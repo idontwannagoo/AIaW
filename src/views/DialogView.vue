@@ -151,28 +151,39 @@
         :class="{ 'rd-r-lg': rightDrawerAbove }"
         @scroll="onScroll"
       >
-        <template
-          v-for="(i, index) in chain"
-          :key="i"
+        <div
+          v-if="topSpacerHeight"
+          :style="{ height: `${topSpacerHeight}px` }"
+          aria-hidden="true"
+        />
+        <div
+          v-for="entry in visibleChainEntries"
+          :key="entry.id"
+          :ref="el => setMessageItemRef(entry.id, el)"
+          class="message-item"
+          :data-chain-index="entry.chainIndex"
         >
           <message-item
-            class="message-item"
-            v-if="messageMap[i] && i !== '$root'"
-            :model-value="dialog.msgRoute[index - 1] + 1"
-            :message="messageMap[i]"
-            :child-num="dialog.msgTree[chain[index - 1]].length"
+            :model-value="dialog.msgRoute[entry.routeIndex] + 1"
+            :message="messageMap[entry.id]"
+            :child-num="dialog.msgTree[entry.parentId].length"
             :scroll-container
-            @update:model-value="switchChain(index - 1, $event - 1)"
-            @edit="edit(index)"
-            @regenerate="regenerate(index)"
-            @delete="deleteBranch(index)"
+            @update:model-value="switchChain(entry.routeIndex, $event - 1)"
+            @edit="edit(entry.chainIndex)"
+            @regenerate="regenerate(entry.chainIndex)"
+            @delete="deleteBranch(entry.chainIndex)"
             @quote="quote"
-            @extract-artifact="extractArtifact(messageMap[i], ...$event)"
-            @rendered="messageMap[i].generatingSession && lockBottom()"
+            @extract-artifact="extractArtifact(messageMap[entry.id], ...$event)"
+            @rendered="messageMap[entry.id].generatingSession && lockBottom()"
             pt-2
             pb-4
           />
-        </template>
+        </div>
+        <div
+          v-if="bottomSpacerHeight"
+          :style="{ height: `${bottomSpacerHeight}px` }"
+          aria-hidden="true"
+        />
       </div>
       <div
         bg-sur-c-low
@@ -416,7 +427,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, onUnmounted, provide, ref, Ref, toRaw, toRef, watch, nextTick } from 'vue'
+import { computed, ComponentPublicInstance, inject, onUnmounted, provide, ref, Ref, toRaw, toRef, watch, nextTick } from 'vue'
 import { db } from 'src/utils/db'
 import { useLiveQueryWithDeps } from 'src/composables/live-query'
 import { almostEqual, displayLength, genId, inputValueEmpty, isPlatformEnabled, isTextFile, JSONEqual, mimeTypeMatch, pageFhStyle, textBeginning, wrapCode, wrapQuote } from 'src/utils/functions'
@@ -498,6 +509,14 @@ provide('dialog', dialog)
 
 const chain = computed<string[]>(() => liveData.value.dialog ? getChain('$root', liveData.value.dialog.msgRoute)[0] : [])
 const historyChain = ref<string[]>([])
+const chainEntries = computed(() =>
+  chain.value.slice(1).map((id, index) => ({
+    id,
+    chainIndex: index + 1,
+    routeIndex: index,
+    parentId: chain.value[index]
+  }))
+)
 function switchChain(index, value) {
   const route = [...dialog.value.msgRoute.slice(0, index), value]
   updateChain(route)
@@ -621,6 +640,126 @@ const itemMap = computed<Record<string, StoredItem>>(() => {
   liveData.value.items.forEach(i => { map[i.id] = i })
   return map
 })
+const defaultMessageHeight = 280
+function estimateMessageHeight(message?: Message) {
+  if (!message) return defaultMessageHeight
+
+  let height = message.type === 'user' ? 120 : 180
+  for (const content of message.contents) {
+    if (content.type === 'assistant-message' || content.type === 'user-message') {
+      height += Math.max(72, Math.min(720, Math.ceil((content.text?.length || 0) / 4)))
+      if (content.type === 'assistant-message' && content.reasoning) {
+        height += Math.max(80, Math.min(320, Math.ceil(content.reasoning.length / 5)))
+      }
+      if (content.type === 'user-message') {
+        height += content.items.length * 92
+      }
+    } else if (content.type === 'assistant-tool') {
+      height += 180
+    }
+  }
+  if (message.error) height += 48
+  if (message.warnings?.length) height += message.warnings.length * 28
+  return Math.max(140, height)
+}
+const measuredMessageHeights = ref<Record<string, number>>({})
+const viewportTop = ref(0)
+const viewportHeight = ref(0)
+const forcedRenderIndex = ref<number | null>(null)
+const VIRTUAL_OVERSCAN_PX = 1600
+const VIRTUAL_FORCED_PADDING = 8
+
+const chainEntryHeights = computed(() =>
+  chainEntries.value.map(entry => measuredMessageHeights.value[entry.id] ?? estimateMessageHeight(messageMap.value[entry.id]))
+)
+const chainEntryOffsets = computed(() => {
+  const offsets = [0]
+  let total = 0
+  for (const height of chainEntryHeights.value) {
+    total += height
+    offsets.push(total)
+  }
+  return offsets
+})
+const visibleChainRange = computed(() => {
+  const total = chainEntries.value.length
+  if (!total) {
+    return { start: 0, end: 0 }
+  }
+
+  const offsets = chainEntryOffsets.value
+  const top = Math.max(0, viewportTop.value - VIRTUAL_OVERSCAN_PX)
+  const bottom = viewportTop.value + Math.max(viewportHeight.value, 1) + VIRTUAL_OVERSCAN_PX
+
+  let start = 0
+  while (start < total && offsets[start + 1] < top) start++
+
+  let end = start
+  while (end < total && offsets[end] < bottom) end++
+
+  start = Math.max(0, start - 1)
+  end = Math.min(total, Math.max(end + 1, start + 1))
+
+  if (forcedRenderIndex.value != null) {
+    start = Math.min(start, Math.max(0, forcedRenderIndex.value - VIRTUAL_FORCED_PADDING))
+    end = Math.max(end, Math.min(total, forcedRenderIndex.value + VIRTUAL_FORCED_PADDING + 1))
+  }
+
+  return { start, end }
+})
+const visibleChainEntries = computed(() =>
+  chainEntries.value
+    .slice(visibleChainRange.value.start, visibleChainRange.value.end)
+    .filter(entry => !!messageMap.value[entry.id])
+)
+const topSpacerHeight = computed(() => chainEntryOffsets.value[visibleChainRange.value.start] ?? 0)
+const bottomSpacerHeight = computed(() => {
+  const totalHeight = chainEntryOffsets.value.at(-1) ?? 0
+  return Math.max(0, totalHeight - (chainEntryOffsets.value[visibleChainRange.value.end] ?? 0))
+})
+
+const messageItemEls = new Map<string, HTMLElement>()
+const messageItemObservers = new Map<string, ResizeObserver>()
+function setMessageItemRef(id: string, el: Element | ComponentPublicInstance | null) {
+  const prevEl = messageItemEls.get(id)
+  if (!el) {
+    messageItemObservers.get(id)?.disconnect()
+    messageItemObservers.delete(id)
+    messageItemEls.delete(id)
+    return
+  }
+
+  const nextEl = ('$el' in el ? el.$el : el) as HTMLElement
+  if (prevEl === nextEl) return
+
+  if (prevEl) {
+    messageItemObservers.get(id)?.disconnect()
+  }
+
+  messageItemEls.set(id, nextEl)
+  const observer = new ResizeObserver(entries => {
+    const height = Math.ceil(entries[0]?.contentRect.height ?? nextEl.offsetHeight)
+    if (!height) return
+    if (Math.abs((measuredMessageHeights.value[id] ?? 0) - height) < 2) return
+    measuredMessageHeights.value = {
+      ...measuredMessageHeights.value,
+      [id]: height
+    }
+  })
+  observer.observe(nextEl)
+  messageItemObservers.set(id, observer)
+}
+onUnmounted(() => {
+  messageItemObservers.forEach(observer => observer.disconnect())
+  messageItemObservers.clear()
+  messageItemEls.clear()
+})
+
+function updateViewportMetrics(container = scrollContainer.value) {
+  if (!container) return
+  viewportTop.value = container.scrollTop
+  viewportHeight.value = container.clientHeight
+}
 provide('messageMap', messageMap)
 provide('itemMap', itemMap)
 const generating = computed(() => !!messageMap.value[chain.value.at(-2)]?.generatingSession)
@@ -1203,17 +1342,17 @@ watch(route, to => {
         updateChain(route)
         await until(chain).changed()
       }
-      await nextTick()
-      const { items } = getEls()
+      await ensureChainIndexRendered(route.length)
       if (route.length) {
-        const item = items[route.length - 1]
-        if (highlight) {
+        const item = getMessageElByChainIndex(route.length)
+        if (item && highlight) {
           const mark = new Mark(item)
           mark.unmark()
           mark.mark(highlight)
         }
-        item.querySelector('mark[data-markjs]')?.scrollIntoView()
+        item?.querySelector('mark[data-markjs]')?.scrollIntoView()
       }
+      forcedRenderIndex.value = null
       router.replace({ query: {} })
     }
   })
@@ -1241,24 +1380,38 @@ const showVars = ref(true)
 const scrollContainer = ref<HTMLElement>()
 function getEls() {
   const container = scrollContainer.value
-  const items: HTMLElement[] = Array.from(document.querySelectorAll('.message-item'))
-  return { container, items }
+  const items: HTMLElement[] = container
+    ? Array.from(container.querySelectorAll('.message-item'))
+    : []
+  const chainIndexes = items.map(item => parseInt(item.dataset.chainIndex, 10))
+  return { container, items, chainIndexes }
+}
+function getMessageElByChainIndex(chainIndex: number) {
+  return scrollContainer.value?.querySelector<HTMLElement>(`.message-item[data-chain-index="${chainIndex}"]`)
+}
+async function ensureChainIndexRendered(chainIndex: number) {
+  const entryIndex = chainIndex - 1
+  if (entryIndex < 0) return
+  forcedRenderIndex.value = entryIndex
+  await nextTick()
 }
 function itemInView(item: HTMLElement, container: HTMLElement) {
   return item.offsetTop <= container.scrollTop + container.clientHeight &&
   item.offsetTop + item.clientHeight > container.scrollTop
 }
 function switchTo(target: 'prev' | 'next' | 'first' | 'last') {
-  const { container, items } = getEls()
+  const { container, items, chainIndexes } = getEls()
+  if (!container || !items.length) return
   const index = items.findIndex((item, i) =>
     itemInView(item, container) &&
-    dialog.value.msgTree[chain.value[i]].length > 1
+    dialog.value.msgTree[chain.value[chainIndexes[i] - 1]]?.length > 1
   )
   if (index === -1) return
 
-  const id = chain.value[index]
+  const chainIndex = chainIndexes[index]
+  const id = chain.value[chainIndex - 1]
   let to
-  const curr = dialog.value.msgRoute[index]
+  const curr = dialog.value.msgRoute[chainIndex - 1]
   const num = dialog.value.msgTree[id].length
   if (target === 'first') {
     to = 0
@@ -1270,10 +1423,11 @@ function switchTo(target: 'prev' | 'next' | 'first' | 'last') {
     to = curr + 1
   }
   if (to < 0 || to >= num || to === curr) return
-  switchChain(index, to)
+  switchChain(chainIndex - 1, to)
 }
 function scroll(action: 'up' | 'down' | 'top' | 'bottom', behavior: 'smooth' | 'auto' = 'smooth') {
   const { container, items } = getEls()
+  if (!container) return
   if (action === 'top') {
     container.scrollTo({ top: 0, behavior })
     return
@@ -1284,6 +1438,7 @@ function scroll(action: 'up' | 'down' | 'top' | 'bottom', behavior: 'smooth' | '
 
   // Get current position
   const index = items.findIndex(item => itemInView(item, container))
+  if (index === -1) return
   const itemTypes = items.map(i => i.clientHeight > container.clientHeight ? 'partial' : 'entire')
   let position: 'start' | 'inner' | 'end' | 'out'
   const item = items[index]
@@ -1346,20 +1501,22 @@ function scroll(action: 'up' | 'down' | 'top' | 'bottom', behavior: 'smooth' | '
   container.scrollTo({ top: top + 2, behavior: 'smooth' })
 }
 function regenerateCurr() {
-  const { container, items } = getEls()
+  const { container, items, chainIndexes } = getEls()
+  if (!container || !items.length) return
   const index = items.findIndex(
-    (item, i) => itemInView(item, container) && messageMap.value[chain.value[i + 1]].type === 'assistant'
+    (item, i) => itemInView(item, container) && messageMap.value[chain.value[chainIndexes[i]]]?.type === 'assistant'
   )
   if (index === -1) return
-  regenerate(index + 1)
+  regenerate(chainIndexes[index])
 }
 function editCurr() {
-  const { container, items } = getEls()
+  const { container, items, chainIndexes } = getEls()
+  if (!container || !items.length) return
   const index = items.findIndex(
-    (item, i) => itemInView(item, container) && messageMap.value[chain.value[i + 1]].type === 'user'
+    (item, i) => itemInView(item, container) && messageMap.value[chain.value[chainIndexes[i]]]?.type === 'user'
   )
   if (index === -1) return
-  edit(index + 1)
+  edit(chainIndexes[index])
 }
 const { perfs } = useUserPerfsStore()
 if (isPlatformEnabled(perfs.enableShortcutKey)) {
@@ -1427,13 +1584,21 @@ async function autoExtractArtifact() {
 const uiStateStore = useUiStateStore()
 const scrollTops = uiStateStore.dialogScrollTops
 function onScroll(ev) {
-  scrollTops[props.id] = ev.target.scrollTop
+  const container = ev.target as HTMLElement
+  scrollTops[props.id] = container.scrollTop
+  viewportTop.value = container.scrollTop
+  viewportHeight.value = container.clientHeight
+  forcedRenderIndex.value = null
 }
 watch(() => liveData.value.dialog?.id, id => {
   if (!id) return
   nextTick(() => {
     scrollContainer.value?.scrollTo({ top: scrollTops[id] ?? 0 })
+    updateViewportMetrics()
   })
+})
+watch([() => chainEntries.value.length, scrollContainer], () => {
+  nextTick(() => updateViewportMetrics())
 })
 
 const providersStore = useProvidersStore()
