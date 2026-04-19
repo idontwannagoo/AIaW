@@ -1,9 +1,8 @@
 import { computed } from 'vue'
 import { useUserPerfsStore } from 'src/stores/user-perfs'
 import { Model, Provider } from 'src/utils/types'
-import { useObservable } from '@vueuse/rxjs'
-import { db } from 'src/utils/db'
-import { DexieDBURL, LitellmBaseURL } from 'src/utils/config'
+import { syncClient } from 'src/utils/sync-client'
+import { LitellmBaseURL } from 'src/utils/config'
 import { wrapLanguageModel, extractReasoningMiddleware } from 'ai'
 import { AuthropicCors, FormattingReenabled, MarkdownFormatting } from 'src/utils/middlewares'
 import { fetch } from 'src/utils/platform-api'
@@ -20,11 +19,10 @@ function wrapMiddlewares(model: LanguageModelV2) {
   return middlewares.length ? wrapLanguageModel({ model, middleware: middlewares }) : model
 }
 export function useGetModel() {
-  const user = DexieDBURL ? useObservable(db.cloud.currentUser) : null
-  const defaultProvider = computed(() => user?.value.isLoggedIn ? {
+  const defaultProvider = computed(() => LitellmBaseURL && syncClient.state.isLoggedIn ? {
     type: 'openai-compatible',
     settings: {
-      apiKey: user.value.data.apiKey,
+      apiKey: syncClient.state.token,
       baseURL: new URL(LitellmBaseURL, location.origin).toString()
     }
   } : null)

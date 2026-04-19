@@ -1,6 +1,7 @@
 import { useQuasar } from 'quasar'
-import { DexieDBURL, LitellmBaseURL } from 'src/utils/config'
-import { db } from 'src/utils/db'
+import { LitellmBaseURL } from 'src/utils/config'
+import { isSyncEnabled } from 'src/utils/sync-client'
+import { openLoginDialog } from 'src/composables/login-dialogs'
 import { localData } from 'src/utils/local-data'
 import { dialogOptions } from 'src/utils/values'
 import { onMounted } from 'vue'
@@ -18,7 +19,7 @@ export function useFirstVisit() {
       return
     }
     if (!localData.visited) {
-      const serviceAvailable = DexieDBURL && LitellmBaseURL
+      const serviceAvailable = isSyncEnabled() && LitellmBaseURL
       const message = serviceAvailable
         ? t('firstVisit.messageWithLogin')
         : t('firstVisit.messageWithoutLogin')
@@ -42,7 +43,7 @@ export function useFirstVisit() {
         router.push('/settings')
         localData.visited = true
       }).onOk(() => {
-        db.cloud.login()
+        openLoginDialog()
         localData.visited = true
       })
     }

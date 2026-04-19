@@ -17,7 +17,7 @@ import PluginSettings from 'src/views/PluginSettings.vue'
 import AssistantsMarket from 'src/views/AssistantsMarket.vue'
 import AccountPage from 'src/pages/AccountPage.vue'
 import ModelPricing from 'src/pages/ModelPricing.vue'
-import { DexieDBURL, LitellmBaseURL } from 'src/utils/config'
+import { LitellmBaseURL, SyncEnabled } from 'src/utils/config'
 import ShortcutKeys from 'src/views/ShortcutKeys.vue'
 import { i18n } from 'src/boot/i18n'
 import SettingsView from 'src/views/SettingsView.vue'
@@ -77,10 +77,10 @@ const routes: RouteRecordRaw[] = [
         ]
       },
       { path: '/set-provider', component: SetProvider },
-      ...(DexieDBURL ? [
+      ...(SyncEnabled ? [
         { path: '/account', component: AccountPage, meta: { title: t('routes.account') } }
       ] : []),
-      ...(DexieDBURL && LitellmBaseURL ? [
+      ...(SyncEnabled && LitellmBaseURL ? [
         { path: '/model-pricing', component: ModelPricing, meta: { title: t('routes.modelPricing') } }
       ] : []),
       { path: '/', component: EmptyPage },

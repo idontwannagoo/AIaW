@@ -1,34 +1,23 @@
-import Dexie from 'dexie'
+import Dexie, { Table } from 'dexie'
 import { defaultAvatar, genId } from './functions'
 import { Workspace, Folder, Dialog, Message, Assistant, Artifact, StoredReactive, InstalledPlugin, AvatarImage, StoredItem, CustomProvider } from './types'
 import { AssistantDefaultPrompt, ExampleWsIndexContent } from './templates'
-import dexieCloud, { DexieCloudTable } from 'dexie-cloud-addon'
-import { DexieDBURL } from './config'
 import { i18n } from 'src/boot/i18n'
 
 type Db = Dexie & {
-  workspaces: DexieCloudTable<Workspace | Folder, 'id'>
-  dialogs: DexieCloudTable<Dialog, 'id'>
-  messages: DexieCloudTable<Message, 'id'>
-  assistants: DexieCloudTable<Assistant, 'id'>
-  artifacts: DexieCloudTable<Artifact, 'id'>
-  installedPluginsV2: DexieCloudTable<InstalledPlugin, 'id'>
-  reactives: DexieCloudTable<StoredReactive, 'key'>
-  avatarImages: DexieCloudTable<AvatarImage, 'id'>
-  items: DexieCloudTable<StoredItem, 'id'>
-  providers: DexieCloudTable<CustomProvider, 'id'>
+  workspaces: Table<Workspace | Folder, 'id'>
+  dialogs: Table<Dialog, 'id'>
+  messages: Table<Message, 'id'>
+  assistants: Table<Assistant, 'id'>
+  artifacts: Table<Artifact, 'id'>
+  installedPluginsV2: Table<InstalledPlugin, 'id'>
+  reactives: Table<StoredReactive, 'key'>
+  avatarImages: Table<AvatarImage, 'id'>
+  items: Table<StoredItem, 'id'>
+  providers: Table<CustomProvider, 'id'>
 }
 
-const db = new Dexie('data', { addons: DexieDBURL ? [dexieCloud] : [] }) as Db
-
-if (DexieDBURL) {
-  db.cloud.configure({
-    databaseUrl: DexieDBURL,
-    requireAuth: false,
-    customLoginGui: true,
-    nameSuffix: false
-  })
-}
+const db = new Dexie('data') as Db
 const schema = {
   workspaces: 'id, type, parentId',
   dialogs: 'id, workspaceId',

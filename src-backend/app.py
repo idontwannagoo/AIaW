@@ -8,6 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from llama_parse import LlamaParse
 import os
 
+from sync.main import mount_sync
+
 http_client = None
 
 @asynccontextmanager
@@ -18,6 +20,7 @@ async def lifespan(app: FastAPI):
     await http_client.close()
 
 app = FastAPI(lifespan=lifespan)
+mount_sync(app)
 
 ALLOWED_PREFIXES = [
     'https://lobehub.search1api.com/api/search',

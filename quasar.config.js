@@ -18,7 +18,8 @@ export default configure((ctx) => {
     boot: [
       'i18n',
       'unocss',
-      'global-components'
+      'global-components',
+      'sync'
     ],
 
     // https://v2.quasar.dev/quasar-cli-vite/quasar-config-js#css

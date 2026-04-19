@@ -15,4 +15,4 @@ COPY --from=builder /app/dist/pwa ./static
 RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 9010
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "9010"]
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app:app --host 0.0.0.0 --port 9010"]

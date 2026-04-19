@@ -547,12 +547,11 @@ import CopyBtn from 'src/components/CopyBtn.vue'
 import AAvatar from 'src/components/AAvatar.vue'
 import PickAvatarDialog from 'src/components/PickAvatarDialog.vue'
 import ModelInputItems from 'src/components/ModelInputItems.vue'
-import { useObservable } from '@vueuse/rxjs'
-import { db } from 'src/utils/db'
+import { syncClient } from 'src/utils/sync-client'
 import ProviderInputItems from 'src/components/ProviderInputItems.vue'
 import { useLocateId } from 'src/composables/locate-id'
 import { pageFhStyle } from 'src/utils/functions'
-import { DexieDBURL, LitellmBaseURL } from 'src/utils/config'
+import { LitellmBaseURL } from 'src/utils/config'
 import PlatformEnabledInput from 'src/components/PlatformEnabledInput.vue'
 import ImportDataDialog from 'src/components/ImportDataDialog.vue'
 import { useI18n } from 'vue-i18n'
@@ -601,7 +600,7 @@ const providerLink = computed(() => {
   const provider = encodeURIComponent(JSON.stringify(perfs.provider))
   return `${PublicOrigin}/set-provider?provider=${provider}`
 })
-const user = DexieDBURL ? useObservable(db.cloud.currentUser) : null
+const user = syncClient.state
 
 const { getProvider } = useGetModel()
 const provider = computed(() => getProvider())

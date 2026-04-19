@@ -1,0 +1,58 @@
+services:
+  app:
+    build: .
+    ports:
+      - "9010:9010"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aiaw:aiaw@postgres:5432/aiaw
+      JWT_SECRET: ${JWT_SECRET:-please-set-a-long-random-value}
+      JWT_EXPIRE_DAYS: "30"
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9002}
+      S3_ACCESS_KEY: aiaw
+      S3_SECRET_KEY: aiaw-secret-key
+      S3_BUCKET: aiaw
+      SEARXNG_URL: ${SEARXNG_URL:-}
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aiaw
+      POSTGRES_PASSWORD: aiaw
+      POSTGRES_DB: aiaw
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "aiaw"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: aiaw
+      MINIO_ROOT_PASSWORD: aiaw-secret-key
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  minio-data:
