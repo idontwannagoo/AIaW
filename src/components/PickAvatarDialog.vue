@@ -166,6 +166,8 @@ import { genId } from 'src/utils/functions'
 import { cropSquareBlob } from 'src/utils/image-process'
 import { db } from 'src/utils/db'
 import { materialSymbols } from 'src/utils/values'
+import { uploadBinary } from 'src/utils/file-storage'
+import { syncClient } from 'src/utils/sync-client'
 
 const props = defineProps<{
   defaultTab: string,
@@ -247,8 +249,11 @@ function setText(text: string) {
 }
 async function onImageInput(file: File) {
   const blob = await cropSquareBlob(file, 96)
+  const buffer = await blob.arrayBuffer()
   const id = genId()
-  await db.avatarImages.add({ id, contentBuffer: await blob.arrayBuffer(), mimeType: file.type })
+  const { key: fileKey } = await uploadBinary(buffer, file.type)
+  await db.avatarImages.add({ id, contentBuffer: buffer, mimeType: file.type, fileKey: fileKey || undefined })
+  if (fileKey) void syncClient.push('avatarImages', 'put', id)
   selected.value = { type: 'image', imageId: id }
 }
 watch(selected, (to, from) => {

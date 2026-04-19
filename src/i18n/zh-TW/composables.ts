@@ -17,14 +17,24 @@ export default {
     failure: '下單失敗'
   },
   login: {
-    register: '登入/註冊',
-    next: '下一步',
-    otp: 'OTP驗證碼',
-    enterOtp: '請輸入驗證郵件中的OTP驗證碼',
+    loginTitle: '登入',
+    registerTitle: '建立帳號',
+    emailLabel: '電子郵件',
+    passwordLabel: '密碼',
+    login: '登入',
+    register: '註冊',
+    cancel: '取消',
+    switchToLogin: '已有帳號？去登入',
+    switchToRegister: '沒有帳號？去註冊',
+    invalidEmail: '請輸入有效的電子郵件地址',
+    invalidPassword: '密碼至少需要6個字元',
+    emailAlreadyRegistered: '此電子郵件已被註冊',
+    invalidCredentials: '電子郵件或密碼不正確',
+    unknownError: '發生未知錯誤',
     logout: '登出',
     confirmLogout: '確定要登出嗎？',
     loggedIn: '已登入：{email}',
-    privacyPolicy: '登入即代表同意我們的<a href="https://docs.aiaw.app/zh/privacy-policy/" text-pri target="_blank">隱私政策</a>'
+    privacyPolicy: '註冊即代表同意我們的<a href="https://docs.aiaw.app/zh/privacy-policy/" text-pri target="_blank">隱私政策</a>'
   },
   installPlugin: {
     fetchFailed: '獲取插件配置失敗：{message}',

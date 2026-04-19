@@ -394,14 +394,15 @@ async function logout(): Promise<void> {
 async function push(
   entity: SyncEntity,
   op: 'put' | 'delete',
-  idOrPayload: string | Record<string, unknown>
+  idOrPayload: string | unknown
 ): Promise<void> {
   if (!SyncEnabled) return
   const pk = localPrimaryKey(entity)
+  const payloadObj = idOrPayload as Record<string, unknown>
   let id: string
   let payload: Record<string, unknown> | undefined
   if (op === 'delete') {
-    id = typeof idOrPayload === 'string' ? idOrPayload : String(idOrPayload[pk])
+    id = typeof idOrPayload === 'string' ? idOrPayload : String(payloadObj[pk])
   } else {
     if (typeof idOrPayload === 'string') {
       // fallback: read from local DB
@@ -410,8 +411,8 @@ async function push(
       payload = payloadForPush(entity, local as Record<string, unknown>)
       id = idOrPayload
     } else {
-      id = String(idOrPayload[pk])
-      payload = payloadForPush(entity, idOrPayload)
+      id = String(payloadObj[pk])
+      payload = payloadForPush(entity, payloadObj)
     }
   }
   if (!id) return

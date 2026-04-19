@@ -474,6 +474,7 @@ import { useUiStateStore } from 'src/stores/ui-state'
 import AutocompleteInput from 'src/components/AutocompleteInput.vue'
 import { useProvidersStore } from 'src/stores/providers'
 import { syncClient } from 'src/utils/sync-client'
+import { uploadBinary } from 'src/utils/file-storage'
 
 const { t, locale } = useI18n()
 
@@ -500,9 +501,18 @@ const dialog = syncRef<Dialog>(
   },
   { valueDeep: true }
 )
+let unsubscribeEntityChanged: (() => void) | null = null
 onMounted(() => {
   void syncClient.fetchMessagesOfDialog(props.id)
   void syncClient.fetchItemsOfDialog(props.id)
+  unsubscribeEntityChanged = syncClient.onEntityChanged(msg => {
+    if (msg.entity === 'messages' || msg.entity === 'items') {
+      void syncClient.fetchMessagesOfDialog(props.id)
+      void syncClient.fetchItemsOfDialog(props.id)
+    } else if (msg.entity === 'dialogs' && msg.id === props.id) {
+      // Dialog metadata already reflected via Dexie live query; no extra fetch needed.
+    }
+  })
 })
 const assistantsStore = useAssistantsStore()
 const workspace: Ref<Workspace> = inject('workspace')
@@ -786,6 +796,7 @@ function setMessageItemRef(id: string, el: Element | ComponentPublicInstance | n
   messageItemObservers.set(id, observer)
 }
 onUnmounted(() => {
+  unsubscribeEntityChanged?.()
   messageItemObservers.forEach(observer => observer.disconnect())
   messageItemObservers.clear()
   messageItemEls.clear()
@@ -939,7 +950,19 @@ function quote(item: ApiResultItem) {
   }
 }
 async function addInputItems(items: ApiResultItem[]) {
-  const storedItems = items.map(i => ({ ...i, id: genId(), dialogId: props.id, references: 0 }))
+  const storedItems: StoredItem[] = []
+  for (const i of items) {
+    const stored: StoredItem = { ...i, id: genId(), dialogId: props.id, references: 0 }
+    if (i.contentBuffer) {
+      try {
+        const { key } = await uploadBinary(i.contentBuffer, i.mimeType ?? 'application/octet-stream')
+        if (key) stored.fileKey = key
+      } catch (err) {
+        console.warn('[sync] item upload failed', err)
+      }
+    }
+    storedItems.push(stored)
+  }
   const ids = storedItems.map(i => i.id)
   const msgId = chain.value.at(-1)!
   await db.transaction('rw', db.messages, db.items, () => {

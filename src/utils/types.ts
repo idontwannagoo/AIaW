@@ -75,8 +75,9 @@ interface ProviderType {
 
 interface AvatarImage {
   id: string
-  contentBuffer: ArrayBuffer
+  contentBuffer?: ArrayBuffer
   mimeType: string
+  fileKey?: string
 }
 interface ApiResultItem {
   type: 'text' | 'file' | 'quote'
@@ -89,6 +90,7 @@ interface StoredItem extends ApiResultItem {
   id: string
   dialogId: string
   references: number
+  fileKey?: string
 }
 type StoredItemId = StoredItem['id']
 

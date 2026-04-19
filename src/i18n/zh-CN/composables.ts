@@ -17,14 +17,24 @@ export default {
     failure: '下单失败'
   },
   login: {
-    register: '登录/注册',
-    next: '下一步',
-    otp: 'OTP验证码',
-    enterOtp: '请输入验证邮件中的OTP验证码',
+    loginTitle: '登录',
+    registerTitle: '创建账号',
+    emailLabel: '邮箱',
+    passwordLabel: '密码',
+    login: '登录',
+    register: '注册',
+    cancel: '取消',
+    switchToLogin: '已有账号？去登录',
+    switchToRegister: '没有账号？去注册',
+    invalidEmail: '请输入有效的邮箱地址',
+    invalidPassword: '密码至少需要6个字符',
+    emailAlreadyRegistered: '该邮箱已被注册',
+    invalidCredentials: '邮箱或密码不正确',
+    unknownError: '发生未知错误',
     logout: '退出登录',
     confirmLogout: '确定要退出登录吗？',
     loggedIn: '已登录：{email}',
-    privacyPolicy: '登录即代表同意我们的<a href="https://docs.aiaw.app/zh/privacy-policy/" text-pri target="_blank">隐私政策</a>'
+    privacyPolicy: '注册即代表同意我们的<a href="https://docs.aiaw.app/zh/privacy-policy/" text-pri target="_blank">隐私政策</a>'
   },
   installPlugin: {
     fetchFailed: '获取插件配置失败：{message}',

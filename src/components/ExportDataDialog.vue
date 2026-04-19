@@ -42,6 +42,7 @@ import { exportDB } from 'dexie-export-import'
 import { useDialogPluginComponent, useQuasar } from 'quasar'
 import { db, schema } from 'src/utils/db'
 import { exportFile } from 'src/utils/platform-api'
+import { downloadBinary } from 'src/utils/file-storage'
 import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -57,12 +58,24 @@ const $q = useQuasar()
 
 const { dialogRef, onDialogHide, onDialogOK, onDialogCancel } = useDialogPluginComponent()
 
+async function backfillTransform(table: string, value: Record<string, unknown>) {
+  const BINARY_TABLES = new Set(['avatarImages', 'items'])
+  if (BINARY_TABLES.has(table) && value.fileKey && !value.contentBuffer) {
+    try {
+      value = { ...value, contentBuffer: await downloadBinary(value.fileKey as string) }
+    } catch (err) {
+      console.warn('[export] binary backfill failed', value.fileKey, err)
+    }
+  }
+  if (removeUserMark.value) {
+    return { value: { ...value, owner: 'unauthorized', realmId: 'unauthorized' } }
+  }
+  return { value }
+}
+
 function exportData() {
-  const options = removeUserMark.value ? {
-    filter: table => Object.keys(schema).includes(table),
-    transform: (table, value) => ({ value: { ...value, owner: 'unauthorized', realmId: 'unauthorized' } })
-  } : {}
-  exportDB(db, options).then(async blob => {
+  const filter = removeUserMark.value ? (table: string) => Object.keys(schema).includes(table) : undefined
+  exportDB(db, { filter, transform: backfillTransform }).then(async blob => {
     await exportFile('aiaw_user_db.json', blob)
     onDialogOK()
   }).catch(err => {

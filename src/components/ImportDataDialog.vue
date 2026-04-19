@@ -60,6 +60,8 @@
 import { importInto } from 'dexie-export-import'
 import { useDialogPluginComponent, useQuasar } from 'quasar'
 import { db } from 'src/utils/db'
+import { uploadBinary } from 'src/utils/file-storage'
+import { syncClient } from 'src/utils/sync-client'
 import { reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -86,7 +88,22 @@ function importData() {
     acceptVersionDiff: force,
     overwriteValues: overwrite,
     clearTablesBeforeImport: clear
-  }).then(() => {
+  }).then(async () => {
+    // Upload any binary rows that lack a fileKey (from old-format exports).
+    for (const tableName of ['avatarImages', 'items'] as const) {
+      const rows = await db.table(tableName).toArray() as { id: string; contentBuffer?: ArrayBuffer; mimeType?: string; fileKey?: string }[]
+      for (const row of rows) {
+        if (row.contentBuffer && !row.fileKey) {
+          try {
+            const { key } = await uploadBinary(row.contentBuffer, row.mimeType ?? 'application/octet-stream')
+            if (key) await db.table(tableName).update(row.id, { fileKey: key })
+          } catch (err) {
+            console.warn('[import] binary upload failed', row.id, err)
+          }
+        }
+      }
+    }
+    await syncClient.pushAll()
     $q.notify({
       message: t('importDataDialog.importSuccess'),
       color: 'positive'

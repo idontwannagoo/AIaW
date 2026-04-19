@@ -344,6 +344,7 @@ import { useMdPreviewProps } from 'src/composables/md-preview-props'
 import ConvertArtifactDialog from './ConvertArtifactDialog.vue'
 import { useI18n } from 'vue-i18n'
 import { dialogOptions } from 'src/utils/values'
+import { syncClient } from 'src/utils/sync-client'
 
 const props = defineProps<{
   message: Message,
@@ -387,21 +388,24 @@ const emit = defineEmits<{
 watchEffect(async () => {
   const sessionId = props.message.generatingSession
   if (sessionId) {
-    !await sessions.ping(sessionId) && db.messages.update(props.message.id, {
-      generatingSession: null,
-      status: 'failed',
-      error: 'aborted',
-      contents: props.message.contents.map(content => {
-        if (content.type === 'assistant-tool' && content.status === 'calling') {
-          return {
-            ...content,
-            status: 'failed',
-            error: 'Tool call aborted'
+    if (!await sessions.ping(sessionId)) {
+      await db.messages.update(props.message.id, {
+        generatingSession: null,
+        status: 'failed',
+        error: 'aborted',
+        contents: props.message.contents.map(content => {
+          if (content.type === 'assistant-tool' && content.status === 'calling') {
+            return {
+              ...content,
+              status: 'failed',
+              error: 'Tool call aborted'
+            }
           }
-        }
-        return content
-      }) as MessageContent[]
-    })
+          return content
+        }) as MessageContent[]
+      })
+      void syncClient.push('messages', 'put', props.message.id)
+    }
   }
 })
 
@@ -500,10 +504,11 @@ function edit() {
       title: t('messageItem.editMessage'),
       model: textContent.value.text
     }
-  }).onOk(text => {
-    db.messages.update(props.message.id, {
+  }).onOk(async text => {
+    await db.messages.update(props.message.id, {
       [`contents.${textIndex.value}.text`]: text
     })
+    void syncClient.push('messages', 'put', props.message.id)
   })
 }
 function deleteBranch() {

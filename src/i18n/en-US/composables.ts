@@ -17,14 +17,24 @@ export default {
     failure: 'Order failed'
   },
   login: {
-    register: 'Log In / Register',
-    next: 'Next',
-    otp: 'OTP Code',
-    enterOtp: 'Please enter the OTP code from the verification email',
+    loginTitle: 'Log In',
+    registerTitle: 'Create Account',
+    emailLabel: 'Email',
+    passwordLabel: 'Password',
+    login: 'Log In',
+    register: 'Register',
+    cancel: 'Cancel',
+    switchToLogin: 'Already have an account? Log in',
+    switchToRegister: 'No account? Register',
+    invalidEmail: 'Please enter a valid email address',
+    invalidPassword: 'Password must be at least 6 characters',
+    emailAlreadyRegistered: 'This email is already registered',
+    invalidCredentials: 'Invalid email or password',
+    unknownError: 'An unknown error occurred',
     logout: 'Log Out',
     confirmLogout: 'Are you sure you want to log out?',
     loggedIn: 'Logged in: {email}',
-    privacyPolicy: 'By logging in, you agree to our <a href="https://docs.aiaw.app/privacy-policy/" text-pri target="_blank">Privacy Policy</a>'
+    privacyPolicy: 'By registering, you agree to our <a href="https://docs.aiaw.app/privacy-policy/" text-pri target="_blank">Privacy Policy</a>'
   },
   installPlugin: {
     fetchFailed: 'Failed to get plugin configuration: {message}',
