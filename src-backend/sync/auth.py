@@ -2,9 +2,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 from uuid import UUID
 
+import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, Request, status
-from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,15 +12,13 @@ from .config import JWT_ALGORITHM, JWT_EXPIRE_DAYS, JWT_SECRET
 from .db import get_session
 from .models import User
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 def hash_password(pw: str) -> str:
-    return pwd_context.hash(pw)
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_password(pw: str, hashed: str) -> bool:
-    return pwd_context.verify(pw, hashed)
+    return bcrypt.checkpw(pw.encode(), hashed.encode())
 
 
 def issue_token(user_id: UUID) -> str:

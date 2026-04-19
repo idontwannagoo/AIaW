@@ -23,10 +23,10 @@ export const useAssistantsStore = defineStore('assistants', () => {
       model: null,
       modelSettings: { ...defaultModelSettings },
       plugins: {},
-      promptRole: 'system',
+      promptRole: 'system' as const,
       stream: true,
       ...props
-    }
+    } as Assistant
     await db.assistants.add(assistant)
     void syncClient.push('assistants', 'put', assistant)
     return assistant.id

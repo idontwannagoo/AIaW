@@ -72,13 +72,13 @@ export const useProvidersStore = defineStore('providers', () => {
       name: t('stores.providers.newProvider'),
       id: genId(),
       avatar: {
-        type: 'icon',
+        type: 'icon' as const,
         icon: 'sym_o_dashboard_customize',
         hue: Math.floor(Math.random() * 360)
       },
       subproviders: [],
       ...props
-    }
+    } as CustomProvider
     await db.providers.add(provider)
     void syncClient.push('providers', 'put', provider)
     return provider.id

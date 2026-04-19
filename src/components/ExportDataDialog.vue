@@ -58,24 +58,39 @@ const $q = useQuasar()
 
 const { dialogRef, onDialogHide, onDialogOK, onDialogCancel } = useDialogPluginComponent()
 
-async function backfillTransform(table: string, value: Record<string, unknown>) {
-  const BINARY_TABLES = new Set(['avatarImages', 'items'])
-  if (BINARY_TABLES.has(table) && value.fileKey && !value.contentBuffer) {
-    try {
-      value = { ...value, contentBuffer: await downloadBinary(value.fileKey as string) }
-    } catch (err) {
-      console.warn('[export] binary backfill failed', value.fileKey, err)
+async function buildBinaryBackfillMap(): Promise<Map<string, ArrayBuffer>> {
+  const map = new Map<string, ArrayBuffer>()
+  for (const tableName of ['avatarImages', 'items'] as const) {
+    const rows = await db.table(tableName).toArray() as { id: string; contentBuffer?: ArrayBuffer; fileKey?: string }[]
+    for (const row of rows) {
+      if (!row.contentBuffer && row.fileKey) {
+        try {
+          map.set(row.id, await downloadBinary(row.fileKey))
+        } catch (err) {
+          console.warn('[export] binary backfill failed', row.id, err)
+        }
+      }
     }
   }
-  if (removeUserMark.value) {
-    return { value: { ...value, owner: 'unauthorized', realmId: 'unauthorized' } }
-  }
-  return { value }
+  return map
 }
 
 function exportData() {
-  const filter = removeUserMark.value ? (table: string) => Object.keys(schema).includes(table) : undefined
-  exportDB(db, { filter, transform: backfillTransform }).then(async blob => {
+  const BINARY_TABLES = new Set(['avatarImages', 'items'])
+  buildBinaryBackfillMap().then(binaryMap => {
+    const filter = removeUserMark.value ? (table: string) => Object.keys(schema).includes(table) : undefined
+    const transform = (table: string, value: Record<string, unknown>) => {
+      let v = value
+      if (BINARY_TABLES.has(table) && !v.contentBuffer && binaryMap.has(v.id as string)) {
+        v = { ...v, contentBuffer: binaryMap.get(v.id as string) }
+      }
+      if (removeUserMark.value) {
+        v = { ...v, owner: 'unauthorized', realmId: 'unauthorized' }
+      }
+      return { value: v }
+    }
+    return exportDB(db, { filter, transform })
+  }).then(async blob => {
     await exportFile('aiaw_user_db.json', blob)
     onDialogOK()
   }).catch(err => {

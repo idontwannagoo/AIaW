@@ -36,11 +36,11 @@ export const useWorkspacesStore = defineStore('workspaces', () => {
     const folder = {
       id: genId(),
       name: t('stores.workspaces.newFolder'),
-      avatar: { type: 'icon', icon: 'sym_o_folder' },
-      type: 'folder',
+      avatar: { type: 'icon' as const, icon: 'sym_o_folder' },
+      type: 'folder' as const,
       parentId: '$root',
       ...props
-    }
+    } as Folder
     await db.workspaces.add(folder)
     void syncClient.push('workspaces', 'put', folder)
     return folder.id

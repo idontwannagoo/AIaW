@@ -161,7 +161,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useUiStateStore } from 'src/stores/ui-state'
 import { syncClient } from 'src/utils/sync-client'
 import { openLoginDialog } from 'src/composables/login-dialogs'
@@ -169,7 +169,6 @@ import { useQuasar } from 'quasar'
 import { LitellmBaseURL, UsdToCnyRate } from 'src/utils/config'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { onMounted } from 'vue'
 import ModelItem from 'src/components/ModelItem.vue'
 
 const router = useRouter()

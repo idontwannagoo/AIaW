@@ -33,7 +33,7 @@
             @update:model-value="passwordError = ''"
             @keyup.enter="submit"
           >
-            <template v-slot:append>
+            <template #append>
               <q-icon
                 :name="showPassword ? 'sym_o_visibility_off' : 'sym_o_visibility'"
                 class="cursor-pointer"

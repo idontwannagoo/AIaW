@@ -27,9 +27,9 @@ export function useCreateDialog(workspace: Ref<Workspace>) {
     const message = {
       id: messageId,
       dialogId: id,
-      type: 'user',
-      contents: [{ type: 'user-message', text: '', items: [] }],
-      status: 'inputing'
+      type: 'user' as const,
+      contents: [{ type: 'user-message' as const, text: '', items: [] }],
+      status: 'inputing' as const
     }
     await db.transaction('rw', db.dialogs, db.messages, () => {
       db.dialogs.add(dialog)

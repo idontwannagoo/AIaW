@@ -20,7 +20,7 @@ import {
 
 const TOKEN_KEY = 'aiaw.sync.jwt'
 const EMAIL_KEY = 'aiaw.sync.email'
-const SINCE_KEY_PREFIX = 'aiaw.sync.since.'   // per-entity high-water-mark
+const SINCE_KEY_PREFIX = 'aiaw.sync.since.' // per-entity high-water-mark
 const OUTBOX_REACTIVE_KEY = '#sync-outbox'
 const SEQ_REACTIVE_KEY = '#sync-outbox-seq'
 
@@ -207,7 +207,7 @@ function payloadForPush(entity: SyncEntity, value: Record<string, unknown> | und
   if (!value) return undefined
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(value)) {
-    if (k === 'contentBuffer') continue               // binary stays local; fileKey is synced
+    if (k === 'contentBuffer') continue // binary stays local; fileKey is synced
     if (k === 'owner' || k === 'realmId' || k === '$ts') continue
     out[k] = v
   }
