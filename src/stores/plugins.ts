@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 import { useLiveQuery } from 'src/composables/live-query'
 import { persistentReactive } from 'src/composables/persistent-reactive'
 import { db } from 'src/utils/db'
+import { syncClient } from 'src/utils/sync-client'
 import { GradioPluginManifest, HuggingPluginManifest, InstalledPlugin, McpPluginManifest, PluginsData } from 'src/utils/types'
 import { buildLobePlugin, timePlugin, defaultData, whisperPlugin, videoTranscriptPlugin, buildGradioPlugin, calculatorPlugin, huggingToGradio, fluxPlugin, lobeDefaultData, gradioDefaultData, emotionsPlugin, mermaidPlugin, mcpDefaultData, dumpMcpPlugin, buildMcpPlugin } from 'src/utils/plugins'
 import { computed } from 'vue'
@@ -38,35 +39,25 @@ export const usePluginsStore = defineStore('plugins', () => {
   ])
 
   async function installLobePlugin(manifest: LobeChatPluginManifest) {
+    const id = `lobe-${manifest.identifier}`
+    const pluginKey = genId()
     // @ts-expect-error - Dexie transaction doesn't support recursive type inference (LobeChatPluginManifest)
     await db.transaction('rw', db.installedPluginsV2, db.reactives, async () => {
-      const id = `lobe-${manifest.identifier}`
-      await db.installedPluginsV2.put({
-        id,
-        key: genId(),
-        type: 'lobechat',
-        available: true,
-        manifest
-      })
-      await db.reactives.update('#plugins-data', {
-        [`value.${id}`]: lobeDefaultData(manifest)
-      })
+      await db.installedPluginsV2.put({ id, key: pluginKey, type: 'lobechat', available: true, manifest })
+      await db.reactives.update('#plugins-data', { [`value.${id}`]: lobeDefaultData(manifest) })
     })
+    void syncClient.push('installedPluginsV2', 'put', pluginKey)
+    void syncClient.push('reactives', 'put', '#plugins-data')
   }
 
   async function installGradioPlugin(manifest: GradioPluginManifest) {
+    const pluginKey = genId()
     await db.transaction('rw', db.installedPluginsV2, db.reactives, async () => {
-      await db.installedPluginsV2.put({
-        id: manifest.id,
-        key: genId(),
-        type: 'gradio',
-        available: true,
-        manifest
-      })
-      await db.reactives.update('#plugins-data', {
-        [`value.${manifest.id}`]: gradioDefaultData(manifest)
-      })
+      await db.installedPluginsV2.put({ id: manifest.id, key: pluginKey, type: 'gradio', available: true, manifest })
+      await db.reactives.update('#plugins-data', { [`value.${manifest.id}`]: gradioDefaultData(manifest) })
     })
+    void syncClient.push('installedPluginsV2', 'put', pluginKey)
+    void syncClient.push('reactives', 'put', '#plugins-data')
   }
 
   async function installHuggingPlugin(manifest: HuggingPluginManifest) {
@@ -77,23 +68,20 @@ export const usePluginsStore = defineStore('plugins', () => {
   async function installMcpPlugin(manifest: McpPluginManifest) {
     if (manifest.transport.type === 'stdio' && !IsTauri) throw new Error(t('stores.plugins.stdioRequireDesktop'))
     const dump = await dumpMcpPlugin(manifest)
+    let pluginKey: string
     await db.transaction('rw', db.installedPluginsV2, db.reactives, async () => {
       const plugin = await db.installedPluginsV2.where('id').equals(manifest.id).first()
       if (plugin) {
+        pluginKey = plugin.key
         await db.installedPluginsV2.update(plugin.key, { type: 'mcp', available: true, manifest: dump })
       } else {
-        await db.installedPluginsV2.add({
-          id: manifest.id,
-          key: genId(),
-          type: 'mcp',
-          available: true,
-          manifest: dump
-        })
+        pluginKey = genId()
+        await db.installedPluginsV2.add({ id: manifest.id, key: pluginKey, type: 'mcp', available: true, manifest: dump })
       }
-      await db.reactives.update('#plugins-data', {
-        [`value.${manifest.id}`]: mcpDefaultData(manifest)
-      })
+      await db.reactives.update('#plugins-data', { [`value.${manifest.id}`]: mcpDefaultData(manifest) })
     })
+    void syncClient.push('installedPluginsV2', 'put', pluginKey)
+    void syncClient.push('reactives', 'put', '#plugins-data')
   }
 
   async function uninstall(id) {
@@ -101,6 +89,8 @@ export const usePluginsStore = defineStore('plugins', () => {
       await db.installedPluginsV2.where('id').equals(id).modify({ available: false })
       await db.assistants.filter(a => !!a.plugins[id]).modify({ [`plugins.${id}`]: undefined })
     })
+    const plugin = await db.installedPluginsV2.where('id').equals(id).first()
+    if (plugin) void syncClient.push('installedPluginsV2', 'put', plugin.key)
   }
 
   return {

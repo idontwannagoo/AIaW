@@ -5,16 +5,16 @@ import { AssistantDefaultPrompt, ExampleWsIndexContent } from './templates'
 import { i18n } from 'src/boot/i18n'
 
 type Db = Dexie & {
-  workspaces: Table<Workspace | Folder, 'id'>
-  dialogs: Table<Dialog, 'id'>
-  messages: Table<Message, 'id'>
-  assistants: Table<Assistant, 'id'>
-  artifacts: Table<Artifact, 'id'>
-  installedPluginsV2: Table<InstalledPlugin, 'id'>
-  reactives: Table<StoredReactive, 'key'>
-  avatarImages: Table<AvatarImage, 'id'>
-  items: Table<StoredItem, 'id'>
-  providers: Table<CustomProvider, 'id'>
+  workspaces: Table<Workspace | Folder, string>
+  dialogs: Table<Dialog, string>
+  messages: Table<Message, string>
+  assistants: Table<Assistant, string>
+  artifacts: Table<Artifact, string>
+  installedPluginsV2: Table<InstalledPlugin, string>
+  reactives: Table<StoredReactive, string>
+  avatarImages: Table<AvatarImage, string>
+  items: Table<StoredItem, string>
+  providers: Table<CustomProvider, string>
 }
 
 const db = new Dexie('data') as Db

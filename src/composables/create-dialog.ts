@@ -1,4 +1,5 @@
 import { db } from 'src/utils/db'
+import { syncClient } from 'src/utils/sync-client'
 import { genId } from 'src/utils/functions'
 import { Dialog, Workspace } from 'src/utils/types'
 import { Ref } from 'vue'
@@ -12,30 +13,30 @@ export function useCreateDialog(workspace: Ref<Workspace>) {
   async function createDialog(props: Partial<Dialog> = {}) {
     const id = genId()
     const messageId = genId()
+    const dialog = {
+      id,
+      workspaceId: workspace.value.id,
+      name: t('createDialog.newDialog'),
+      msgTree: { $root: [messageId], [messageId]: [] },
+      msgRoute: [],
+      msgBranchState: {},
+      assistantId: workspace.value.defaultAssistantId,
+      inputVars: {},
+      ...props
+    }
+    const message = {
+      id: messageId,
+      dialogId: id,
+      type: 'user',
+      contents: [{ type: 'user-message', text: '', items: [] }],
+      status: 'inputing'
+    }
     await db.transaction('rw', db.dialogs, db.messages, () => {
-      db.dialogs.add({
-        id,
-        workspaceId: workspace.value.id,
-        name: t('createDialog.newDialog'),
-        msgTree: { $root: [messageId], [messageId]: [] },
-        msgRoute: [],
-        msgBranchState: {},
-        assistantId: workspace.value.defaultAssistantId,
-        inputVars: {},
-        ...props
-      })
-      db.messages.add({
-        id: messageId,
-        dialogId: id,
-        type: 'user',
-        contents: [{
-          type: 'user-message',
-          text: '',
-          items: []
-        }],
-        status: 'inputing'
-      })
+      db.dialogs.add(dialog)
+      db.messages.add(message)
     })
+    void syncClient.push('dialogs', 'put', dialog)
+    void syncClient.push('messages', 'put', message)
     router.push(`/workspaces/${workspace.value.id}/dialogs/${id}`)
   }
   return { createDialog }

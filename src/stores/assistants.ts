@@ -5,12 +5,13 @@ import { defaultAvatar, genId } from 'src/utils/functions'
 import { Assistant } from 'src/utils/types'
 import { AssistantDefaultPrompt } from 'src/utils/templates'
 import { useI18n } from 'vue-i18n'
+import { syncClient } from 'src/utils/sync-client'
 
 export const useAssistantsStore = defineStore('assistants', () => {
   const assistants = useLiveQuery(() => db.assistants.toArray(), { initialValue: [] as Assistant[] })
   const { t } = useI18n()
   async function add(props: Partial<Assistant> = {}) {
-    return await db.assistants.add({
+    const assistant = {
       name: t('stores.assistants.newAssistant'),
       id: genId(),
       avatar: defaultAvatar('AI'),
@@ -25,19 +26,28 @@ export const useAssistantsStore = defineStore('assistants', () => {
       promptRole: 'system',
       stream: true,
       ...props
-    })
+    }
+    await db.assistants.add(assistant)
+    void syncClient.push('assistants', 'put', assistant)
+    return assistant.id
   }
 
   async function update(id: string, changes) {
-    return await db.assistants.update(id, changes)
+    const result = await db.assistants.update(id, changes)
+    void syncClient.push('assistants', 'put', id)
+    return result
   }
 
   async function put(assistant: Assistant) {
-    return await db.assistants.put(assistant)
+    const result = await db.assistants.put(assistant)
+    void syncClient.push('assistants', 'put', assistant)
+    return result
   }
 
   async function delete_(id: string) {
-    return await db.assistants.delete(id)
+    const result = await db.assistants.delete(id)
+    void syncClient.push('assistants', 'delete', id)
+    return result
   }
 
   return {

@@ -42,6 +42,7 @@ import MenuItem from './MenuItem.vue'
 import SelectWorkspaceDialog from './SelectWorkspaceDialog.vue'
 import { Artifact } from 'src/utils/types'
 import { db } from 'src/utils/db'
+import { syncClient } from 'src/utils/sync-client'
 import { artifactUnsaved, saveArtifactChanges } from 'src/utils/functions'
 import { useI18n } from 'vue-i18n'
 import { exportFile } from 'src/utils/platform-api'
@@ -64,8 +65,9 @@ function renameItem({ id, name }) {
     },
     cancel: true,
     ...dialogOptions
-  }).onOk(newName => {
-    db.artifacts.update(id, { name: newName.trim() })
+  }).onOk(async newName => {
+    await db.artifacts.update(id, { name: newName.trim() })
+    void syncClient.push('artifacts', 'put', id)
   })
 }
 function moveItem({ id }) {
@@ -74,8 +76,9 @@ function moveItem({ id }) {
     componentProps: {
       accept: 'workspace'
     }
-  }).onOk(workspaceId => {
-    db.artifacts.update(id, { workspaceId })
+  }).onOk(async workspaceId => {
+    await db.artifacts.update(id, { workspaceId })
+    void syncClient.push('artifacts', 'put', id)
   })
 }
 function downloadItem({ name, versions, currIndex }) {
@@ -92,12 +95,14 @@ function deleteItem({ id, name }) {
       flat: true
     },
     ...dialogOptions
-  }).onOk(() => {
-    db.artifacts.delete(id)
+  }).onOk(async () => {
+    await db.artifacts.delete(id)
+    void syncClient.push('artifacts', 'delete', id)
   })
 }
 function saveItem(artifact: Artifact) {
   db.artifacts.update(artifact.id, saveArtifactChanges(artifact))
+  void syncClient.push('artifacts', 'put', artifact.id)
 }
 </script>
 

@@ -427,7 +427,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ComponentPublicInstance, inject, onUnmounted, provide, ref, Ref, toRaw, toRef, watch, nextTick } from 'vue'
+import { computed, ComponentPublicInstance, inject, onMounted, onUnmounted, provide, ref, Ref, toRaw, toRef, watch, nextTick } from 'vue'
 import { db } from 'src/utils/db'
 import { useLiveQueryWithDeps } from 'src/composables/live-query'
 import { almostEqual, displayLength, genId, inputValueEmpty, isPlatformEnabled, isTextFile, JSONEqual, mimeTypeMatch, pageFhStyle, textBeginning, wrapCode, wrapQuote } from 'src/utils/functions'
@@ -473,6 +473,7 @@ import { useGetModel } from 'src/composables/get-model'
 import { useUiStateStore } from 'src/stores/ui-state'
 import AutocompleteInput from 'src/components/AutocompleteInput.vue'
 import { useProvidersStore } from 'src/stores/providers'
+import { syncClient } from 'src/utils/sync-client'
 
 const { t, locale } = useI18n()
 
@@ -493,9 +494,16 @@ const liveData = useLiveQueryWithDeps(() => props.id, async () => {
 }, { initialValue: { dialog: null, messages: [], items: [] } as { dialog: Dialog, messages: Message[], items: StoredItem[] } })
 const dialog = syncRef<Dialog>(
   () => liveData.value.dialog,
-  val => { db.dialogs.put(toRaw(val)) },
+  val => {
+    db.dialogs.put(toRaw(val))
+    void syncClient.push('dialogs', 'put', toRaw(val))
+  },
   { valueDeep: true }
 )
+onMounted(() => {
+  void syncClient.fetchMessagesOfDialog(props.id)
+  void syncClient.fetchItemsOfDialog(props.id)
+})
 const assistantsStore = useAssistantsStore()
 const workspace: Ref<Workspace> = inject('workspace')
 const assistants = computed(() => assistantsStore.assistants.filter(
@@ -648,6 +656,8 @@ async function appendMessage(target, info: Partial<Message>, insert = false, sel
     }
     await db.dialogs.update(props.id, dialogChanges)
   })
+  void syncClient.push('messages', 'put', id)
+  void syncClient.push('dialogs', 'put', props.id)
   return id
 }
 function expandMessageTree(root): string[] {
@@ -931,8 +941,9 @@ function quote(item: ApiResultItem) {
 async function addInputItems(items: ApiResultItem[]) {
   const storedItems = items.map(i => ({ ...i, id: genId(), dialogId: props.id, references: 0 }))
   const ids = storedItems.map(i => i.id)
+  const msgId = chain.value.at(-1)!
   await db.transaction('rw', db.messages, db.items, () => {
-    db.messages.update(chain.value.at(-1), {
+    db.messages.update(msgId, {
       // use shallow keyPath to avoid dexie's sync bug
       contents: [{
         ...inputMessageContent.value,
@@ -941,6 +952,10 @@ async function addInputItems(items: ApiResultItem[]) {
     })
     saveItems(storedItems)
   })
+  void syncClient.push('messages', 'put', msgId)
+  for (const item of storedItems) {
+    void syncClient.push('items', 'put', item)
+  }
 }
 
 async function saveItems(items: StoredItem[]) {
@@ -1269,6 +1284,7 @@ async function stream(target, insert = false) {
     const usage = await result.usage
     const warnings = (await result.warnings).map(w => (w.type === 'unsupported-setting' || w.type === 'unsupported-tool') ? w.details : w.message)
     await db.messages.update(id, { contents, status: 'default', generatingSession: null, warnings, usage })
+    void syncClient.push('messages', 'put', id)
   } catch (e) {
     console.error(e)
     if (e.data?.error?.type === 'budget_exceeded') {
@@ -1280,6 +1296,7 @@ async function stream(target, insert = false) {
       })
     }
     await db.messages.update(id, { contents, error: e.message || e.toString(), status: 'failed', generatingSession: null })
+    void syncClient.push('messages', 'put', id)
   }
   perfs.artifactsAutoExtract && autoExtractArtifact()
   lockingBottom.value = false
@@ -1337,6 +1354,7 @@ async function genTitle() {
       })
     })
     await db.dialogs.update(dialogId, { name: text })
+    void syncClient.push('dialogs', 'put', dialogId)
   } catch (e) {
     console.error(e)
     $q.notify({ message: t('dialogView.summarizeFailed'), color: 'negative' })
@@ -1585,6 +1603,7 @@ async function extractArtifact(message: Message, text: string, pattern, options:
   await db.messages.update(message.id, {
     [`contents.${index}.text`]: content.text.replace(pattern, to) as any
   })
+  void syncClient.push('messages', 'put', message.id)
 }
 async function autoExtractArtifact() {
   const message = messageMap.value[chain.value.at(-2)]

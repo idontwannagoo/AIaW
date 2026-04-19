@@ -2,6 +2,7 @@ import { Object as TObject } from '@sinclair/typebox'
 import { defineStore } from 'pinia'
 import { useLiveQuery } from 'src/composables/live-query'
 import { db } from 'src/utils/db'
+import { syncClient } from 'src/utils/sync-client'
 import { genId, removeDuplicates } from 'src/utils/functions'
 import { CustomProvider, Provider, ProviderType } from 'src/utils/types'
 import { modelOptions as baseModelOptions, ProviderTypes } from 'src/utils/values'
@@ -67,7 +68,7 @@ export const useProvidersStore = defineStore('providers', () => {
   ]))
   const { t } = useI18n()
   async function add(props: Partial<CustomProvider> = {}) {
-    return await db.providers.add({
+    const provider = {
       name: t('stores.providers.newProvider'),
       id: genId(),
       avatar: {
@@ -77,19 +78,28 @@ export const useProvidersStore = defineStore('providers', () => {
       },
       subproviders: [],
       ...props
-    })
+    }
+    await db.providers.add(provider)
+    void syncClient.push('providers', 'put', provider)
+    return provider.id
   }
 
   async function update(id: string, changes) {
-    return await db.providers.update(id, changes)
+    const result = await db.providers.update(id, changes)
+    void syncClient.push('providers', 'put', id)
+    return result
   }
 
   async function put(provider: CustomProvider) {
-    return await db.providers.put(provider)
+    const result = await db.providers.put(provider)
+    void syncClient.push('providers', 'put', provider)
+    return result
   }
 
   async function delete_(id: string) {
-    return await db.providers.delete(id)
+    const result = await db.providers.delete(id)
+    void syncClient.push('providers', 'delete', id)
+    return result
   }
 
   return {

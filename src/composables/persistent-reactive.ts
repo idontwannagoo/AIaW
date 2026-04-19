@@ -1,5 +1,6 @@
 import { watch, reactive, toRaw, ref } from 'vue'
 import { db } from 'src/utils/db'
+import { syncClient } from 'src/utils/sync-client'
 import { useLiveQuery } from './live-query'
 
 export function persistentReactive<T extends object>(key: string, value: T) {
@@ -13,6 +14,7 @@ export function persistentReactive<T extends object>(key: string, value: T) {
       return
     }
     db.reactives.put({ key, value: toRaw(val) })
+    void syncClient.push('reactives', 'put', key)
   })
   const source = useLiveQuery(() => db.reactives.get(key), { initialValue: 'initial' as const })
   watch(source, newVal => {

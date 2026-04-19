@@ -1,6 +1,7 @@
 import { useQuasar } from 'quasar'
 import SaveDialog from 'src/components/SaveDialog.vue'
 import { db } from 'src/utils/db'
+import { syncClient } from 'src/utils/sync-client'
 import { restoreArtifactChanges, saveArtifactChanges } from 'src/utils/functions'
 import { Artifact } from 'src/utils/types'
 
@@ -13,12 +14,14 @@ export function useCloseArtifact() {
         componentProps: {
           name: artifact.name
         }
-      }).onOk((save: boolean) => {
+      }).onOk(async (save: boolean) => {
         const changes = save ? saveArtifactChanges(artifact) : restoreArtifactChanges(artifact)
-        db.artifacts.update(artifact.id, { open: false, ...changes })
+        await db.artifacts.update(artifact.id, { open: false, ...changes })
+        void syncClient.push('artifacts', 'put', artifact.id)
       })
     } else {
       db.artifacts.update(artifact.id, { open: false })
+      void syncClient.push('artifacts', 'put', artifact.id)
     }
   }
   return { closeArtifact }

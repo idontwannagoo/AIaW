@@ -67,10 +67,11 @@
 <script setup lang="ts">
 import { useQuasar } from 'quasar'
 import { db } from 'src/utils/db'
+import { syncClient } from 'src/utils/sync-client'
 import { isPlatformEnabled } from 'src/utils/functions'
 import { Dialog, Workspace } from 'src/utils/types'
 import { dialogOptions } from 'src/utils/values'
-import { inject, Ref, toRef } from 'vue'
+import { inject, onMounted, Ref, toRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import SelectWorkspaceDialog from './SelectWorkspaceDialog.vue'
 import { useCreateDialog } from 'src/composables/create-dialog'
@@ -83,6 +84,10 @@ const workspace: Ref<Workspace> = inject('workspace')
 const dialogs: Ref<Dialog[]> = inject('dialogs')
 
 const $q = useQuasar()
+
+onMounted(() => {
+  void syncClient.fetchDialogsOfWorkspace(workspace.value?.id)
+})
 
 const { createDialog } = useCreateDialog(workspace)
 async function addItem() {
@@ -100,8 +105,9 @@ function renameItem({ id, name }) {
     },
     cancel: true,
     ...dialogOptions
-  }).onOk(newName => {
-    db.dialogs.update(id, { name: newName.trim() })
+  }).onOk(async newName => {
+    await db.dialogs.update(id, { name: newName.trim() })
+    void syncClient.push('dialogs', 'put', id)
   })
 }
 function moveItem({ id }) {
@@ -110,8 +116,9 @@ function moveItem({ id }) {
     componentProps: {
       accept: 'workspace'
     }
-  }).onOk(workspaceId => {
-    db.dialogs.update(id, { workspaceId })
+  }).onOk(async workspaceId => {
+    await db.dialogs.update(id, { workspaceId })
+    void syncClient.push('dialogs', 'put', id)
   })
 }
 function deleteItem({ id, name }) {
@@ -125,12 +132,13 @@ function deleteItem({ id, name }) {
       flat: true
     },
     ...dialogOptions
-  }).onOk(() => {
-    db.transaction('rw', db.dialogs, db.messages, db.items, async () => {
+  }).onOk(async () => {
+    await db.transaction('rw', db.dialogs, db.messages, db.items, async () => {
       await db.dialogs.delete(id)
       await db.messages.where('dialogId').equals(id).delete()
       await db.items.where('dialogId').equals(id).delete()
     })
+    void syncClient.push('dialogs', 'delete', id)
   })
 }
 
