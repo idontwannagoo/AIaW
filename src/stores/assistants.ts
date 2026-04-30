@@ -1,16 +1,16 @@
 import { defineStore } from 'pinia'
-import { useLiveQuery } from 'src/composables/live-query'
-import { db, defaultModelSettings } from 'src/utils/db'
+import { repos } from 'src/data'
+import { defaultModelSettings } from 'src/utils/db'
 import { defaultAvatar, genId } from 'src/utils/functions'
 import { Assistant } from 'src/utils/types'
 import { AssistantDefaultPrompt } from 'src/utils/templates'
 import { useI18n } from 'vue-i18n'
 
 export const useAssistantsStore = defineStore('assistants', () => {
-  const assistants = useLiveQuery(() => db.assistants.toArray(), { initialValue: [] as Assistant[] })
+  const assistants = repos.assistants.observeList<Assistant[]>({ initialValue: [] })
   const { t } = useI18n()
   async function add(props: Partial<Assistant> = {}) {
-    return await db.assistants.add({
+    return await repos.assistants.add({
       name: t('stores.assistants.newAssistant'),
       id: genId(),
       avatar: defaultAvatar('AI'),
@@ -25,19 +25,19 @@ export const useAssistantsStore = defineStore('assistants', () => {
       promptRole: 'system',
       stream: true,
       ...props
-    })
+    } as Assistant)
   }
 
   async function update(id: string, changes) {
-    return await db.assistants.update(id, changes)
+    return await repos.assistants.update(id, changes)
   }
 
   async function put(assistant: Assistant) {
-    return await db.assistants.put(assistant)
+    return await repos.assistants.put(assistant)
   }
 
   async function delete_(id: string) {
-    return await db.assistants.delete(id)
+    return await repos.assistants.delete(id)
   }
 
   return {

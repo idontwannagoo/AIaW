@@ -80,7 +80,7 @@
 
 <script setup lang="ts">
 import { QList, useDialogPluginComponent } from 'quasar'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import { caselessIncludes, escapeRegex } from 'src/utils/functions'
 import { Dialog } from 'src/utils/types'
 import { nextTick, watch, ref, watchEffect } from 'vue'
@@ -107,11 +107,11 @@ const dialogs = ref<Dialog[]>(null)
 const docs = ref<Doc[]>(null)
 watchEffect(async () => {
   dialogs.value = global.value
-    ? await db.dialogs.toArray()
-    : await db.dialogs.where('workspaceId').equals(props.workspaceId).toArray()
+    ? await repos.dialogs.list()
+    : await repos.dialogs.find({ where: { workspaceId: props.workspaceId } })
   const messages = global.value
-    ? await db.messages.toArray()
-    : await db.messages.where('dialogId').anyOf(dialogs.value.map(d => d.id)).toArray()
+    ? await repos.messages.list()
+    : await repos.messages.find({ where: { dialogId: dialogs.value.map(d => d.id) } })
   docs.value = messages.map(m => ({
     id: m.id,
     dialogId: m.dialogId,

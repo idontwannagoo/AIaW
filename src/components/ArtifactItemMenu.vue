@@ -41,7 +41,7 @@ import { dialogOptions } from 'src/utils/values'
 import MenuItem from './MenuItem.vue'
 import SelectWorkspaceDialog from './SelectWorkspaceDialog.vue'
 import { Artifact } from 'src/utils/types'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import { artifactUnsaved, saveArtifactChanges } from 'src/utils/functions'
 import { useI18n } from 'vue-i18n'
 import { exportFile } from 'src/utils/platform-api'
@@ -65,7 +65,7 @@ function renameItem({ id, name }) {
     cancel: true,
     ...dialogOptions
   }).onOk(newName => {
-    db.artifacts.update(id, { name: newName.trim() })
+    repos.artifacts.update(id, { name: newName.trim() })
   })
 }
 function moveItem({ id }) {
@@ -75,7 +75,7 @@ function moveItem({ id }) {
       accept: 'workspace'
     }
   }).onOk(workspaceId => {
-    db.artifacts.update(id, { workspaceId })
+    repos.artifacts.update(id, { workspaceId })
   })
 }
 function downloadItem({ name, versions, currIndex }) {
@@ -93,11 +93,11 @@ function deleteItem({ id, name }) {
     },
     ...dialogOptions
   }).onOk(() => {
-    db.artifacts.delete(id)
+    repos.artifacts.delete(id)
   })
 }
 function saveItem(artifact: Artifact) {
-  db.artifacts.update(artifact.id, saveArtifactChanges(artifact))
+  repos.artifacts.update(artifact.id, saveArtifactChanges(artifact))
 }
 </script>
 

@@ -428,8 +428,7 @@
 
 <script setup lang="ts">
 import { computed, ComponentPublicInstance, inject, onUnmounted, provide, ref, Ref, toRaw, toRef, watch, nextTick } from 'vue'
-import { db } from 'src/utils/db'
-import { useLiveQueryWithDeps } from 'src/composables/live-query'
+import { repos, runTx, observeWithDeps } from 'src/data'
 import { almostEqual, displayLength, genId, inputValueEmpty, isPlatformEnabled, isTextFile, JSONEqual, mimeTypeMatch, pageFhStyle, textBeginning, wrapCode, wrapQuote } from 'src/utils/functions'
 import { useAssistantsStore } from 'src/stores/assistants'
 import { streamText, generateText, tool, jsonSchema, StreamTextResult, GenerateTextResult, ModelMessage, stepCountIs } from 'ai'
@@ -483,17 +482,17 @@ const props = defineProps<{
 const rightDrawerAbove = inject('rightDrawerAbove')
 
 const dialogs: Ref<Dialog[]> = inject('dialogs')
-const liveData = useLiveQueryWithDeps(() => props.id, async () => {
+const liveData = observeWithDeps(() => props.id, async () => {
   const [dialog, messages, items] = await Promise.all([
-    db.dialogs.get(props.id),
-    db.messages.where('dialogId').equals(props.id).toArray(),
-    db.items.where('dialogId').equals(props.id).toArray()
+    repos.dialogs.get(props.id),
+    repos.messages.find({ where: { dialogId: props.id } }),
+    repos.items.find({ where: { dialogId: props.id } })
   ])
   return { dialog, messages, items }
 }, { initialValue: { dialog: null, messages: [], items: [] } as { dialog: Dialog, messages: Message[], items: StoredItem[] } })
 const dialog = syncRef<Dialog>(
   () => liveData.value.dialog,
-  val => { db.dialogs.put(toRaw(val)) },
+  val => { repos.dialogs.put(toRaw(val)) },
   { valueDeep: true }
 )
 const assistantsStore = useAssistantsStore()
@@ -547,7 +546,7 @@ function updateChain(routeOrBranchState: number[] | Record<string, number>) {
     : routeOrBranchState
   const res = getChain(liveData.value.dialog.msgTree, '$root', branchState)
   historyChain.value = res[0]
-  db.dialogs.update(dialog.value.id, { msgRoute: res[1], msgBranchState: branchState })
+  repos.dialogs.update(dialog.value.id, { msgRoute: res[1], msgBranchState: branchState })
 }
 watch([() => liveData.value.messages.length, () => liveData.value.dialog?.id], () => {
   liveData.value.dialog && updateChain(liveData.value.dialog.msgRoute)
@@ -567,7 +566,7 @@ function focusInput() {
 async function edit(index) {
   const target = chain.value[index - 1]
   const { type, contents } = messageMap.value[chain.value[index]]
-  await db.transaction('rw', db.dialogs, db.messages, db.items, async () => {
+  await runTx(['dialogs', 'messages', 'items'], async () => {
     await appendMessage(target, {
       type,
       contents,
@@ -602,32 +601,32 @@ async function deleteBranch(index) {
     else if (c.type === 'assistant-tool') return c.result || []
     else return []
   })
-  await db.transaction('rw', db.dialogs, db.messages, db.items, () => {
-    db.messages.bulkDelete(ids)
+  await runTx(['dialogs', 'messages', 'items'], () => {
+    repos.messages.bulkDelete(ids)
     itemIds.forEach(id => {
       let { references } = itemMap.value[id]
       references--
-      references === 0 ? db.items.delete(id) : db.items.update(id, { references })
+      references === 0 ? repos.items.delete(id) : repos.items.update(id, { references })
     })
     const msgTree = { ...toRaw(dialog.value.msgTree) }
     msgTree[parent] = msgTree[parent].filter(id => id !== anchor)
     ids.forEach(id => {
       delete msgTree[id]
     })
-    db.dialogs.update(props.id, { msgTree })
+    repos.dialogs.update(props.id, { msgTree })
   })
 }
 
 async function appendMessage(target, info: Partial<Message>, insert = false, selectBranch = false) {
   const id = genId()
-  await db.transaction('rw', db.dialogs, db.messages, async () => {
-    await db.messages.add({
+  await runTx(['dialogs', 'messages'], async () => {
+    await repos.messages.add({
       id,
       dialogId: dialog.value.id,
       workspaceId: dialog.value.workspaceId,
       ...info
     } as Message)
-    const d = await db.dialogs.get(props.id)
+    const d = await repos.dialogs.get(props.id)
     const children = d.msgTree[target]
     const changes = insert ? {
       [target]: [id],
@@ -646,7 +645,7 @@ async function appendMessage(target, info: Partial<Message>, insert = false, sel
       dialogChanges.msgBranchState = branchState
       dialogChanges.msgRoute = getChain(msgTree, '$root', branchState)[1]
     }
-    await db.dialogs.update(props.id, dialogChanges)
+    await repos.dialogs.update(props.id, dialogChanges)
   })
   return id
 }
@@ -801,7 +800,7 @@ async function updateInputText(text) {
   pendingTimeout = window.setTimeout(() => {
     pendingTexts.splice(0)
   }, 200)
-  await db.messages.update(chain.value.at(-1), {
+  await repos.messages.update(chain.value.at(-1), {
     // use shallow keyPath to avoid dexie's sync bug
     contents: [{
       ...inputMessageContent.value,
@@ -866,15 +865,15 @@ onUnmounted(() => removeEventListener('paste', onPaste))
 async function removeItem({ id, references }: StoredItem) {
   const items = [...inputMessageContent.value.items]
   items.splice(items.indexOf(id), 1)
-  await db.transaction('rw', db.messages, db.items, () => {
-    db.messages.update(chain.value.at(-1), {
+  await runTx(['messages', 'items'], () => {
+    repos.messages.update(chain.value.at(-1), {
       contents: [{
         ...inputMessageContent.value,
         items
       }]
     })
     references--
-    references === 0 ? db.items.delete(id) : db.items.update(id, { references })
+    references === 0 ? repos.items.delete(id) : repos.items.update(id, { references })
   })
 }
 async function parseFiles(files: File[]) {
@@ -931,8 +930,8 @@ function quote(item: ApiResultItem) {
 async function addInputItems(items: ApiResultItem[]) {
   const storedItems = items.map(i => ({ ...i, id: genId(), dialogId: props.id, references: 0 }))
   const ids = storedItems.map(i => i.id)
-  await db.transaction('rw', db.messages, db.items, () => {
-    db.messages.update(chain.value.at(-1), {
+  await runTx(['messages', 'items'], () => {
+    repos.messages.update(chain.value.at(-1), {
       // use shallow keyPath to avoid dexie's sync bug
       contents: [{
         ...inputMessageContent.value,
@@ -947,7 +946,7 @@ async function saveItems(items: StoredItem[]) {
   items.forEach(i => {
     i.references++
   })
-  await db.items.bulkPut(items)
+  await repos.items.bulkPut(items)
 }
 
 function getChainMessages() {
@@ -1091,7 +1090,7 @@ async function send() {
   }
   showVars.value = false
   const target = chain.value.at(-1)
-  await db.messages.update(target, { status: 'default' })
+  await repos.messages.update(target, { status: 'default' })
   until(chain).changed().then(() => {
     nextTick().then(() => {
       scroll('bottom')
@@ -1117,7 +1116,7 @@ async function stream(target, insert = false) {
   }
   const contents: MessageContent[] = [messageContent]
   let id
-  await db.transaction('rw', db.dialogs, db.messages, async () => {
+  await runTx(['dialogs', 'messages'], async () => {
     id = await appendMessage(target, {
       type: 'assistant',
       assistantId: assistant.value.id,
@@ -1137,7 +1136,7 @@ async function stream(target, insert = false) {
     })
   })
 
-  const update = throttle(() => db.messages.update(id, { contents }), 50)
+  const update = throttle(() => repos.messages.update(id, { contents }), 50)
   async function callTool(plugin: Plugin, api: PluginApi, args) {
     const content: MessageContent = {
       type: 'assistant-tool',
@@ -1247,7 +1246,7 @@ async function stream(target, insert = false) {
     let result: StreamTextResult<any, any> | GenerateTextResult<any, any>
     if (assistant.value.stream) {
       result = streamText(params)
-      await db.messages.update(id, { status: 'streaming' })
+      await repos.messages.update(id, { status: 'streaming' })
       lockingBottom.value = perfs.streamingLockBottom
       for await (const part of result.fullStream) {
         if (part.type === 'text-delta') {
@@ -1268,7 +1267,7 @@ async function stream(target, insert = false) {
 
     const usage = await result.usage
     const warnings = (await result.warnings).map(w => (w.type === 'unsupported-setting' || w.type === 'unsupported-tool') ? w.details : w.message)
-    await db.messages.update(id, { contents, status: 'default', generatingSession: null, warnings, usage })
+    await repos.messages.update(id, { contents, status: 'default', generatingSession: null, warnings, usage })
   } catch (e) {
     console.error(e)
     if (e.data?.error?.type === 'budget_exceeded') {
@@ -1279,7 +1278,7 @@ async function stream(target, insert = false) {
         actions: [{ label: t('dialogView.recharge'), color: 'on-sur', handler() { router.push('/account') } }]
       })
     }
-    await db.messages.update(id, { contents, error: e.message || e.toString(), status: 'failed', generatingSession: null })
+    await repos.messages.update(id, { contents, error: e.message || e.toString(), status: 'failed', generatingSession: null })
   }
   perfs.artifactsAutoExtract && autoExtractArtifact()
   lockingBottom.value = false
@@ -1336,7 +1335,7 @@ async function genTitle() {
         lang: locale.value
       })
     })
-    await db.dialogs.update(dialogId, { name: text })
+    await repos.dialogs.update(dialogId, { name: text })
   } catch (e) {
     console.error(e)
     $q.notify({ message: t('dialogView.summarizeFailed'), color: 'negative' })
@@ -1351,7 +1350,7 @@ async function copyContent() {
 const route = useRoute()
 const router = useRouter()
 watch(route, to => {
-  db.workspaces.update(workspace.value.id, { lastDialogId: props.id } as Partial<Workspace>)
+  repos.workspaces.update(workspace.value.id, { lastDialogId: props.id } as Partial<Workspace>)
 
   until(dialog).toMatch(val => val?.id === props.id).then(async () => {
     focusInput()
@@ -1582,7 +1581,7 @@ async function extractArtifact(message: Message, text: string, pattern, options:
   const to = `> ${t('dialogView.convertedToArtifact')}: <router-link to="?openArtifact=${id}">${name}</router-link>\n`
   const index = message.contents.findIndex(c => ['assistant-message', 'user-message'].includes(c.type))
   const content = message.contents[index] as UserMessageContent | AssistantMessageContent
-  await db.messages.update(message.id, {
+  await repos.messages.update(message.id, {
     [`contents.${index}.text`]: content.text.replace(pattern, to) as any
   })
 }

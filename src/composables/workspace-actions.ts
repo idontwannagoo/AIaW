@@ -6,7 +6,7 @@ import PickAvatarDialog from 'src/components/PickAvatarDialog.vue'
 import SelectWorkspaceDialog from 'src/components/SelectWorkspaceDialog.vue'
 import { genId } from 'src/utils/functions'
 import { useAssistantsStore } from 'src/stores/assistants'
-import { db } from 'src/utils/db'
+import { runTx } from 'src/data'
 import { useI18n } from 'vue-i18n'
 
 export function useWorkspaceActions() {
@@ -29,9 +29,9 @@ export function useWorkspaceActions() {
     }).onOk(name => {
       const workspaceId = genId()
       const assistantId = genId()
-      db.transaction('rw', db.workspaces, db.assistants, () => {
-        workspacesStore.addWorkspace({ id: workspaceId, name: name.trim(), parentId, defaultAssistantId: assistantId })
-        assistantsStore.add({ id: assistantId, name: t('workspace.defaultAssistant'), workspaceId })
+      runTx(['workspaces', 'assistants'], async () => {
+        await workspacesStore.addWorkspace({ id: workspaceId, name: name.trim(), parentId, defaultAssistantId: assistantId })
+        await assistantsStore.add({ id: assistantId, name: t('workspace.defaultAssistant'), workspaceId })
       })
     })
   }

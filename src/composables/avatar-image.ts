@@ -1,5 +1,5 @@
 import { Ref, ref, watch } from 'vue'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import { useFileURL } from './file-url'
 import { AvatarImage } from 'src/utils/types'
 
@@ -7,7 +7,7 @@ export function useAvatarImage(imageId: Ref<string>) {
   const image = ref<AvatarImage>(null)
   watch(imageId, to => {
     if (to) {
-      db.avatarImages.get(to).then(i => {
+      repos.avatarImages.get(to).then(i => {
         image.value = i
       })
     } else {

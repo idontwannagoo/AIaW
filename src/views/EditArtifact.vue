@@ -101,7 +101,7 @@
 import CodeJar from 'src/components/CodeJar.vue'
 import { useListenKey } from 'src/composables/listen-key'
 import { useUserPerfsStore } from 'src/stores/user-perfs'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import { artifactUnsaved, saveArtifactChanges } from 'src/utils/functions'
 import { Artifact } from 'src/utils/types'
 import { computed, ref, toRef, watchEffect } from 'vue'
@@ -113,7 +113,7 @@ const props = defineProps<{
 }>()
 
 function update(changes: Partial<Artifact>) {
-  db.artifacts.update(props.artifact.id, changes)
+  repos.artifacts.update(props.artifact.id, changes)
 }
 function setIndex(index: number) {
   update({
@@ -124,7 +124,7 @@ function setIndex(index: number) {
 function save() {
   const { artifact } = props
   if (!artifactUnsaved(artifact)) return
-  db.artifacts.update(artifact.id, saveArtifactChanges(artifact))
+  repos.artifacts.update(artifact.id, saveArtifactChanges(artifact))
 }
 const { perfs } = useUserPerfsStore()
 useListenKey(toRef(perfs, 'saveArtifactKey'), save)

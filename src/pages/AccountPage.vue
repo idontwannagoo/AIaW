@@ -199,8 +199,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useUiStateStore } from 'src/stores/ui-state'
-import { useObservable } from '@vueuse/rxjs'
-import { db } from 'src/utils/db'
+import { authSource } from 'src/data'
 import { useQuasar } from 'quasar'
 import SubscribeDialog from 'src/components/SubscribeDialog.vue'
 import { BudgetBaseURL, LitellmBaseURL, SyncServicePrice, SyncServicePriceUSD } from 'src/utils/config'
@@ -213,18 +212,18 @@ import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
 
-const user = useObservable(db.cloud.currentUser)
+const user = authSource.user
 const router = useRouter()
-db.on('ready', () => {
-  if (!user.value.isLoggedIn) {
+authSource.onReady(() => {
+  if (!user.value?.isLoggedIn) {
     router.replace('/')
-    db.cloud.login()
+    authSource.login()
   } else {
     refreshLlmBalance()
   }
 })
 const licenseStatus = computed(() => {
-  switch (user.value.license.status) {
+  switch (user.value?.license?.status) {
     case 'ok': return t('accountPage.licenseOk')
     case 'expired': return t('accountPage.licenseExpired')
     case 'deactivated': return t('accountPage.licenseDeactivated')
@@ -245,7 +244,7 @@ function subscribeDialog() {
         link: res.payUrl
       }
     }).onOk(() => {
-      db.cloud.sync()
+      authSource.sync()
     })
   })
 }
@@ -261,13 +260,13 @@ function topupDialog() {
       }
     }).onOk(() => {
       refreshLlmBalance()
-      db.cloud.sync()
+      authSource.sync()
     })
   })
 }
 
 async function logout() {
-  await db.cloud.logout()
+  await authSource.logout()
   router.replace('/')
 }
 
@@ -277,7 +276,7 @@ async function refreshLlmBalance() {
   const resp = await fetch(`${LitellmBaseURL}/key/info`, {
     method: 'GET',
     headers: {
-      Authorization: `Bearer ${user.value.data.apiKey}`
+      Authorization: `Bearer ${user.value?.data?.apiKey}`
     }
   })
   const { info, error } = await resp.json()

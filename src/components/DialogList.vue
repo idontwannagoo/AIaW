@@ -66,7 +66,7 @@
 
 <script setup lang="ts">
 import { useQuasar } from 'quasar'
-import { db } from 'src/utils/db'
+import { repos, runTx } from 'src/data'
 import { isPlatformEnabled } from 'src/utils/functions'
 import { Dialog, Workspace } from 'src/utils/types'
 import { dialogOptions } from 'src/utils/values'
@@ -101,7 +101,7 @@ function renameItem({ id, name }) {
     cancel: true,
     ...dialogOptions
   }).onOk(newName => {
-    db.dialogs.update(id, { name: newName.trim() })
+    repos.dialogs.update(id, { name: newName.trim() })
   })
 }
 function moveItem({ id }) {
@@ -111,7 +111,7 @@ function moveItem({ id }) {
       accept: 'workspace'
     }
   }).onOk(workspaceId => {
-    db.dialogs.update(id, { workspaceId })
+    repos.dialogs.update(id, { workspaceId })
   })
 }
 function deleteItem({ id, name }) {
@@ -126,10 +126,10 @@ function deleteItem({ id, name }) {
     },
     ...dialogOptions
   }).onOk(() => {
-    db.transaction('rw', db.dialogs, db.messages, db.items, async () => {
-      await db.dialogs.delete(id)
-      await db.messages.where('dialogId').equals(id).delete()
-      await db.items.where('dialogId').equals(id).delete()
+    runTx(['dialogs', 'messages', 'items'], async () => {
+      await repos.dialogs.delete(id)
+      await repos.messages.deleteWhere({ where: { dialogId: id } })
+      await repos.items.deleteWhere({ where: { dialogId: id } })
     })
   })
 }

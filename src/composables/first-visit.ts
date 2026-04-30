@@ -1,6 +1,6 @@
 import { useQuasar } from 'quasar'
 import { DexieDBURL, LitellmBaseURL } from 'src/utils/config'
-import { db } from 'src/utils/db'
+import { authSource } from 'src/data'
 import { localData } from 'src/utils/local-data'
 import { dialogOptions } from 'src/utils/values'
 import { onMounted } from 'vue'
@@ -42,7 +42,7 @@ export function useFirstVisit() {
         router.push('/settings')
         localData.visited = true
       }).onOk(() => {
-        db.cloud.login()
+        authSource.login()
         localData.visited = true
       })
     }

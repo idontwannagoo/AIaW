@@ -57,9 +57,8 @@
 </template>
 
 <script setup lang="ts">
-import { importInto } from 'dexie-export-import'
 import { useDialogPluginComponent, useQuasar } from 'quasar'
-import { db } from 'src/utils/db'
+import { importData as runImport } from 'src/data'
 import { reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -81,7 +80,7 @@ const loading = ref(false)
 function importData() {
   const { force, overwrite, clear } = options
   loading.value = true
-  importInto(db, file.value, {
+  runImport(file.value, {
     acceptMissingTables: force,
     acceptVersionDiff: force,
     overwriteValues: overwrite,

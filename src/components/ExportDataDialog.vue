@@ -38,9 +38,8 @@
 </template>
 
 <script setup lang="ts">
-import { exportDB } from 'dexie-export-import'
 import { useDialogPluginComponent, useQuasar } from 'quasar'
-import { db, schema } from 'src/utils/db'
+import { exportData as runExport, exportSchema } from 'src/data'
 import { exportFile } from 'src/utils/platform-api'
 import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -59,10 +58,10 @@ const { dialogRef, onDialogHide, onDialogOK, onDialogCancel } = useDialogPluginC
 
 function exportData() {
   const options = removeUserMark.value ? {
-    filter: table => Object.keys(schema).includes(table),
+    filter: table => Object.keys(exportSchema).includes(table),
     transform: (table, value) => ({ value: { ...value, owner: 'unauthorized', realmId: 'unauthorized' } })
   } : {}
-  exportDB(db, options).then(async blob => {
+  runExport(options).then(async blob => {
     await exportFile('aiaw_user_db.json', blob)
     onDialogOK()
   }).catch(err => {

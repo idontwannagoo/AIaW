@@ -163,20 +163,19 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue'
 import { useUiStateStore } from 'src/stores/ui-state'
-import { useObservable } from '@vueuse/rxjs'
-import { db } from 'src/utils/db'
+import { authSource } from 'src/data'
 import { useQuasar } from 'quasar'
 import { LitellmBaseURL, UsdToCnyRate } from 'src/utils/config'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import ModelItem from 'src/components/ModelItem.vue'
 
-const user = useObservable(db.cloud.currentUser)
+const user = authSource.user
 const router = useRouter()
-db.on('ready', () => {
-  if (!user.value.isLoggedIn) {
+authSource.onReady(() => {
+  if (!user.value?.isLoggedIn) {
     router.replace('/')
-    db.cloud.login()
+    authSource.login()
   } else {
     loadModels()
   }
@@ -224,7 +223,7 @@ async function loadModels() {
     const resp = await fetch(`${LitellmBaseURL}/model/info`, {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${user.value.data.apiKey}`
+        Authorization: `Bearer ${user.value?.data?.apiKey}`
       }
     })
     if (!resp.ok) {

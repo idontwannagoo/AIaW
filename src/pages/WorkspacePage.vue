@@ -149,9 +149,8 @@ import { computed, provide, ref, watch } from 'vue'
 import AssistantsExpansion from 'src/components/AssistantsExpansion.vue'
 import ArtifactsExpansion from 'src/components/ArtifactsExpansion.vue'
 import { useWorkspacesStore } from 'src/stores/workspaces'
-import { useLiveQueryWithDeps } from 'src/composables/live-query'
-import { db } from 'src/utils/db'
-import { Workspace, Dialog, Artifact } from 'src/utils/types'
+import { repos } from 'src/data'
+import { Workspace } from 'src/utils/types'
 import { useUserDataStore } from 'src/stores/user-data'
 import { useQuasar } from 'quasar'
 import ErrorNotFound from 'src/pages/ErrorNotFound.vue'
@@ -172,8 +171,8 @@ const props = defineProps<{
 const workspacesStore = useWorkspacesStore()
 
 const workspace = computed(() => workspacesStore.workspaces.find(item => item.id === props.id) as Workspace)
-const dialogs = useLiveQueryWithDeps(() => props.id, () => db.dialogs.where('workspaceId').equals(props.id).toArray(), { initialValue: [] as Dialog[] })
-const artifacts = useLiveQueryWithDeps(() => props.id, () => db.artifacts.where('workspaceId').equals(props.id).toArray(), { initialValue: [] as Artifact[] })
+const dialogs = repos.dialogs.observeFind(() => ({ where: { workspaceId: props.id } }), { initialValue: [], deps: () => props.id })
+const artifacts = repos.artifacts.observeFind(() => ({ where: { workspaceId: props.id } }), { initialValue: [], deps: () => props.id })
 
 provide('workspace', workspace)
 provide('dialogs', dialogs)
@@ -201,7 +200,7 @@ watch(() => route.query.openArtifact, val => {
   if (!val) return
   const artifact = artifacts.value.find(a => a.id === val)
   if (artifact) {
-    !artifact.open && db.artifacts.update(artifact.id, { open: true })
+    !artifact.open && repos.artifacts.update(artifact.id, { open: true })
     router.replace({ query: { artifactId: artifact.id } })
   } else {
     router.replace({ query: { artifactId: focusedArtifact.value?.id } })
@@ -232,7 +231,7 @@ provide('workspace', workspace)
 const { perfs } = useUserPerfsStore()
 
 function setListOpen(key: keyof Workspace['listOpen'], value: boolean) {
-  db.workspaces.update(workspace.value.id, {
+  repos.workspaces.update(workspace.value.id, {
     listOpen: { ...workspace.value.listOpen, [key]: value }
   } as Partial<Workspace>)
 }

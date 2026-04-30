@@ -1,15 +1,13 @@
 import { until } from '@vueuse/core'
-import { useObservable } from '@vueuse/rxjs'
 import { useQuasar } from 'quasar'
 import { useUserDataStore } from 'src/stores/user-data'
-import { DexieDBURL } from 'src/utils/config'
-import { db } from 'src/utils/db'
+import { authSource } from 'src/data'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 
 export function useSubscriptionNotify() {
-  if (!DexieDBURL) return
-  const user = useObservable(db.cloud.currentUser)
+  if (!authSource.enabled) return
+  const user = authSource.user
   const router = useRouter()
   const $q = useQuasar()
   const store = useUserDataStore()
@@ -19,8 +17,8 @@ export function useSubscriptionNotify() {
     router.push('/account')
   }
   function notify() {
-    if (!user.value.isLoggedIn) return
-    if (user.value.license.type === 'eval') {
+    if (!user.value?.isLoggedIn) return
+    if (user.value.license?.type === 'eval') {
       if (user.value.license.evalDaysLeft <= 0) {
         if (data.evalExpiredNotified) return
         $q.notify({
@@ -45,7 +43,7 @@ export function useSubscriptionNotify() {
           }]
         })
       }
-    } else if (user.value.license.type === 'prod') {
+    } else if (user.value.license?.type === 'prod') {
       const { validUntil } = user.value.license
       if (validUntil < new Date()) {
         if (data.prodExpiredNotifiedTimestamp === validUntil.getTime()) return

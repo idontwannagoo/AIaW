@@ -322,7 +322,7 @@
 
 <script setup lang="ts">
 import { MdPreview, MdCatalog } from 'md-editor-v3'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import { computed, ComputedRef, inject, nextTick, onUnmounted, reactive, ref, watchEffect } from 'vue'
 import sessions from 'src/utils/sessions'
 import { MessageContent, Message, ApiResultItem, UserMessageContent, AssistantMessageContent, ConvertArtifactOptions } from 'src/utils/types'
@@ -387,7 +387,7 @@ const emit = defineEmits<{
 watchEffect(async () => {
   const sessionId = props.message.generatingSession
   if (sessionId) {
-    !await sessions.ping(sessionId) && db.messages.update(props.message.id, {
+    !await sessions.ping(sessionId) && repos.messages.update(props.message.id, {
       generatingSession: null,
       status: 'failed',
       error: 'aborted',
@@ -501,7 +501,7 @@ function edit() {
       model: textContent.value.text
     }
   }).onOk(text => {
-    db.messages.update(props.message.id, {
+    repos.messages.update(props.message.id, {
       [`contents.${textIndex.value}.text`]: text
     })
   })

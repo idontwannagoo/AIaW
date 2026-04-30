@@ -1,6 +1,6 @@
 import { useQuasar } from 'quasar'
 import { BudgetBaseURL } from 'src/utils/config'
-import { db } from 'src/utils/db'
+import { authSource } from 'src/data'
 import { OrderItem } from 'src/utils/types'
 import { Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -19,7 +19,7 @@ export function useOrder(loading: Ref<boolean>, onDialogOK: (res) => void) {
         }),
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${db.cloud.currentUser.value.accessToken}`
+          Authorization: `Bearer ${authSource.currentToken()}`
         }
       })
       if (!res.ok) throw new Error('Failed to order')

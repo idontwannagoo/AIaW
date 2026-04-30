@@ -1,7 +1,7 @@
 import { Array as TArray, Object, Optional, String } from '@sinclair/typebox'
 import { Artifact, Plugin, PluginApi, PluginData } from './types'
 import { engine } from './template-engine'
-import { db } from './db'
+import { repos } from 'src/data'
 import { saveArtifactChanges } from './functions'
 import { i18n } from 'src/boot/i18n'
 
@@ -36,7 +36,7 @@ const api: PluginApi = {
     }))
   }),
   async execute({ id, updates, newName }) {
-    const artifact = await db.artifacts.get(id)
+    const artifact = await repos.artifacts.get(id)
     if (!artifact || !artifact.writable) throw new Error(`Artifact ${id} not found`)
     let content = artifact.versions[artifact.currIndex].text
     for (const update of updates) {
@@ -44,7 +44,7 @@ const api: PluginApi = {
       content = content.replace(pattern, update.replacement)
     }
     artifact.tmp = content
-    await db.artifacts.update(id, {
+    await repos.artifacts.update(id, {
       ...saveArtifactChanges(artifact),
       tmp: artifact.tmp,
       name: newName ?? artifact.name

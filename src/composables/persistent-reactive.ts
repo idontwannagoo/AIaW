@@ -1,5 +1,5 @@
 import { watch, reactive, toRaw, ref } from 'vue'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import { useLiveQuery } from './live-query'
 
 export function persistentReactive<T extends object>(key: string, value: T) {
@@ -12,9 +12,9 @@ export function persistentReactive<T extends object>(key: string, value: T) {
       flag = false
       return
     }
-    db.reactives.put({ key, value: toRaw(val) })
+    repos.reactives.put({ key, value: toRaw(val) })
   })
-  const source = useLiveQuery(() => db.reactives.get(key), { initialValue: 'initial' as const })
+  const source = useLiveQuery(() => repos.reactives.get(key), { initialValue: 'initial' as const })
   watch(source, newVal => {
     if (newVal === 'initial') return
     flag = true
@@ -22,7 +22,7 @@ export function persistentReactive<T extends object>(key: string, value: T) {
       ready.value = true
       Object.assign(val, newVal.value)
     } else {
-      db.reactives.add({ key, value })
+      repos.reactives.add({ key, value })
     }
   })
   return [val, ready] as const

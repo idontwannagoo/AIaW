@@ -1,7 +1,6 @@
 import { Object as TObject } from '@sinclair/typebox'
 import { defineStore } from 'pinia'
-import { useLiveQuery } from 'src/composables/live-query'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import { genId, removeDuplicates } from 'src/utils/functions'
 import { CustomProvider, Provider, ProviderType } from 'src/utils/types'
 import { modelOptions as baseModelOptions, ProviderTypes } from 'src/utils/values'
@@ -9,7 +8,7 @@ import { computed, Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 export const useProvidersStore = defineStore('providers', () => {
-  const providers: Ref<CustomProvider[]> = useLiveQuery(() => db.providers.toArray(), { initialValue: [] })
+  const providers: Ref<CustomProvider[]> = repos.providers.observeList<CustomProvider[]>({ initialValue: [] })
   function createProvider(provider: Provider, options, stack) {
     if (provider.type.startsWith('custom:')) {
       const p = providers.value.find(p => `custom:${p.id}` === provider.type)
@@ -67,7 +66,7 @@ export const useProvidersStore = defineStore('providers', () => {
   ]))
   const { t } = useI18n()
   async function add(props: Partial<CustomProvider> = {}) {
-    return await db.providers.add({
+    return await repos.providers.add({
       name: t('stores.providers.newProvider'),
       id: genId(),
       avatar: {
@@ -77,19 +76,19 @@ export const useProvidersStore = defineStore('providers', () => {
       },
       subproviders: [],
       ...props
-    })
+    } as CustomProvider)
   }
 
   async function update(id: string, changes) {
-    return await db.providers.update(id, changes)
+    return await repos.providers.update(id, changes)
   }
 
   async function put(provider: CustomProvider) {
-    return await db.providers.put(provider)
+    return await repos.providers.put(provider)
   }
 
   async function delete_(id: string) {
-    return await db.providers.delete(id)
+    return await repos.providers.delete(id)
   }
 
   return {

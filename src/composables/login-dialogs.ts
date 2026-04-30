@@ -1,15 +1,13 @@
 import { useQuasar } from 'quasar'
-import { useObservable } from '@vueuse/rxjs'
-import { db } from 'src/utils/db'
+import { authSource } from 'src/data'
 import { watch } from 'vue'
 import { dialogOptions } from 'src/utils/values'
-import { DexieDBURL } from 'src/utils/config'
 import { useI18n } from 'vue-i18n'
 
 export function useLoginDialogs() {
-  if (!DexieDBURL) return
-  const userInteraction = useObservable(db.cloud.userInteraction)
-  const user = useObservable(db.cloud.currentUser)
+  if (!authSource.enabled) return
+  const userInteraction = authSource.userInteraction
+  const user = authSource.user
   const $q = useQuasar()
   const { t } = useI18n()
   let loginNotify = false
@@ -74,7 +72,7 @@ export function useLoginDialogs() {
       }
     }
   })
-  watch(() => user.value.isLoggedIn, isLoggedIn => {
+  watch(() => user.value?.isLoggedIn, isLoggedIn => {
     isLoggedIn && loginNotify && $q.notify(t('login.loggedIn', { email: user.value.email }))
     loginNotify = false
   })

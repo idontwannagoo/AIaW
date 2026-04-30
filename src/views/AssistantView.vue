@@ -479,7 +479,7 @@ import ATip from 'src/components/ATip.vue'
 import { useLocateId } from 'src/composables/locate-id'
 import { blobToBase64, pageFhStyle } from 'src/utils/functions'
 import { useSetTitle } from 'src/composables/set-title'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import EnablePluginsItems from 'src/components/EnablePluginsItems.vue'
 import { exportFile } from 'src/utils/platform-api'
 
@@ -517,7 +517,7 @@ useSetTitle(computed(() => assistant.value?.name))
 async function exportAssistant(target: 'file' | 'clipboard') {
   let { avatar } = assistant.value
   if (avatar.type === 'image') {
-    const avatarImage = await db.avatarImages.get(avatar.imageId)
+    const avatarImage = await repos.avatarImages.get(avatar.imageId)
     const base64 = await blobToBase64(new Blob([avatarImage.contentBuffer], { type: avatarImage.mimeType }))
     avatar = { type: 'url', url: base64 }
   }

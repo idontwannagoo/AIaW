@@ -1,4 +1,4 @@
-import { db } from 'src/utils/db'
+import { repos, runTx } from 'src/data'
 import { genId } from 'src/utils/functions'
 import { Dialog, Workspace } from 'src/utils/types'
 import { Ref } from 'vue'
@@ -12,8 +12,8 @@ export function useCreateDialog(workspace: Ref<Workspace>) {
   async function createDialog(props: Partial<Dialog> = {}) {
     const id = genId()
     const messageId = genId()
-    await db.transaction('rw', db.dialogs, db.messages, () => {
-      db.dialogs.add({
+    await runTx(['dialogs', 'messages'], async () => {
+      await repos.dialogs.add({
         id,
         workspaceId: workspace.value.id,
         name: t('createDialog.newDialog'),
@@ -23,8 +23,8 @@ export function useCreateDialog(workspace: Ref<Workspace>) {
         assistantId: workspace.value.defaultAssistantId,
         inputVars: {},
         ...props
-      })
-      db.messages.add({
+      } as Dialog)
+      await repos.messages.add({
         id: messageId,
         dialogId: id,
         type: 'user',
@@ -34,7 +34,7 @@ export function useCreateDialog(workspace: Ref<Workspace>) {
           items: []
         }],
         status: 'inputing'
-      })
+      } as never)
     })
     router.push(`/workspaces/${workspace.value.id}/dialogs/${id}`)
   }

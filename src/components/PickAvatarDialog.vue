@@ -164,7 +164,7 @@ import HueSlider from './HueSlider.vue'
 import ImageInputArea from './ImageInputArea.vue'
 import { genId } from 'src/utils/functions'
 import { cropSquareBlob } from 'src/utils/image-process'
-import { db } from 'src/utils/db'
+import { repos } from 'src/data'
 import { materialSymbols } from 'src/utils/values'
 
 const props = defineProps<{
@@ -248,12 +248,12 @@ function setText(text: string) {
 async function onImageInput(file: File) {
   const blob = await cropSquareBlob(file, 96)
   const id = genId()
-  await db.avatarImages.add({ id, contentBuffer: await blob.arrayBuffer(), mimeType: file.type })
+  await repos.avatarImages.add({ id, contentBuffer: await blob.arrayBuffer(), mimeType: file.type })
   selected.value = { type: 'image', imageId: id }
 }
 watch(selected, (to, from) => {
   if (from.type === 'image') {
-    db.avatarImages.delete(from.imageId)
+    repos.avatarImages.delete(from.imageId)
   }
 })
 
