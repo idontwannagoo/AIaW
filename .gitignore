@@ -1,6 +1,7 @@
 .DS_Store
-.thumbs.db
+Thumbs.db
 node_modules
+.pnpm-store
 
 # Quasar core related directories
 .quasar
@@ -21,16 +22,22 @@ node_modules
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+*.log
 
 # Editor directories and files
 .idea
+.history
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
+*.swp
+*.swo
 
 # local .env files
 .env.local*
+.env.*.local
 
 # Code counter
 .VSCodeCounter
@@ -45,4 +52,13 @@ yarn-error.log*
 # Vitepress
 /docs/.vitepress/cache
 /docs/.vitepress/dist
+
+# Python backend (src-backend)
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+
 .aider*
+/.claude
+CLAUDE.md
