@@ -86,6 +86,9 @@ export interface AuthSource {
   logout(): Promise<void>
   sync(): Promise<void>
   onReady(fn: () => void): void
+  // Resolve when the first sync attempt has completed (in-sync / error / offline),
+  // or after a safety timeout. No-op when sync is not enabled.
+  waitForFirstSync(): Promise<void>
   // Stage 0 escape hatch: synchronous read of current user (used for bearer token in fetch)
   currentToken(): string | undefined
 }

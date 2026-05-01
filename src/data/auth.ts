@@ -37,6 +37,33 @@ export const authSource: AuthSource = {
       fn()
     })
   },
+  async waitForFirstSync() {
+    if (!enabled) return
+    await new Promise<void>(resolve => {
+      let done = false
+      let sub: { unsubscribe(): void } | undefined
+      const finish = () => {
+        if (done) return
+        done = true
+        try { sub?.unsubscribe() } catch { /* ignore */ }
+        clearTimeout(timer)
+        resolve()
+      }
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        sub = (db.cloud.syncState as any).subscribe((state: { phase: string }) => {
+          if (
+            state.phase === 'in-sync' ||
+            state.phase === 'error' ||
+            state.phase === 'offline'
+          ) finish()
+        })
+      } catch {
+        finish()
+      }
+      const timer = setTimeout(finish, 5000)
+    })
+  },
   currentToken() {
     if (!enabled) return undefined
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
