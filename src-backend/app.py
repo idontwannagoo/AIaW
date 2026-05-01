@@ -9,6 +9,7 @@ from llama_parse import LlamaParse
 import os
 
 from data.routers import health as health_router
+from data.routers import providers as providers_router
 
 http_client = None
 
@@ -22,6 +23,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 app.include_router(health_router.router)
+app.include_router(providers_router.router)
 
 ALLOWED_PREFIXES = [
     'https://lobehub.search1api.com/api/search',

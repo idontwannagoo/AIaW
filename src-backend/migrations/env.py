@@ -14,6 +14,7 @@ from alembic import context
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.db import Base, DATABASE_URL  # noqa: E402
+from data import models  # noqa: F401, E402  -- ensure models register on Base.metadata
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
