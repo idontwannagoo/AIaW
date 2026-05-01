@@ -367,6 +367,13 @@ function topupDialog() {
 
 async function logout() {
   await authSource.logout()
+  // Dexie session lives in IndexedDB and isn't bound to the backend account.
+  // Without this cascade, switching backend accounts on the same browser
+  // leaks the previous Dexie session into the next user — they see X's email
+  // in the legacy entry and cloud sync still runs as X.
+  if (BackendAuth && dexieAuthSource.enabled && dexieUser.value?.isLoggedIn) {
+    try { await dexieAuthSource.logout() } catch { /* best effort */ }
+  }
   router.replace('/')
 }
 
