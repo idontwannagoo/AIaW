@@ -11,6 +11,7 @@
  * Step 4 is what hooks `providers.server.ts` into this; until then nothing in
  * the UI depends on it.
  */
+import { watch } from 'vue'
 import { BackendApiBaseURL } from 'src/utils/config'
 import { authSource } from './auth'
 import type { ChangeEvent, SyncSource } from './sync-source'
@@ -87,6 +88,19 @@ class RealtimeConn {
         if (this.subs.size === 0) this.shutdown()
       }
     }
+  }
+
+  /**
+   * Recover from `idle` when the auth source produces a token after we'd
+   * given up (cold subscribe before login, or 4001 + refresh failure followed
+   * by a manual re-login). Caller is the `authSource.user` watcher below.
+   * No-op if we're already connecting / open / closed-on-purpose.
+   */
+  wakeIfIdle(): void {
+    if (this._state !== 'idle') return
+    if (this.subs.size === 0) return
+    this.reconnectAttempt = 0
+    this.ensureConnected()
   }
 
   /** Drop the connection and cancel any scheduled reconnect. Idempotent. */
@@ -282,3 +296,17 @@ export function createRemoteSyncSource<T>(
 if (typeof window !== 'undefined') {
   ;(window as unknown as { aiawRealtime: RealtimeConn }).aiawRealtime = realtime
 }
+
+// Wake the singleton when the user (re)appears: covers (a) subscribe()
+// called before login, (b) 4001 close + tryRefresh failure followed by a
+// manual re-login, (c) refresh-token rotation across tabs that briefly
+// nulls accessToken. Without this watch, `idle` is a terminal state until
+// the next subscribe() call — meaning the UI silently stops receiving live
+// events. The watch lives at module scope; the singleton has the same
+// lifetime as the page so we don't need to stop it.
+watch(
+  () => authSource.user.value,
+  (next, prev) => {
+    if (next && !prev) realtime.wakeIfIdle()
+  }
+)

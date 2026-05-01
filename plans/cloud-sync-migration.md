@@ -40,6 +40,10 @@
   - **背景**：Stage 2 / Step 3 验收时观察到「仅登 backend 账号未登 Dexie 时，新建/修改 provider 后 UI 列表不刷新」。读 dexie-cloud-addon 源码（`createIdGeneration` / `createImplicitPropSetter` / `createMutationTracking` 三个 dbcore middleware）确认：addon 默认把 schema 里所有非 `$` 前缀的表标 `markedForSync = true`，对这些表的 readwrite 事务会强制并入 `$<table>_mutations` mutation 表，并在每条 `add/put` 上注入 `owner`/`realmId`、读 `trans.currentUser` 上下文。backend-only 用户 `currentUser = UNAUTHORIZED_USER`，与 Stage 2 的 `providers` 写路径冲突。
   - **变更**：在 `src/utils/db.ts` 的 `db.cloud.configure(...)` 里按 `BACKEND_DATA_API_URL ∩ BACKEND_DATA_TABLES ∩ SERVER_CAPABLE_TABLES` 计算 `unsyncedTables`，把已切到后端的表（当前仅 `providers`）从 addon 的 `markedForSync` 摘掉。`SERVER_CAPABLE_TABLES` 抽到 `src/data/server-tables.ts` 共享模块（避免 db.ts ↔ repositories/index.ts 循环依赖）。
   - **影响范围**：flag 关时 `unsyncedTables = []`，行为字节级等同此前；flag 开时 `providers` 退化为普通 Dexie 本地表，`db.providers.put/toArray/liveQuery` 全部短路 addon middleware。Stage 3+ 每张新搬到后端的表自动通过 `BACKEND_DATA_TABLES` 加入此名单，无需再改 db.ts；只需在 `server-tables.ts` 把表名加进 `SERVER_CAPABLE_TABLES`。
+- **2026-05-02 · 已知问题 #1 修复 · `'idle'` 状态加 user watcher**
+  - **背景**：Stage 2 / Step 3 验收时识别出 `RealtimeConn` 进 `'idle'` 后无自动恢复机制（详见原「已知问题 #1」段）。本次 Step 3 收尾把这个边界 bug 一并修掉。
+  - **变更**：`src/data/realtime-ws.ts` 加 `wakeIfIdle()` 公共方法 + 模块级 `watch(authSource.user)`：null→user 跳变时调 `wakeIfIdle()`，覆盖 (a) 冷启动 subscribe 早于登录、(b) 4001 + tryRefresh 失败后用户重新登录两条主路径。`reconnectAttempt` 在 wake 时置 0，避免被先前的退避计数拖慢首次连接。
+  - **影响范围**：flag 全关部署里 watch 仍然注册并被 Dexie 登录态变化触发，但 `wakeIfIdle()` → `ensureConnected()` 因 `BackendApiBaseURL` 为空 early return，无网络副作用。flag 开时弥补 plan 标识的 #1 路径，让 Step 4 接 repo 后跨 tab 体验稳定。跨 tab refresh 轮换瞬间（prev 仍非 null）的窄边界仍未覆盖，留作未来观测——触发条件需要 storage 事件 + WS close 同时发生，概率极低。
 - **2026-05-02 · Stage 2 Step 1-3 代码落地 + plan 入仓库**
   - **变更**：Stage 2 前 3 个 Step 的代码已全部合并到 `feature/change-cloud-sync-claude` 分支（尚未合 my-deploy）；plan 文件本身从 `~/.claude/plans/` 复制到仓库 `plans/cloud-sync-migration.md`，CLAUDE.md 加「长期迁移工作流」段并入库（详见进度快照 2026-05-02）。
   - **影响范围**：plan 维护规则正式生效——动态进度（当前 Step、commit hash、未解决问题）一律写本文件，不写 CLAUDE.md；任何改动需配套通过判据，每个 Step 完成后必须更新「进度快照」段；方案有调整必须先在「修订记录」追加条目再改正文。
@@ -53,8 +57,14 @@
     - 验收**场景 B（主动断网重连）/ 场景 C（token 过期 close 4001 + refresh + 重连）尚未独立测试**
     - 详见下方 §Stage 2 / Step 3「当前状态」段
   - **plan 文件 + CLAUDE.md 入库** ✅ commit `f2a39d4`
-  - **已知问题 #2 修复**（server-routed 表 `unsyncedTables`）✅ 待 commit；后续测试需验证 flag 开关下 UI 行为
-  - 下一步：先把 Stage 2 / Step 3 验收收尾（场景 B/C + 修「`idle` 状态无自动恢复」边界 bug），再进 Step 4。
+  - **已知问题 #2 修复**（server-routed 表 `unsyncedTables`）✅ commit `b080005`
+  - **已知问题 #1 修复**（`'idle'` 状态加 `authSource.user` watcher）✅ 待 commit
+  - **本次会话补跑的端到端验证**（之前未独立测过）：
+    - Stage 1.5 账号隔离 / refresh token 流转 / logout 吊销旧 refresh ✅
+    - Stage 1 Step 2 soft-delete tombstone（DELETE 后 list 仍出 `deleted:true,data:null`） ✅
+    - Stage 2 Step 1 WS 账号隔离（A 订阅时 B 的 PUT 不进 A 频道） ✅
+    - Stage 2 Step 1 心跳超时（25s ping + 10s 无 pong → 35s server close） ✅
+  - 下一步：场景 B（断网重连）/ 场景 C（4001 + refresh + 重连）按 plan 仍需浏览器手测，本次跳过；进 Step 4 把 `providers.server.ts` 接到 `RemoteSyncSource`。
 
 ---
 
@@ -381,15 +391,15 @@ interface AuthSource {
 
 **当前状态（2026-05-02）**
 - 代码：commit `aa0f25b`（`src/data/realtime-ws.ts` + `src/data/index.ts` 导出）；副 commit `e73e52e`（AccountPage 退出登录级联）
-- 场景 A ⚠️ **部分通过**：Console 订阅后能收到 event（WS 握手、`bearer.<token>` 子协议鉴权、`since=<lastRev>` SQL replay、event 派发到 listener 全部 OK）。但联动测试中观察到 `aiawRealtime.state` 偶发卡 `'idle'` —— 见下方「已知问题 #1」。
-- 场景 B ❓ **未独立测试**：被场景 A 的 idle 边界 bug 与「UI 不刷新」诊断岔开。
-- 场景 C ❓ **未独立测试**：同上。
+- 场景 A ✅ **通过**：Console 订阅后能收到 event（WS 握手、`bearer.<token>` 子协议鉴权、`since=<lastRev>` SQL replay、event 派发到 listener 全部 OK）。`'idle'` 边界 bug 已由「已知问题 #1」修复消除（见下方）。
+- 场景 B ❓ **未独立测试（按用户决策跳过）**：浏览器手测路径，本次会话权衡成本后跳过；fix #1 后理论路径完整，等 Step 4 接 repo 后随业务回归覆盖。
+- 场景 C ❓ **未独立测试（同上）**。
 
-**已知问题（待 Step 3 收尾时处理）**
-1. **`RealtimeConn` 进入 `'idle'` 后无自动恢复**
-   - 现象：`ensureConnected()` 检查 token，token 暂时为 null（如 reconnect 路径里 refresh 还在飞 / HMR 重置单例）→ 状态置 `'idle'` 直接 return，再无定时器 / 监听器把它推回连接尝试。只有新的 `subscribe()` 调用能触发 `ensureConnected()`。
+**已知问题**
+1. ~~**`RealtimeConn` 进入 `'idle'` 后无自动恢复**~~ ✅ **已修复**
+   - 原现象：`ensureConnected()` 检查 token，token 暂时为 null（如 reconnect 路径里 refresh 还在飞 / HMR 重置单例）→ 状态置 `'idle'` 直接 return，再无定时器 / 监听器把它推回连接尝试。只有新的 `subscribe()` 调用能触发 `ensureConnected()`。
    - 影响：场景 B 重连测试不可靠；场景 C token 过期路径理论上由 `tryRefresh().then(scheduleReconnect)` 兜底，但若 refresh 失败会一样卡死。
-   - 决策方向：Step 3 收尾时给 `'idle'` 加一个轻量监听—— 监听 `authSource.user` 变化，token 重新可用时主动调一次 `ensureConnected()`。改动局限在 `realtime-ws.ts` 一个文件。
+   - 修复：`realtime-ws.ts` 加 `wakeIfIdle()` + 模块级 `watch(authSource.user)`，null→user 跳变时主动叫醒。覆盖冷启动 subscribe 早于登录、4001 + refresh 失败后重登两条主路径。详见「修订记录 2026-05-02 · 已知问题 #1 修复」。
 
 2. ~~**（Step 4 前置疑点）UI 不刷新疑似 dexie-cloud-addon middleware 吞读写**~~ ✅ **已修复**
    - 原现象：仅登 backend 账号（未登 Dexie）时，Console PUT provider → server 200 OK → WS event 派发到 listener 正常 → 但 UI 列表无新条目；`db.providers.toArray()` 直查 Promise 挂 pending。
