@@ -1,4 +1,3 @@
-import os
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -7,18 +6,16 @@ from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..auth import current_user
 from ..db import get_session
 from ..models.provider import Provider
+from ..models.user import User
 
 router = APIRouter(prefix='/api/v1/providers', tags=['providers'])
 
-# Step 2 stub: until Step 3 wires JWT, every request is bucketed under one user.
-# Override per-process via env so two terminals can simulate two accounts.
-DEV_USER_ID = os.environ.get('DEV_USER_ID', 'dev-user')
 
-
-def _current_user_id() -> str:
-    return DEV_USER_ID
+def _user_id(user: User = Depends(current_user)) -> str:
+    return user.id
 
 
 class ProviderRow(BaseModel):
@@ -42,7 +39,7 @@ def _to_row(p: Provider) -> ProviderRow:
 @router.get('', response_model=list[ProviderRow])
 async def list_providers(
     since: int = 0,
-    user_id: str = Depends(_current_user_id),
+    user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ):
     stmt = (
@@ -57,7 +54,7 @@ async def list_providers(
 @router.get('/{provider_id}', response_model=ProviderRow)
 async def get_provider(
     provider_id: str,
-    user_id: str = Depends(_current_user_id),
+    user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ):
     stmt = select(Provider).where(
@@ -73,7 +70,7 @@ async def get_provider(
 async def upsert_provider(
     provider_id: str,
     data: dict[str, Any],
-    user_id: str = Depends(_current_user_id),
+    user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ):
     # Upsert: bump version + clear any tombstone on revival.
@@ -107,7 +104,7 @@ async def upsert_provider(
 @router.delete('/{provider_id}', response_model=ProviderRow)
 async def delete_provider(
     provider_id: str,
-    user_id: str = Depends(_current_user_id),
+    user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ):
     next_version = (await session.execute(

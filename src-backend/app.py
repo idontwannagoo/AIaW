@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from llama_parse import LlamaParse
 import os
 
+from data.routers import auth as auth_router
 from data.routers import health as health_router
 from data.routers import providers as providers_router
 
@@ -23,6 +24,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 app.include_router(health_router.router)
+app.include_router(auth_router.router)
 app.include_router(providers_router.router)
 
 ALLOWED_PREFIXES = [
