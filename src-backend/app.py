@@ -4,14 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import aiohttp
+import logging
 from typing import Optional, Dict, Any
 from fastapi.staticfiles import StaticFiles
 from llama_parse import LlamaParse
 import os
 
-from data.routers import auth as auth_router
-from data.routers import health as health_router
-from data.routers import providers as providers_router
+logger = logging.getLogger('aiaw.backend')
+logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
 
 http_client = None
 
@@ -36,9 +36,45 @@ app.add_middleware(
     allow_headers=['*']
 )
 
-app.include_router(health_router.router)
-app.include_router(auth_router.router)
-app.include_router(providers_router.router)
+def _enable_backend_data_api(app: FastAPI) -> None:
+    """Conditionally mount the self-hosted data API (auth + providers + health).
+
+    Gated by BACKEND_DATA_API_ENABLED so the container can boot in deployments
+    that only need the original CORS proxy / doc-parse / static SPA. When the
+    flag is on we fail fast at startup if the required secrets are missing,
+    so misconfiguration surfaces in the boot log rather than as runtime 5xx.
+    Symmetric with the frontend's BACKEND_DATA_API_URL flag — both off = Stage
+    0 behavior; both on = Stage 1.5 full data API.
+    """
+    flag = os.environ.get('BACKEND_DATA_API_ENABLED', '').strip().lower()
+    if flag != 'true':
+        logger.info(
+            'backend data API disabled (set BACKEND_DATA_API_ENABLED=true to enable)'
+        )
+        return
+
+    missing = [v for v in ('JWT_SECRET', 'DATABASE_URL') if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError(
+            'BACKEND_DATA_API_ENABLED=true but required env vars missing: '
+            + ', '.join(missing)
+            + '. Generate JWT_SECRET via: '
+            'python -c "import secrets; print(secrets.token_urlsafe(64))"'
+        )
+
+    # Imported lazily so module-level side effects (engine creation, JWT_SECRET
+    # check inside data/auth.py) only happen when the feature is on.
+    from data.routers import auth as auth_router
+    from data.routers import health as health_router
+    from data.routers import providers as providers_router
+
+    app.include_router(health_router.router)
+    app.include_router(auth_router.router)
+    app.include_router(providers_router.router)
+    logger.info('backend data API enabled (auth + providers + health mounted)')
+
+
+_enable_backend_data_api(app)
 
 ALLOWED_PREFIXES = [
     'https://lobehub.search1api.com/api/search',
