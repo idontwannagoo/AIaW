@@ -6,6 +6,8 @@ from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from realtime import broker
+
 from ..auth import current_user
 from ..db import get_session
 from ..models.provider import Provider
@@ -34,6 +36,24 @@ def _to_row(p: Provider) -> ProviderRow:
         deleted=p.deleted_at is not None,
         data=None if p.deleted_at is not None else p.data,
     )
+
+
+def _to_event(p: Provider) -> dict[str, Any]:
+    deleted = p.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'providers',
+        'op': 'delete' if deleted else 'put',
+        'id': p.id,
+        'rev': p.version,
+        'row': None if deleted else {
+            'id': p.id,
+            'version': p.version,
+            'updated_at': p.updated_at.isoformat(),
+            'deleted': False,
+            'data': p.data,
+        },
+    }
 
 
 @router.get('', response_model=list[ProviderRow])
@@ -98,6 +118,7 @@ async def upsert_provider(
         # Conflict on id but owned by another user.
         raise HTTPException(status_code=409, detail='id owned by another user')
     await session.commit()
+    await broker.publish(user_id, _to_event(row))
     return _to_row(row)
 
 
@@ -120,4 +141,5 @@ async def delete_provider(
     if row is None:
         raise HTTPException(status_code=404, detail='not found')
     await session.commit()
+    await broker.publish(user_id, _to_event(row))
     return _to_row(row)
