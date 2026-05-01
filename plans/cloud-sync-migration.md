@@ -58,7 +58,7 @@
     - 详见下方 §Stage 2 / Step 3「当前状态」段
   - **plan 文件 + CLAUDE.md 入库** ✅ commit `f2a39d4`
   - **已知问题 #2 修复**（server-routed 表 `unsyncedTables`）✅ commit `b080005`
-  - **已知问题 #1 修复**（`'idle'` 状态加 `authSource.user` watcher）✅ 待 commit
+  - **已知问题 #1 修复**（`'idle'` 状态加 `authSource.user` watcher）✅ commit `b5bc422`
   - **本次会话补跑的端到端验证**（之前未独立测过）：
     - Stage 1.5 账号隔离 / refresh token 流转 / logout 吊销旧 refresh ✅
     - Stage 1 Step 2 soft-delete tombstone（DELETE 后 list 仍出 `deleted:true,data:null`） ✅
