@@ -19,6 +19,20 @@ export default {
   abortableBtn: {
     stop: '停止'
   },
+  backendLoginDialog: {
+    titleLogin: '登录',
+    titleRegister: '注册',
+    email: '邮箱',
+    password: '密码',
+    inviteCode: '邀请码',
+    inviteCodeHint: '若服务端为邀请制注册，请填写邀请码',
+    passwordMinLength: '密码至少 8 位',
+    cancel: '取消',
+    login: '登录',
+    register: '注册',
+    switchToRegister: '没有账号？注册',
+    switchToLogin: '已有账号？登录'
+  },
   artifactsExpansion: {
     searchPlaceholder: '搜索 Artifacts...',
     close: '关闭',

@@ -19,6 +19,20 @@ export default {
   abortableBtn: {
     stop: 'Stop'
   },
+  backendLoginDialog: {
+    titleLogin: 'Sign in',
+    titleRegister: 'Create account',
+    email: 'Email',
+    password: 'Password',
+    inviteCode: 'Invite code',
+    inviteCodeHint: 'Required when the server uses invite-only registration',
+    passwordMinLength: 'Password must be at least 8 characters',
+    cancel: 'Cancel',
+    login: 'Sign in',
+    register: 'Create account',
+    switchToRegister: 'No account? Sign up',
+    switchToLogin: 'Have an account? Sign in'
+  },
   artifactsExpansion: {
     searchPlaceholder: 'Search Artifacts...',
     close: 'Close',

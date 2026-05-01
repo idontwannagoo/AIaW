@@ -19,6 +19,20 @@ export default {
   abortableBtn: {
     stop: '停止'
   },
+  backendLoginDialog: {
+    titleLogin: '登入',
+    titleRegister: '註冊',
+    email: '信箱',
+    password: '密碼',
+    inviteCode: '邀請碼',
+    inviteCodeHint: '若伺服器為邀請制註冊，請填寫邀請碼',
+    passwordMinLength: '密碼至少 8 位',
+    cancel: '取消',
+    login: '登入',
+    register: '註冊',
+    switchToRegister: '沒有帳號？註冊',
+    switchToLogin: '已有帳號？登入'
+  },
   artifactsExpansion: {
     searchPlaceholder: '搜尋 Artifacts...',
     close: '關閉',

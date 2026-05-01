@@ -6,6 +6,12 @@ export const SyncServicePriceUSD = process.env.SYNC_SERVICE_PRICE_USD && parseFl
 export const UsdToCnyRate = process.env.USD_TO_CNY_RATE && parseFloat(process.env.USD_TO_CNY_RATE)
 export const StripeFee = process.env.STRIPE_FEE && parseFloat(process.env.STRIPE_FEE)
 export const DexieDBURL = process.env.DEXIE_DB_URL
+// Stage 1+ self-hosted backend. Empty = no backend, behave like Stage 0.
+export const BackendApiBaseURL = process.env.BACKEND_DATA_API_URL
+// Stage 1.5: when 'true', authSource is BackendAuthSource (self-hosted JWT).
+// Otherwise the DexieAuthSource is used. Independent from BACKEND_DATA_API_URL
+// because UI may want to log into backend without yet routing data to it.
+export const BackendAuth = process.env.BACKEND_AUTH === 'true'
 export const LitellmBaseURL = process.env.LITELLM_BASE_URL
 export const BudgetBaseURL = process.env.BUDGET_BASE_URL
 export const SearxngBaseURL = process.env.SEARXNG_BASE_URL
