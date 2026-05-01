@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, Form, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import aiohttp
@@ -22,6 +23,18 @@ async def lifespan(app: FastAPI):
     await http_client.close()
 
 app = FastAPI(lifespan=lifespan)
+
+_cors_origins = [o.strip() for o in os.environ.get(
+    'CORS_ALLOW_ORIGINS',
+    'http://localhost:9005,http://localhost:9006,http://127.0.0.1:9005,http://127.0.0.1:9006'
+).split(',') if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*']
+)
 
 app.include_router(health_router.router)
 app.include_router(auth_router.router)

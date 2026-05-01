@@ -169,7 +169,36 @@ function boot(): Promise<void> {
   return bootPromise
 }
 
-if (enabled) void boot()
+// Cross-tab sync via the storage event. Fires only in OTHER tabs (never the
+// writer), so no self-loop. We deliberately do NOT call runRefresh here:
+// that would rotate the just-issued refresh token, breaking the writer tab
+// (its in-memory refresh would 401 next time). Instead we adopt the new
+// refresh + user from storage and let access-token acquisition stay lazy —
+// the next pre-expiry timer or an explicit request triggers refresh.
+function syncFromStorage() {
+  const newRefresh = loadStoredRefresh()
+  if (newRefresh === refreshToken) {
+    const stored = loadStoredUser()
+    if (stored) userRef.value = stored
+    return
+  }
+  if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
+  accessToken = null
+  refreshToken = newRefresh
+  userRef.value = newRefresh ? loadStoredUser() : null
+}
+
+if (enabled) {
+  void boot()
+  if (typeof window !== 'undefined') {
+    window.addEventListener('storage', (e) => {
+      if (e.storageArea !== localStorage) return
+      // e.key === null when localStorage.clear() was called.
+      if (e.key !== null && e.key !== REFRESH_KEY && e.key !== USER_KEY) return
+      syncFromStorage()
+    })
+  }
+}
 
 export const backendAuthSource: AuthSource = {
   enabled,

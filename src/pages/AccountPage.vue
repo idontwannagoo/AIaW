@@ -20,7 +20,53 @@
     <q-page :style-fn="pageFhStyle">
       <q-list
         pb-2
-        v-if="user.license"
+        v-if="user?.isLoggedIn && !user.license"
+        max-w="1000px"
+        mx-a
+      >
+        <q-item-label header>
+          {{ $t('accountPage.infoHeader') }}
+        </q-item-label>
+        <q-item>
+          <q-item-section>
+            {{ $t('accountPage.emailLabel') }}
+          </q-item-section>
+          <q-item-section side>
+            {{ user.email }}
+          </q-item-section>
+        </q-item>
+        <q-item v-if="user.userId">
+          <q-item-section>User ID</q-item-section>
+          <q-item-section side>
+            <span
+              font-mono
+              text-xs
+            >{{ user.userId }}</span>
+          </q-item-section>
+        </q-item>
+        <q-item v-if="user.data?.linkedDexieEmail">
+          <q-item-section>Linked Dexie Email</q-item-section>
+          <q-item-section side>
+            {{ user.data.linkedDexieEmail }}
+          </q-item-section>
+        </q-item>
+        <q-separator spaced />
+        <q-item
+          clickable
+          v-ripple
+          @click="logout"
+        >
+          <q-item-section avatar>
+            <q-icon name="sym_o_logout" />
+          </q-item-section>
+          <q-item-section>
+            {{ $t('accountPage.logoutButton') }}
+          </q-item-section>
+        </q-item>
+      </q-list>
+      <q-list
+        pb-2
+        v-if="user?.license"
         max-w="1000px"
         mx-a
       >
@@ -82,8 +128,11 @@
             <q-item-label>
               {{ $t('accountPage.subscribedLabel') }}
             </q-item-label>
-            <q-item-label caption>
-              {{ $t('accountPage.validUntil', { date: user.license.validUntil.toLocaleString() }) }}
+            <q-item-label
+              caption
+              v-if="user.license.validUntil"
+            >
+              {{ $t('accountPage.validUntil', { date: new Date(user.license.validUntil).toLocaleString() }) }}
             </q-item-label>
           </q-item-section>
           <q-item-section side>
@@ -150,7 +199,7 @@
             </q-item-section>
           </q-item>
         </template>
-        <template v-if="user.data.orderHistory?.length">
+        <template v-if="user.data?.orderHistory?.length">
           <q-separator spaced />
           <q-item-label header>
             {{ $t('accountPage.orderHistoryHeader') }}
@@ -162,7 +211,6 @@
             :rows="[...user.data.orderHistory].reverse()"
             :columns="orderHistoryColumns"
             :pagination="{ rowsPerPage: Infinity }"
-            v-if="user.data.orderHistory?.length"
           />
         </template>
 
