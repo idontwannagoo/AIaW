@@ -386,23 +386,28 @@ const emit = defineEmits<{
 
 watchEffect(async () => {
   const sessionId = props.message.generatingSession
-  if (sessionId) {
-    !await sessions.ping(sessionId) && repos.messages.update(props.message.id, {
-      generatingSession: null,
-      status: 'failed',
-      error: 'aborted',
-      contents: props.message.contents.map(content => {
-        if (content.type === 'assistant-tool' && content.status === 'calling') {
-          return {
-            ...content,
-            status: 'failed',
-            error: 'Tool call aborted'
-          }
+  if (!sessionId) return
+  // Only attempt the abort fallback if the session was started by THIS browser
+  // profile. Otherwise it likely belongs to another device — BroadcastChannel
+  // can't reach across browsers, so a missed ping is meaningless and writing
+  // 'aborted' here would race the originator's ongoing stream.
+  if (!sessions.isKnownLocally(sessionId)) return
+  if (await sessions.ping(sessionId)) return
+  repos.messages.update(props.message.id, {
+    generatingSession: null,
+    status: 'failed',
+    error: 'aborted',
+    contents: props.message.contents.map(content => {
+      if (content.type === 'assistant-tool' && content.status === 'calling') {
+        return {
+          ...content,
+          status: 'failed',
+          error: 'Tool call aborted'
         }
-        return content
-      }) as MessageContent[]
-    })
-  }
+      }
+      return content
+    }) as MessageContent[]
+  })
 })
 
 const textIndex = computed(() => props.message.contents.findIndex(c => ['user-message', 'assistant-message'].includes(c.type)))
