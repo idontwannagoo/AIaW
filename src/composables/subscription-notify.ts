@@ -19,7 +19,9 @@ export function useSubscriptionNotify() {
   function notify() {
     if (!user.value?.isLoggedIn) return
     if (user.value.license?.type === 'eval') {
-      if (user.value.license.evalDaysLeft <= 0) {
+      const evalDaysLeft = user.value.license.evalDaysLeft
+      if (evalDaysLeft == null) return
+      if (evalDaysLeft <= 0) {
         if (data.evalExpiredNotified) return
         $q.notify({
           message: t('subscriptionNotify.evalExpired'),
@@ -31,7 +33,7 @@ export function useSubscriptionNotify() {
           }]
         })
         data.evalExpiredNotified = true
-      } else if (user.value.license.evalDaysLeft <= 1) {
+      } else if (evalDaysLeft <= 1) {
         $q.notify({
           message: t('subscriptionNotify.evalExpiring'),
           color: 'inv-sur',
@@ -45,8 +47,11 @@ export function useSubscriptionNotify() {
       }
     } else if (user.value.license?.type === 'prod') {
       const { validUntil } = user.value.license
-      if (validUntil < new Date()) {
-        if (data.prodExpiredNotifiedTimestamp === validUntil.getTime()) return
+      if (!validUntil) return
+      const validUntilDate = validUntil instanceof Date ? validUntil : new Date(validUntil)
+      if (Number.isNaN(validUntilDate.getTime())) return
+      if (validUntilDate < new Date()) {
+        if (data.prodExpiredNotifiedTimestamp === validUntilDate.getTime()) return
         $q.notify({
           message: t('subscriptionNotify.prodExpired'),
           color: 'negative',
@@ -56,8 +61,8 @@ export function useSubscriptionNotify() {
             textColor: 'on-err'
           }]
         })
-        data.prodExpiredNotifiedTimestamp = validUntil.getTime()
-      } else if (validUntil.getTime() - Date.now() <= 1000 * 60 * 60 * 24 * 2) {
+        data.prodExpiredNotifiedTimestamp = validUntilDate.getTime()
+      } else if (validUntilDate.getTime() - Date.now() <= 1000 * 60 * 60 * 24 * 2) {
         $q.notify({
           message: t('subscriptionNotify.prodExpiring'),
           color: 'inv-sur',

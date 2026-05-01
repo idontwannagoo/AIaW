@@ -20,13 +20,17 @@ function wrapMiddlewares(model: LanguageModelV2) {
 }
 export function useGetModel() {
   const user = authSource.enabled ? authSource.user : null
-  const defaultProvider = computed(() => user?.value?.isLoggedIn ? {
-    type: 'openai-compatible',
-    settings: {
-      apiKey: user.value.data.apiKey,
-      baseURL: new URL(LitellmBaseURL, location.origin).toString()
+  const defaultProvider = computed<Provider | undefined>(() => {
+    const apiKey = user?.value?.isLoggedIn ? user.value.data?.apiKey : undefined
+    if (!apiKey || !LitellmBaseURL) return undefined
+    return {
+      type: 'openai-compatible',
+      settings: {
+        apiKey,
+        baseURL: new URL(LitellmBaseURL, location.origin).toString()
+      }
     }
-  } : null)
+  })
   const { perfs } = useUserPerfsStore()
   const providersStore = useProvidersStore()
   function getProvider(provider?: Provider) {
@@ -48,7 +52,8 @@ export function useGetModel() {
     if (!sdkProvider) return null
     model = getModel(model)
     if (!model) return null
-    const m = sdkProvider(model.name) || getSdkProvider(defaultProvider.value)(model.name)
+    const fallback = defaultProvider.value ? getSdkProvider(defaultProvider.value) : null
+    const m = sdkProvider(model.name) || fallback?.(model.name)
     return m && wrapMiddlewares(m)
   }
   return { getProvider, getModel, getSdkProvider, getSdkModel }
