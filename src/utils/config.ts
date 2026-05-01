@@ -8,6 +8,12 @@ export const StripeFee = process.env.STRIPE_FEE && parseFloat(process.env.STRIPE
 export const DexieDBURL = process.env.DEXIE_DB_URL
 // Stage 1+ self-hosted backend. Empty = no backend, behave like Stage 0.
 export const BackendApiBaseURL = process.env.BACKEND_DATA_API_URL
+// Stage 1 Step 6: CSV allowlist of table names that route to the backend
+// instead of Dexie. Empty = all tables stay on Dexie (Stage 0 behavior).
+// Only honored when BackendApiBaseURL is set. Unknown table names are ignored.
+export const BackendDataTables = new Set(
+  (process.env.BACKEND_DATA_TABLES ?? '').split(',').map(s => s.trim()).filter(Boolean)
+)
 // Why String(): Quasar inlines `FOO=true` from .env files as the JS boolean
 // literal `true` (see @quasar/app-vite/lib/utils/env.js), so `=== 'true'`
 // would always be false. Coerce so both inlined boolean and string forms work.

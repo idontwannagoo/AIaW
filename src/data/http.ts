@@ -55,7 +55,7 @@ async function doFetch<T>(
   opts: RequestOptions
 ): Promise<T> {
   const headers: Record<string, string> = { ...(opts.headers ?? {}) }
-  let payload: BodyInit | undefined
+  let payload: string | undefined
   if (body !== undefined) {
     headers['Content-Type'] = headers['Content-Type'] ?? 'application/json'
     payload = JSON.stringify(body)
