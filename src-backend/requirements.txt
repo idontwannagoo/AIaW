@@ -4,3 +4,7 @@ aiohttp==3.11.7
 python-multipart==0.0.18
 llama-index-core==0.12.41
 llama-parse==0.5.15
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+pydantic-settings==2.6.1

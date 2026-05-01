@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aiaw-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aiaw
+      POSTGRES_PASSWORD: aiaw_dev
+      POSTGRES_DB: aiaw
+    ports:
+      - "5433:5432"
+    volumes:
+      - aiaw-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiaw -d aiaw"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  aiaw-postgres-data:

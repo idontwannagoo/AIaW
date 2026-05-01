@@ -8,6 +8,8 @@ from fastapi.staticfiles import StaticFiles
 from llama_parse import LlamaParse
 import os
 
+from data.routers import health as health_router
+
 http_client = None
 
 @asynccontextmanager
@@ -18,6 +20,8 @@ async def lifespan(app: FastAPI):
     await http_client.close()
 
 app = FastAPI(lifespan=lifespan)
+
+app.include_router(health_router.router)
 
 ALLOWED_PREFIXES = [
     'https://lobehub.search1api.com/api/search',
@@ -113,8 +117,9 @@ async def searxng(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-app.mount('/', StaticFiles(directory='static', html=True), name='static')
+if os.path.isdir('static'):
+    app.mount('/', StaticFiles(directory='static', html=True), name='static')
 
-@app.exception_handler(404)
-async def return_index(request: Request, exc: HTTPException):
-    return FileResponse("static/index.html")
+    @app.exception_handler(404)
+    async def return_index(request: Request, exc: HTTPException):
+        return FileResponse("static/index.html")
