@@ -36,6 +36,20 @@
   - Stage 1 收尾 + Stage 1.5 已整体合并到 `my-deploy` 并 push（commit 区间 `2b26349..732aee0`，已通过 Northflank 自动部署）
   - 部署侧默认 flags 全关（`.env.docker` 未含 `BACKEND_DATA_API_URL` / `BACKEND_AUTH` / `BACKEND_DATA_API_ENABLED`），线上行为字节级等同 Stage 0；按需在 Northflank 控制台开 flag 灰度
   - 下一步：进入 **Stage 2**（实时订阅通道，6 Step 已细化写回 plan）。`link-dexie` 自动调用推迟到 Stage 3 第一张迁移表落地时一起补——届时 mapping key 真正被读到。
+- **2026-05-02 · Stage 2 Step 1-3 代码落地 + plan 入仓库**
+  - **变更**：Stage 2 前 3 个 Step 的代码已全部合并到 `feature/change-cloud-sync-claude` 分支（尚未合 my-deploy）；plan 文件本身从 `~/.claude/plans/` 复制到仓库 `plans/cloud-sync-migration.md`，CLAUDE.md 加「长期迁移工作流」段并入库（详见进度快照 2026-05-02）。
+  - **影响范围**：plan 维护规则正式生效——动态进度（当前 Step、commit hash、未解决问题）一律写本文件，不写 CLAUDE.md；任何改动需配套通过判据，每个 Step 完成后必须更新「进度快照」段；方案有调整必须先在「修订记录」追加条目再改正文。
+  - **后续维护**：本文件即权威版；`~/.claude/plans/1-ethereal-lollipop.md` 仅给 Claude Code `/plan` 命令读，按需手动 `cp` 仓库版同步。
+- **进度快照（2026-05-02）**
+  - **Stage 2 / Step 1**（后端 broker + WS `/api/v1/stream`）✅ commit `e6c5335`
+  - **Stage 2 / Step 2**（前端 `SyncSource` 接口 + `DexieSyncSource` 重构）✅ commit `7755de7`
+  - **Stage 2 / Step 3**（前端 `realtime-ws.ts` — `RealtimeConn` 单例 + `createRemoteSyncSource`）⚠️ **代码已合 commit `aa0f25b`，验收进行中**
+    - 副 commit `e73e52e`（修复 AccountPage 主退出登录级联登出 Dexie 会话）— 联动测试时浮现的 Stage 1.5 时期遗留 bug，本次 Step 3 验收前一并修掉
+    - 验收三个场景里**场景 A 部分通过**：Console `realtime.subscribe('providers', cb)` 能收到 event（WS 握手 / 子协议鉴权 / SQL replay / 派发都正常）
+    - 验收**场景 B（主动断网重连）/ 场景 C（token 过期 close 4001 + refresh + 重连）尚未独立测试**
+    - 详见下方 §Stage 2 / Step 3「当前状态」段
+  - **plan 文件 + CLAUDE.md 入库** ✅ commit `f2a39d4`
+  - 下一步：先把 Stage 2 / Step 3 验收收尾（场景 B/C + 修「`idle` 状态无自动恢复」边界 bug），再进 Step 4。
 
 ---
 
@@ -356,9 +370,41 @@ interface AuthSource {
 - 暂不接 repository（仍是 console 测试模式）
 
 **通过判据**（Console 调，绕开 UI）
-- Console 调 `realtime.subscribe('providers', e => console.log(e))` → 第二 tab PUT → 看到 event
-- 主动断网 5s 再连 → Console 看到自动重连日志，订阅恢复
-- 让 token 过期（手动 setTimeout 改本地 token）→ 看到 close 4001 → refresh → 重连
+- 场景 A：Console 调 `realtime.subscribe('providers', e => console.log(e))` → 第二 tab PUT → 看到 event
+- 场景 B：主动断网 5s 再连 → Console 看到自动重连日志，订阅恢复
+- 场景 C：让 token 过期（手动 setTimeout 改本地 token）→ 看到 close 4001 → refresh → 重连
+
+**当前状态（2026-05-02）**
+- 代码：commit `aa0f25b`（`src/data/realtime-ws.ts` + `src/data/index.ts` 导出）；副 commit `e73e52e`（AccountPage 退出登录级联）
+- 场景 A ⚠️ **部分通过**：Console 订阅后能收到 event（WS 握手、`bearer.<token>` 子协议鉴权、`since=<lastRev>` SQL replay、event 派发到 listener 全部 OK）。但联动测试中观察到 `aiawRealtime.state` 偶发卡 `'idle'` —— 见下方「已知问题 #1」。
+- 场景 B ❓ **未独立测试**：被场景 A 的 idle 边界 bug 与「UI 不刷新」诊断岔开。
+- 场景 C ❓ **未独立测试**：同上。
+
+**已知问题（待 Step 3 收尾时处理）**
+1. **`RealtimeConn` 进入 `'idle'` 后无自动恢复**
+   - 现象：`ensureConnected()` 检查 token，token 暂时为 null（如 reconnect 路径里 refresh 还在飞 / HMR 重置单例）→ 状态置 `'idle'` 直接 return，再无定时器 / 监听器把它推回连接尝试。只有新的 `subscribe()` 调用能触发 `ensureConnected()`。
+   - 影响：场景 B 重连测试不可靠；场景 C token 过期路径理论上由 `tryRefresh().then(scheduleReconnect)` 兜底，但若 refresh 失败会一样卡死。
+   - 决策方向：Step 3 收尾时给 `'idle'` 加一个轻量监听—— 监听 `authSource.user` 变化，token 重新可用时主动调一次 `ensureConnected()`。改动局限在 `realtime-ws.ts` 一个文件。
+
+2. **（Step 4 前置疑点）UI 不刷新疑似 dexie-cloud-addon middleware 吞读写**
+   - 现象：仅登 backend 账号（未登 Dexie）时，Console PUT provider → server 200 OK → WS event 派发到 listener 正常 → 但 UI 列表无新条目；进一步用 `db.providers.toArray()` 直查，Promise 挂 pending、`.catch` 也不触发。
+   - 怀疑：`dexie-cloud-addon` 在没登录 Dexie 时对读写仍插中间件、卡在等"sync ready"或类似条件。
+   - 范围：严格说不属于 Step 3（Step 3 判据是 Console 收 event，已通过）；属于 **Step 4**（UI 刷新）的前置阻塞。
+   - 处置：留到 Step 4 接 `RemoteSyncSource` 时一起验证。届时若 `db.providers.put(row)` 仍被吞，候选缓解：
+     - (a) 直接绕开 cloud middleware 写一张非 cloud 的镜像表
+     - (b) 让 backend-only 用户的 `db.ts` 不挂 `dexieCloud` addon
+     - (c) 等 Stage 5 摘 dexie-cloud-addon 后自然消失（但那要等很久）
+   - 优先级：Step 4 启动前必须有结论，否则 Step 4 整套 cache-backed reads 模型走不通。
+
+3. **（旁支跟踪，非本 Step 范围）`persistent-reactive` 脏状态竞态**
+   - 现象：先登 backend、再登 Dexie 场景下，第一次输入正确验证码后 UI 无反应、刷新才生效；且加载的数据缺失默认 provider / 默认模型 / 系统助手等设置（`persistent-reactive` KV 存的字段），第二次重试又能恢复。
+   - 历史：commit `4258fa8` 修过 clean-state 路径，dirty-state 在 5s 超时边界仍有问题。
+   - 决策：跟踪中、不阻塞 Stage 2；Stage 3 迁 `reactives` 表时一起重新审视。
+
+4. **（旁支跟踪）Dexie Cloud 登录 preflight 400**
+   - 现象：本机环境某些时刻点"登录 Dexie 账号" → `dexie-cloud-addon.js:5780` 报 `TypeError: Load failed`，Network 看到 SaaS 端 `/login` preflight 400。
+   - 怀疑：dev server 端口或本机环境的 CORS 触发 SaaS 侧策略，或 Dexie SaaS 临时问题。
+   - 决策：需稳定重现条件才能定位；Stage 5 摘 addon 后自然消失。
 
 #### Step 4 — 把 `providers.server.ts` 接到 `RemoteSyncSource`
 
