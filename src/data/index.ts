@@ -1,6 +1,6 @@
 export { repos } from './repositories'
 export type { Repos } from './repositories'
-export { authSource } from './auth'
+export { authSource, dexieAuthSource } from './auth'
 export { runTx } from './transactions'
 export type { TableName } from './transactions'
 export { observe, observeWithDeps } from './observe'

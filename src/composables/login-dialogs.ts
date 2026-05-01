@@ -1,15 +1,15 @@
-import { useQuasar } from 'quasar'
-import { authSource } from 'src/data'
+import { useQuasar, type QVueGlobals } from 'quasar'
+import { authSource, dexieAuthSource } from 'src/data'
+import type { AuthSource } from 'src/data'
 import { watch } from 'vue'
 import { dialogOptions } from 'src/utils/values'
 import { useI18n } from 'vue-i18n'
+import { BackendAuth } from 'src/utils/config'
 
-export function useLoginDialogs() {
-  if (!authSource.enabled) return
-  const userInteraction = authSource.userInteraction
-  const user = authSource.user
-  const $q = useQuasar()
-  const { t } = useI18n()
+function bindSource(source: AuthSource, $q: QVueGlobals, t: (k: string, p?: Record<string, unknown>) => string) {
+  if (!source.enabled) return
+  const userInteraction = source.userInteraction
+  const user = source.user
   let loginNotify = false
 
   watch(userInteraction, interaction => {
@@ -76,4 +76,16 @@ export function useLoginDialogs() {
     isLoggedIn && loginNotify && $q.notify(t('login.loggedIn', { email: user.value.email }))
     loginNotify = false
   })
+}
+
+export function useLoginDialogs() {
+  const $q = useQuasar()
+  const { t } = useI18n()
+  bindSource(authSource, $q, t)
+  // Stage 1.5 双写窗口：BACKEND_AUTH=true 时主 authSource 是 backend，
+  // 但 dexieAuthSource 仍可独立调用（AccountPage 的"原 Dexie 账号"入口），
+  // 需要并行绑定其 userInteraction 才能弹出 email/OTP 对话框。
+  if (BackendAuth && dexieAuthSource !== authSource) {
+    bindSource(dexieAuthSource, $q, t)
+  }
 }
