@@ -1,6 +1,7 @@
 import type { Collection, Table, WhereClause } from 'dexie'
 import type { ShallowRef } from 'vue'
 import { observe, observeWithDeps } from '../observe'
+import { createDexieSyncSource } from '../sync-source'
 import type { QuerySpec, Repository, WhereValue } from '../types'
 
 function isInValue<V>(v: WhereValue<V>): v is { in: V[] } {
@@ -48,6 +49,7 @@ function buildCollection<T, K extends string>(table: Table<T, K>, spec: QuerySpe
 
 export function createDexieRepository<T, K extends string = string>(getTable: () => Table<T, K>): Repository<T, K> {
   const t = () => getTable()
+  const syncSource = createDexieSyncSource<T, K>(t)
 
   return {
     table: t,
@@ -75,7 +77,7 @@ export function createDexieRepository<T, K extends string = string>(getTable: ()
       t().filter(predicate).modify(changes as any) as unknown as Promise<number>,
 
     observeList: <I = T[]>(options: { initialValue?: I } = {}) =>
-      observe<T[], I>(() => t().toArray(), options) as ShallowRef<T[] | I>,
+      observe<T[], I>(() => syncSource.snapshot(), options) as ShallowRef<T[] | I>,
 
     observeFind: <I = T[]>(
       spec: QuerySpec<T> | (() => QuerySpec<T>),
