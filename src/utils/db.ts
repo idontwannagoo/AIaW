@@ -3,7 +3,8 @@ import { defaultAvatar, genId } from './functions'
 import { Workspace, Folder, Dialog, Message, Assistant, Artifact, StoredReactive, InstalledPlugin, AvatarImage, StoredItem, CustomProvider } from './types'
 import { AssistantDefaultPrompt, ExampleWsIndexContent } from './templates'
 import dexieCloud, { DexieCloudTable } from 'dexie-cloud-addon'
-import { DexieDBURL } from './config'
+import { BackendApiBaseURL, BackendDataTables, DexieDBURL } from './config'
+import { SERVER_CAPABLE_TABLES } from 'src/data/server-tables'
 import { i18n } from 'src/boot/i18n'
 
 type Db = Dexie & {
@@ -22,11 +23,21 @@ type Db = Dexie & {
 const db = new Dexie('data', { addons: DexieDBURL ? [dexieCloud] : [] }) as Db
 
 if (DexieDBURL) {
+  // Tables routed to the self-hosted backend must be excluded from Dexie
+  // Cloud's per-table sync hooks. Otherwise the addon marks them
+  // `markedForSync = true` and wraps every put/toArray in middleware that
+  // expects a logged-in cloud user — which a backend-only user doesn't have.
+  // `unsyncedTables` flips `markedForSync = false`, leaving the table as a
+  // plain local Dexie cache that providers.server.ts can write through.
+  const unsyncedTables = BackendApiBaseURL
+    ? Array.from(BackendDataTables).filter(t => SERVER_CAPABLE_TABLES.has(t))
+    : []
   db.cloud.configure({
     databaseUrl: DexieDBURL,
     requireAuth: false,
     customLoginGui: true,
-    nameSuffix: false
+    nameSuffix: false,
+    ...(unsyncedTables.length > 0 ? { unsyncedTables } : {})
   })
 }
 const schema = {

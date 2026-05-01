@@ -7,15 +7,11 @@ import type {
 } from 'src/utils/types'
 import { createDexieRepository } from './dexie'
 import { serverProvidersRepository } from './providers.server'
+import { SERVER_CAPABLE_TABLES } from '../server-tables'
 import type { Repository } from '../types'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const t = <T, K extends string = string>(getter: () => any): (() => Table<T, K>) => () => getter() as Table<T, K>
-
-// Tables that have a server-side Repository implementation. Used as the
-// allowlist for BACKEND_DATA_TABLES — values not in this set are ignored
-// even if listed in the env, so a typo doesn't silently bypass Dexie.
-const SERVER_CAPABLE_TABLES = new Set<string>(['providers'])
 
 function routeToServer(table: string): boolean {
   return !!BackendApiBaseURL && SERVER_CAPABLE_TABLES.has(table) && BackendDataTables.has(table)

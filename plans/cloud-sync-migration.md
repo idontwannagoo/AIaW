@@ -36,6 +36,10 @@
   - Stage 1 收尾 + Stage 1.5 已整体合并到 `my-deploy` 并 push（commit 区间 `2b26349..732aee0`，已通过 Northflank 自动部署）
   - 部署侧默认 flags 全关（`.env.docker` 未含 `BACKEND_DATA_API_URL` / `BACKEND_AUTH` / `BACKEND_DATA_API_ENABLED`），线上行为字节级等同 Stage 0；按需在 Northflank 控制台开 flag 灰度
   - 下一步：进入 **Stage 2**（实时订阅通道，6 Step 已细化写回 plan）。`link-dexie` 自动调用推迟到 Stage 3 第一张迁移表落地时一起补——届时 mapping key 真正被读到。
+- **2026-05-02 · 已知问题 #2 修复 · server-routed 表走 `unsyncedTables`**
+  - **背景**：Stage 2 / Step 3 验收时观察到「仅登 backend 账号未登 Dexie 时，新建/修改 provider 后 UI 列表不刷新」。读 dexie-cloud-addon 源码（`createIdGeneration` / `createImplicitPropSetter` / `createMutationTracking` 三个 dbcore middleware）确认：addon 默认把 schema 里所有非 `$` 前缀的表标 `markedForSync = true`，对这些表的 readwrite 事务会强制并入 `$<table>_mutations` mutation 表，并在每条 `add/put` 上注入 `owner`/`realmId`、读 `trans.currentUser` 上下文。backend-only 用户 `currentUser = UNAUTHORIZED_USER`，与 Stage 2 的 `providers` 写路径冲突。
+  - **变更**：在 `src/utils/db.ts` 的 `db.cloud.configure(...)` 里按 `BACKEND_DATA_API_URL ∩ BACKEND_DATA_TABLES ∩ SERVER_CAPABLE_TABLES` 计算 `unsyncedTables`，把已切到后端的表（当前仅 `providers`）从 addon 的 `markedForSync` 摘掉。`SERVER_CAPABLE_TABLES` 抽到 `src/data/server-tables.ts` 共享模块（避免 db.ts ↔ repositories/index.ts 循环依赖）。
+  - **影响范围**：flag 关时 `unsyncedTables = []`，行为字节级等同此前；flag 开时 `providers` 退化为普通 Dexie 本地表，`db.providers.put/toArray/liveQuery` 全部短路 addon middleware。Stage 3+ 每张新搬到后端的表自动通过 `BACKEND_DATA_TABLES` 加入此名单，无需再改 db.ts；只需在 `server-tables.ts` 把表名加进 `SERVER_CAPABLE_TABLES`。
 - **2026-05-02 · Stage 2 Step 1-3 代码落地 + plan 入仓库**
   - **变更**：Stage 2 前 3 个 Step 的代码已全部合并到 `feature/change-cloud-sync-claude` 分支（尚未合 my-deploy）；plan 文件本身从 `~/.claude/plans/` 复制到仓库 `plans/cloud-sync-migration.md`，CLAUDE.md 加「长期迁移工作流」段并入库（详见进度快照 2026-05-02）。
   - **影响范围**：plan 维护规则正式生效——动态进度（当前 Step、commit hash、未解决问题）一律写本文件，不写 CLAUDE.md；任何改动需配套通过判据，每个 Step 完成后必须更新「进度快照」段；方案有调整必须先在「修订记录」追加条目再改正文。
@@ -49,6 +53,7 @@
     - 验收**场景 B（主动断网重连）/ 场景 C（token 过期 close 4001 + refresh + 重连）尚未独立测试**
     - 详见下方 §Stage 2 / Step 3「当前状态」段
   - **plan 文件 + CLAUDE.md 入库** ✅ commit `f2a39d4`
+  - **已知问题 #2 修复**（server-routed 表 `unsyncedTables`）✅ 待 commit；后续测试需验证 flag 开关下 UI 行为
   - 下一步：先把 Stage 2 / Step 3 验收收尾（场景 B/C + 修「`idle` 状态无自动恢复」边界 bug），再进 Step 4。
 
 ---
@@ -386,15 +391,10 @@ interface AuthSource {
    - 影响：场景 B 重连测试不可靠；场景 C token 过期路径理论上由 `tryRefresh().then(scheduleReconnect)` 兜底，但若 refresh 失败会一样卡死。
    - 决策方向：Step 3 收尾时给 `'idle'` 加一个轻量监听—— 监听 `authSource.user` 变化，token 重新可用时主动调一次 `ensureConnected()`。改动局限在 `realtime-ws.ts` 一个文件。
 
-2. **（Step 4 前置疑点）UI 不刷新疑似 dexie-cloud-addon middleware 吞读写**
-   - 现象：仅登 backend 账号（未登 Dexie）时，Console PUT provider → server 200 OK → WS event 派发到 listener 正常 → 但 UI 列表无新条目；进一步用 `db.providers.toArray()` 直查，Promise 挂 pending、`.catch` 也不触发。
-   - 怀疑：`dexie-cloud-addon` 在没登录 Dexie 时对读写仍插中间件、卡在等"sync ready"或类似条件。
-   - 范围：严格说不属于 Step 3（Step 3 判据是 Console 收 event，已通过）；属于 **Step 4**（UI 刷新）的前置阻塞。
-   - 处置：留到 Step 4 接 `RemoteSyncSource` 时一起验证。届时若 `db.providers.put(row)` 仍被吞，候选缓解：
-     - (a) 直接绕开 cloud middleware 写一张非 cloud 的镜像表
-     - (b) 让 backend-only 用户的 `db.ts` 不挂 `dexieCloud` addon
-     - (c) 等 Stage 5 摘 dexie-cloud-addon 后自然消失（但那要等很久）
-   - 优先级：Step 4 启动前必须有结论，否则 Step 4 整套 cache-backed reads 模型走不通。
+2. ~~**（Step 4 前置疑点）UI 不刷新疑似 dexie-cloud-addon middleware 吞读写**~~ ✅ **已修复**
+   - 原现象：仅登 backend 账号（未登 Dexie）时，Console PUT provider → server 200 OK → WS event 派发到 listener 正常 → 但 UI 列表无新条目；`db.providers.toArray()` 直查 Promise 挂 pending。
+   - 根因：dexie-cloud-addon 把所有非 `$` 表默认标 `markedForSync = true`，三个 dbcore middleware（`idGeneration` / `implicitPropSetter` / `mutationTracking`）对这些表的 readwrite 路径并入 `$<table>_mutations` 事务并写 `owner`/`realmId`，依赖 `trans.currentUser` 上下文，与 backend-only 用户冲突。
+   - 修复：方案 (b) 的精细化版本——`src/utils/db.ts` 给 `db.cloud.configure(...)` 加 `unsyncedTables`（按 `BackendDataTables ∩ SERVER_CAPABLE_TABLES` 计算）。flag 开时 `providers` 退化为纯 Dexie 表，三个 middleware 全部短路；其它仍走 Dexie Cloud 的表不受影响。详见「修订记录 2026-05-02 · 已知问题 #2 修复」。
 
 3. **（旁支跟踪，非本 Step 范围）`persistent-reactive` 脏状态竞态**
    - 现象：先登 backend、再登 Dexie 场景下，第一次输入正确验证码后 UI 无反应、刷新才生效；且加载的数据缺失默认 provider / 默认模型 / 系统助手等设置（`persistent-reactive` KV 存的字段），第二次重试又能恢复。
