@@ -91,4 +91,8 @@ export interface AuthSource {
   waitForFirstSync(): Promise<void>
   // Stage 0 escape hatch: synchronous read of current user (used for bearer token in fetch)
   currentToken(): string | undefined
+  // Stage 1 Step 4: trigger a token refresh (only meaningful for sources that
+  // own a refresh-token flow). Returns true if a usable access token exists
+  // after the attempt. Sources without their own refresh return false.
+  tryRefresh(): Promise<boolean>
 }

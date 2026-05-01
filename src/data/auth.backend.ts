@@ -230,5 +230,9 @@ export const backendAuthSource: AuthSource = {
   },
   currentToken() {
     return accessToken ?? undefined
+  },
+  async tryRefresh() {
+    await runRefresh()
+    return !!accessToken
   }
 }

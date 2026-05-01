@@ -68,5 +68,10 @@ export const dexieAuthSource: AuthSource = {
     if (!enabled) return undefined
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return (db.cloud.currentUser as any)?.value?.accessToken
+  },
+  async tryRefresh() {
+    // dexie-cloud-addon owns its own token refresh; http.ts only targets the
+    // self-hosted backend, so a Dexie-source refresh wouldn't help its 401s.
+    return false
   }
 }
