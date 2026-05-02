@@ -44,6 +44,7 @@ from ..models.installed_plugin import InstalledPlugin
 from ..models.provider import Provider
 from ..models.reactive import Reactive
 from ..models.user import User
+from ..models.workspace import Workspace
 
 logger = logging.getLogger('aiaw.backend.realtime.sse')
 
@@ -57,6 +58,7 @@ TABLE_MODELS = {
     'assistants': Assistant,
     'avatar_images': AvatarImage,
     'installed_plugins': InstalledPlugin,
+    'workspaces': Workspace,
 }
 
 # SSE keepalives are comments; clients (including event-source-polyfill)
@@ -154,12 +156,31 @@ def _serialize_installed_plugin(p: InstalledPlugin) -> dict[str, Any]:
     }
 
 
+def _serialize_workspace(w: Workspace) -> dict[str, Any]:
+    deleted = w.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'workspaces',
+        'op': 'delete' if deleted else 'put',
+        'id': w.id,
+        'rev': w.version,
+        'row': None if deleted else {
+            'id': w.id,
+            'version': w.version,
+            'updated_at': w.updated_at.isoformat(),
+            'deleted': False,
+            'data': w.data,
+        },
+    }
+
+
 SERIALIZERS = {
     'providers': _serialize_provider,
     'reactives': _serialize_reactive,
     'assistants': _serialize_assistant,
     'avatar_images': _serialize_avatar_image,
     'installed_plugins': _serialize_installed_plugin,
+    'workspaces': _serialize_workspace,
 }
 
 

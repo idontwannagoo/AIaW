@@ -203,3 +203,38 @@ export async function deleteAvatarImage(
 ): Promise<AvatarImageRow> {
   return backendClient(token).del(`/api/v1/avatar-images/${id}`)
 }
+
+// Stage 4 / 批次-4a — workspaces endpoint (id-PK, mirrors providers /
+// assistants envelope; the row's `data` carries Workspace | Folder).
+export interface WorkspaceRow {
+  id: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: Record<string, unknown> | null
+}
+
+export async function putWorkspace(
+  token: string,
+  id: string,
+  data: Record<string, unknown>
+): Promise<WorkspaceRow> {
+  return backendClient(token).put(`/api/v1/workspaces/${id}`, data)
+}
+
+export async function listWorkspaces(
+  token: string,
+  since = 0
+): Promise<WorkspaceRow[]> {
+  return backendClient(token).get(`/api/v1/workspaces?since=${since}`)
+}
+
+export async function deleteWorkspace(
+  token: string,
+  id: string,
+  cascade = true
+): Promise<WorkspaceRow> {
+  return backendClient(token).del(
+    `/api/v1/workspaces/${id}?cascade=${cascade}`
+  )
+}

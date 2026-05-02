@@ -91,11 +91,12 @@ db.on.populate.subscribe(() => {
 
 // Migration
 db.assistants.hook('reading', assistant => {
+  if (!assistant) return assistant
   assistant.promptRole ??= 'system'
   assistant.stream ??= true
   // Migration to v1.8
   const { modelSettings } = assistant
-  if ('maxTokens' in modelSettings) {
+  if (modelSettings && 'maxTokens' in modelSettings) {
     modelSettings.maxOutputTokens = modelSettings.maxTokens as number
     delete modelSettings.maxTokens
   }
@@ -103,7 +104,7 @@ db.assistants.hook('reading', assistant => {
 })
 // Migration to v1.4
 db.workspaces.hook('reading', workspace => {
-  if (workspace.type === 'workspace') {
+  if (workspace?.type === 'workspace') {
     workspace.listOpen ??= {
       assistants: true,
       artifacts: false,
@@ -114,6 +115,7 @@ db.workspaces.hook('reading', workspace => {
 })
 
 db.messages.hook('reading', message => {
+  if (!message) return message
   const usage = message.usage as any
   if (usage && 'promptTokens' in usage) {
     message.usage = {

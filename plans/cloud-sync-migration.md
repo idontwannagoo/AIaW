@@ -104,27 +104,28 @@
 - **Stage 2.5** ✅ 摘 `dexie-cloud-addon` + 删双登录 UI + 删 `linked_dexie_email` 字段链 + 后端 alembic migration drop 列（`c4f1e2d3a8b0`）
 - **Stage 3 / 批次-3a** ✅ `reactives` KV 表迁到 backend：复合主键 `(user_id, key)` + envelope `{key, version, updated_at, deleted, data}` + alembic migration `d6a3f8c91e22` + WS / SSE 加 reactives 白名单 + 前端 `reactives.server.ts` 路由 + `BACKEND_DATA_TABLES=providers,reactives`。`persistent-reactive.ts` 透明走 server，跨 tab 实时同步可用
 - **Stage 3 / 批次-3b** ✅ `assistants` (id-PK) + `installedPlugins` (KV-PK like reactives, 但 `data` 是整行) + `avatarImages` (id-PK + ArrayBuffer↔base64 wire) 三张叶子表迁到 backend：alembic migration `e4b2c5f9d017` + 3 个 router + WS / SSE 加 3 张表白名单 + 3 个 `<table>.server.ts` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages`
+- **Stage 4 主体 / 批次-4a** ✅ `workspaces` (id-PK，type/parentId 嵌 `data`、`$root` sentinel、不建自引用 FK) 迁到 backend：alembic migration `a7f3c2e9b481` + `routers/workspaces.py`（DELETE 接 `?cascade=true|false` no-op 预留 4b/4c/4d/4e wire 形状）+ WS / SSE 加 workspaces 白名单与 serializer + `workspaces.server.ts`（delete 走 `?cascade=true`）+ `BACKEND_DATA_TABLES=...,workspaces`；顺手修 `stores/workspaces.ts::deleteItem` 不再 runTx 包 dexie 事务（与 server-routed 表不兼容）+ `db.ts` 3 个 reading hook 容忍 undefined（latent bug）
 - **Stage 4 硬前置 2** ✅ 对象存储 BlobStore + `/api/v1/blobs` endpoint：`blobs` 表 (sha256 PK + size + content_type + storage_key) + `blob_refs` 表 ((user_id, sha256) 复合 PK + last_seen_at) + alembic migration `f1a3b8c5d4e2`；`BlobStore` 抽象接口 + `LocalFsBlobStore` 默认实现（src-backend/.blob-store 分片路径 `<sha[:2]>/<rest>`）+ `S3BlobStore` 骨架 (boto3 lazy import)；HMAC-SHA256(JWT_SECRET, `sha\|exp`) 签名 URL TTL 1h；POST 上传 + GET metadata + HEAD + GET `/{sha}/data?exp=&sig=` presign + DELETE per-user ref；前端 `src/data/blob-client.ts`（`putBlob` / `fetchBlob` / `serializeAttachment` / `materializeAttachment` + `BLOB_INLINE_MAX_BYTES=64KB`）
 - **Stage 4 硬前置 1** ✅（仅 cursor 分页）`src-backend/data/pagination.py`（`CursorPage` envelope + `normalize_limit` + `build_page` + `CURSOR_MAX_LIMIT=1000`）+ `routers/providers.py` 的 list endpoint 加 `?limit=N` opt-in（不带 limit 维持 `list[Row]` 向后兼容，带 limit 升格为 `{rows, next_cursor}` envelope）+ `tests/api/test_pagination.py`（无 limit / 带 limit / 满页 next_cursor / 边界 / `limit<=0` 拒 / `>CURSOR_MAX_LIMIT` clamp / 续拉到 null 等多 case）。原设计中的 notify-only WS 协议 / per-table payload-mode / fetchAndDispatch 等整体放弃，详见 2026-05-02「硬前置 1 收窄」修订记录。流式云同步走 inline envelope，所有表（含 messages / artifacts）共用 Stage 1–3 现有协议
-- **测试脚手架** ✅ pytest（`tests/api/`，96 case 全绿 ~74s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，63 passed / 224 skipped + 1 pre-existing flake `scenarioB ws auto-reconnect` ~4.7 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
+- **测试脚手架** ✅ pytest（`tests/api/`，117 case 全绿 ~83s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，68 passed / 244 skipped + 1 pre-existing flake `scenarioB ws auto-reconnect` ~4.8 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
 
 ### 部署状态
 
 - **服务 1（指向 `my-deploy`）**：HEAD `2b26349`（Stage 0 baseline + Dexie 路径 bug fix）。env 不开任何 backend flag。承载老用户。Stage 5 落地后由 active 用户迁移率 ≥ 80% 触发 6 周下线窗
 - **服务 2（指向 `new-deploy`）**：公网域名 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run`，独立 Postgres
-  - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
+  - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages,workspaces` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
   - 后端 Northflank 控制台 env：`BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=true`
   - Dockerfile 第二阶段含 `alembic upgrade head` 启动钩子
-  - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/auth/register` 422
-  - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages 跨设备同步可用（reactives 跨 tab 由 persistent-reactive 透传到 user-data / user-perfs / plugins store）；其他 5 张表（workspaces / dialogs / messages / artifacts / items）仍只在本地 IndexedDB；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
+  - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/workspaces` 401、`/api/v1/auth/register` 422
+  - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages + workspaces 跨设备同步可用；其他 4 张表（dialogs / messages / artifacts / items）仍只在本地 IndexedDB；workspaces 删除时子 dialogs / messages / items / artifacts 仍由前端 dexie 清（`stores/workspaces.ts::deleteItem` 顺序 await，不跨表事务）；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
 
-### 下一步：开 Stage 4 主体批次-4a（`workspaces`）
+### 下一步：开 Stage 4 主体批次-4b（`dialogs`） / 批次-4c（`items`）
 
-Stage 3 + 硬前置 1（仅 cursor 分页）+ 硬前置 2 全部完成，可以正式进入 Stage 4 主体批次。按依赖顺序：批次-4a `workspaces` 先做（建立级联事务设计基线）→ 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages`。
+批次-4a workspaces 落地后，按依赖顺序进入 4b dialogs（依赖 workspaces FK，建议加 ON DELETE CASCADE 联动 workspaces tombstone 把 server 端子表清理职责接力过去）+ 4c items（独立，可与 4b 并行）→ 4d artifacts（依赖硬前置 2 对象存储）→ 4e messages（依赖硬前置 1+2，inline envelope 流式同步，最难）。
 
 ### 未启动（按依赖顺序）
 
-- **Stage 4 主体** 批次-4a `workspaces` → 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages` ⏳
+- **Stage 4 主体** 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages` ⏳
 - **Stage 4.5** 服务端 Import Job + bootstrap ⏳ ← **可让老用户用的物理分水岭**
 - **Stage 4.9** flag 路由层 + dexie 实现一次性下架 ⏳ ← 需 Stage 4.5 端到端验收通过 + 稳定运行 1 周
 - **Stage 5** 端到端验证（旧版 export → 新版 import 字节级互通 + 卸载重装 + 跨平台真机） ⏳
@@ -804,7 +805,17 @@ interface AuthSource {
 
 #### 批次状态（每批次落地后填）
 
-- 批次-4a (`workspaces`)：⏳ 未开
+- 批次-4a (`workspaces`)：✅ 落地
+  - 后端：`models/workspace.py`（id-PK envelope，`type` / `parentId` 在 `data` JSONB 内、不拆列、不建自引用 FK；`$root` sentinel 字符串保留）+ `routers/workspaces.py`（GET list / GET one / PUT / DELETE，DELETE 接受 `?cascade=true|false` 参数但 4a 阶段子表多数还在 dexie 故为 no-op，预留 wire 形状给 4b/4c/4d/4e 真级联）+ alembic migration `a7f3c2e9b481`（依赖 `f1a3b8c5d4e2` blobs）+ WS / SSE 加 `workspaces` 白名单与 `_serialize_workspace` + `app.py::_enable_backend_data_api` 挂载 workspaces_router
+  - 前端：`workspaces.server.ts`（id-PK，复用 assistants 模板；delete 走 `?cascade=true` 转发；observeList 触发 `ensureRealtimeSubscription`）+ `repositories/index.ts` flag 路由 workspaces 分支 + `SERVER_CAPABLE_TABLES` 加 `workspaces`
+  - 顺手修：`stores/workspaces.ts::deleteItem` 不再 runTx 包 dexie 事务（assistants 自 批次-3b 起已 server-routed，跨表事务 + HTTP await 不兼容；workspaces 上线后同样问题。改顺序 await，dexie 跨表原子性 4b/4c/4d/4e 后由 server-side cascade endpoint 接力）。同时 `db.ts` 的 3 个 reading hook 加 `if (!row) return row` 与 `workspace?.type` 容忍 undefined（被 cascade 触发出来的 latent bug，根因是 dexie 在某些 cursor cleanup 场景给 hook 传 undefined）
+  - env：`.env.docker` `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages,workspaces`；`tests/env/.env.test.{providers-rest,realtime-{ws,sse,poll,auto}}` 同步加 `workspaces`；`tests/api/conftest.py` TRUNCATE 列表加 `workspaces`
+  - api: `tests/api/test_workspaces.py::test_put_creates_and_list_returns_it / test_get_returns_single_row / test_put_update_bumps_version / test_since_filter_drops_older_revisions / test_soft_delete_yields_tombstone_in_list / test_delete_then_put_revives / test_account_isolation / test_unauth_request_rejected / test_folder_type_round_trips / test_folder_tree_with_parent_chain / test_cascade_param_accepted_no_op_at_4a / test_cross_user_cannot_delete`（12 case，全绿）
+  - spec: `tests/e2e/stage4/workspaces-cascade.spec.ts::case1 ws double-tab / case2 ws double-tab cascade / case3 providers-rest no-realtime / case4 baseline byte-identical`（4 case，全绿）
+  - helper 增量：`tests/e2e/helpers/backend.ts` 加 `WorkspaceRow` / `putWorkspace` / `listWorkspaces` / `deleteWorkspace`（cascade 默认 true）
+  - 测试输出：`pnpm test:api` 117 passed ~83s（96 → 117，+12 + ~9 历史 case 增量计数纠偏）；`pnpm test:e2e` 68 passed / 244 skipped ~4.8 min（57 → 68，+11 含 4a × 6 profile 切片）
+  - 红测验证：把 `routers/workspaces.py::_to_row` 的 `data=None if w.deleted_at else w.data` 临时写死 `data=None`，5/12 case 红、stdout 准确报 `assert body['data']['name'] == 'Workspace 1' → TypeError: 'NoneType' object is not subscriptable`，恢复后绿
+  - 红测验证（e2e）：第一次跑 case2 时 cascade evaluate 触发 db.workspaces.hook('reading') 在 undefined 上爆 `Cannot read properties of undefined (reading 'type')`（pre-existing latent bug），加 `workspace?.type` 守卫后绿；spec stdout / Playwright error-context.md / failed screenshot 三路定位准确
 - 批次-4b (`dialogs`)：⏳ 未开
 - 批次-4c (`items`)：⏳ 未开
 - 批次-4d (`artifacts`)：⏳ 未开 · 依赖 Stage 4 硬前置 2 对象存储完成 + 硬前置 1 cursor 分页落地

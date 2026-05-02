@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { repos, runTx } from 'src/data'
+import { repos } from 'src/data'
 import { genId } from 'src/utils/functions'
 import { Folder, Workspace } from 'src/utils/types'
 import { DefaultWsIndexContent } from 'src/utils/templates'
@@ -51,17 +51,23 @@ export const useWorkspacesStore = defineStore('workspaces', () => {
     for (const key of keys) {
       await deleteItem(key)
     }
-    await runTx(['workspaces', 'dialogs', 'messages', 'items', 'assistants', 'artifacts'], async () => {
-      const dialogIds = await repos.dialogs.findKeys({ where: { workspaceId: id } })
-      for (const dialogId of dialogIds) {
-        await repos.messages.deleteWhere({ where: { dialogId } })
-        await repos.items.deleteWhere({ where: { dialogId } })
-      }
-      await repos.dialogs.deleteWhere({ where: { workspaceId: id } })
-      await repos.assistants.deleteWhere({ where: { workspaceId: id } })
-      await repos.artifacts.deleteWhere({ where: { workspaceId: id } })
-      await repos.workspaces.delete(id)
-    })
+    // Sequential awaits, not a Dexie transaction. Once any of these tables is
+    // server-routed (assistants since 批次-3b, workspaces since 批次-4a),
+    // each repo call may issue HTTP fetches whose await yields the
+    // microtask — Dexie auto-commits and aborts the transaction on the next
+    // operation. Cross-table atomicity will return at 批次-4a's server-side
+    // cascade endpoint once 4b/4c/4d/4e land FK ON DELETE CASCADE on the
+    // child tables; until then the worst case after a mid-flight failure is
+    // a few orphan rows that the next workspace delete cleans up.
+    const dialogIds = await repos.dialogs.findKeys({ where: { workspaceId: id } })
+    for (const dialogId of dialogIds) {
+      await repos.messages.deleteWhere({ where: { dialogId } })
+      await repos.items.deleteWhere({ where: { dialogId } })
+    }
+    await repos.dialogs.deleteWhere({ where: { workspaceId: id } })
+    await repos.assistants.deleteWhere({ where: { workspaceId: id } })
+    await repos.artifacts.deleteWhere({ where: { workspaceId: id } })
+    await repos.workspaces.delete(id)
     return true
   }
 
