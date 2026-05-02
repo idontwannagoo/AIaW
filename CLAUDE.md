@@ -23,7 +23,7 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 - **每完成一个 Step 必须更新 plan**：在 plan 对应 Step 标 ✅，同步更新「进度快照」段；同一次提交里把代码改动与 plan 更新一起 commit，避免 plan 与代码漂移。**不要在 plan 里写当前 commit 自身的 hash**——commit hash 由内容（含 plan）决定，自指数学上无解（amend 后 hash 漂移，plan 写的 hash 失效）。要追溯具体提交直接 `git log` / `git blame` plan 文件。已完成的前序 step 想顺手附个短 hash 做导航锚 OK，但非必须；标 ✅ + Step 名足以定位。
 - **方案有调整必须加修订记录**：当某阶段假设被否定 / 子步骤拆分 / 顺序调整 / 上线策略变化时，在 plan 顶部「修订记录」追加一条带日期 + 背景 + 变更 + 影响范围的条目，再改正文。不要静默改正文。
 - **每次代码修改必须配套通过判据**：每个 Step 在 plan 里都有「通过判据」段，代码改动落地后必须按判据真测一遍（curl / Console / 多 tab / 清缓存等），把结果记进进度快照。判据失败时优先修代码，而不是改判据。
-- **flag 默认关 = 字节级一致**：任何阶段的代码合并到 **new-deploy** 时，前端 `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` / `REALTIME_TRANSPORT` 与后端 `BACKEND_DATA_API_ENABLED` 默认全不开，行为必须与上一阶段完全一致。这是回滚兜底，不可破坏。（注：云同步重构相关代码**永不合 my-deploy** —— 详见下方「部署分支拓扑」段。）
+- **flag 机制保留作"应急 disable 开关"，不再用作"上线节奏 / 灰度兜底"**（2026-05-02 plan 方向调整修订生效）：new-deploy 是空库新实例 + my-deploy 是天然回滚通道，不需要 new-deploy 上"flag 默认关 + 字节级回滚"的兜底。**Stage 3+ 每张表 PR 同 PR 直接把表名加进 `.env.docker` 的 `BACKEND_DATA_TABLES` CSV 并 push 翻开**，不走"上线但不启用 → 单独 PR 翻 flag"两步节奏。`BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` / `REALTIME_TRANSPORT` / `BACKEND_DATA_API_ENABLED` 这套 flag 仍然存在（用作 server.ts 写炸时秒级 disable 单表的应急开关），但默认状态从"全关"改成"按 plan 灰度顺序逐档全开"，整套机制最终在 **Stage 4.9 一次性下架**（前提：Stage 4.5 端到端验收通过 + 稳定运行 ≥ 1 周）。云同步重构相关代码**永不合 my-deploy**——详见下方「部署分支拓扑」段。
 - **后端模块条件挂载**：新增 backend 子模块（如 Stage 2 `realtime.py`）若依赖 `JWT_SECRET` 等强制 env，必须放在 `_enable_backend_data_api()` flag 守卫的 lazy import 里，不能让无 flag 的 Northflank 部署在 import 期就崩。
 - **提交信息**：遵循全局规则（中文、不带 `Co-Authored-By` 与 AI 署名）；项目惯用 `<scope>: <短描述>` 或 `云同步重构stageX-stepY: <内容>` 形式（参考 `git log`）。
 
