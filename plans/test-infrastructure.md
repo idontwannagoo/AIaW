@@ -61,8 +61,25 @@
     - 判据真跑：① `pnpm test:e2e --project=baseline -g smoke` cache hit 路径 3.5s wall（plan 预算 < 30s ✅）；② `pnpm test:e2e -g smoke` 全 3 profile 5.2s 测试 + ~6.8s wall（3 passed / 6 skipped）；③ 注入 `routers/auth.py::register` 直 `raise HTTPException(500, 'INJECTED-FOR-PHASE4-CRITERION-2')` → providers-rest smoke 红 + stdout 直出 `Error: Expected status 200 from /api/v1/auth/register, got 500: {"detail":"INJECTED-FOR-PHASE4-CRITERION-2"}` 含具体 path + status + body（plan 判据 #2 ✅），注入恢复后 3/3 重绿
     - 关键避坑：① `process.env.EXPOSE_DB === 'true'` 在 quasar.config.js 配置期不可靠（dotenv 加载顺序），改为 boot 永远列入 + 运行时 `String(process.env.EXPOSE_DB) !== 'true'` 早 return（vite 构建期内联做 dead code elimination，prod bundle 不含 expose 路径）；② providers store 的 `observeList` 仅是 Dexie liveQuery，不会触发 backend pull，smoke 必须显式调 `__repos__.providers.list()` 才能让 server 写的 row 进 cache；③ `db.providers` schema 主键是 `id`，PUT body 的 `data` 必须含 `id` 字段，否则 client 端 `db.providers.put(row.data)` 抛 `DataError: 'IDBObjectStore' key path did not yield a value`；④ helpers 走 `eslint plugin/promise/param-names`：`new Promise(r => ...)` 必须命名 `resolve`，否则 vite-plugin-checker 把 build 干红
     - 备注：playwright.config 的 webServer 用 `url: http://.../index.html` 而非 `port`（`port` 模式 GET / 在 SPA fallback 之前可能 404）；`--project=baseline` 跑时仍会启动其余 2 个 sirv（sub-100ms 起开销可忽略）；helpers 全用 `(window as any).__db__` 弱类型避免在 src 之外维护 declare global
-  - Phase 5-7 未启动
-  - 下一步：Phase 5（Stage 2 Step 4 验收 spec：双 tab WS 实时联动 / 离线 30s 重连补漏 / providers-rest 退化 / baseline 字节级一致）；Phase 6 反向回填把 cloud-sync plan 已完成 Step 的「通过判据」段末尾补 `api: tests/api/<file>::<test>` / `spec: tests/e2e/<file>::<test>` 引用
+  - Phase 5 Stage 2 Step 4 验收 spec ✅（spec-first：spec 入仓，case 1/2 当前红是 Step 4 未实现的预期信号；case 3/4 绿）
+    - `tests/e2e/stage2/step4-providers-realtime.spec.ts` 4 case，逐条对应 cloud-sync-migration plan Stage 2 Step 4 通过判据 #1-4：
+      - **case1** realtime-ws / 双 tab 实时联动：A 经 `__repos__.providers.put/delete` 写 → B 在 1.5s 内 dumpTable 收到 create / update / delete 三种 op
+      - **case2** realtime-ws / 离线 30s 重连补漏（`test.slow()`）：建好 pre-state → B `setOffline(true)` → A 经 `backend.putProvider` × 2 + `backend.deleteProvider` × 1 → 30s sleep → `setOffline(false)` → B 在 1.5s 内 dumpTable 与 server 状态一致
+      - **case3** providers-rest / 无实时通道退化：A repo.put 后 1.5s 内 B dumpTable **不应**包含新 id；B reload + list() 后**应**包含
+      - **case4** baseline / flag 全关字节级一致：spec 期间 0 次 9011 请求 + 0 次 ws 连接（`page.on('request')` + `page.on('websocket')` 双轨监控）
+    - 关键避坑（落地踩到 + 修了的）：
+      - ① **refresh_token rotation 与双 context**：Stage 1.5 `/auth/refresh` 轮换 refresh_token，单 pair 跨两个 context 时第二个 boot 401。helper `setupTestUser()` + `freshSession()` —— register 一次 + 每个 context 走 `loginApi` 各开一个独立 session
+      - ② **`page.reload()` + `addInitScript` 的回退陷阱**：addInitScript 在每次 navigation 都重跑，会把 localStorage 重置为已被消费的旧 refresh_token，刷新后 `/auth/refresh` 再 401。case 3 reload 前先 `injectAuth(pageB, await freshSession(user))` 把 init script 栈追加一条新 token 覆盖
+      - ③ **same-context 双 tab 不测 realtime**：同 BrowserContext 的两个 tab 共享 IndexedDB + Dexie BroadcastChannel，A 的本地 put 不经服务器即在 B 的 liveQuery 里出现 —— 把 realtime fan-out 漏掉。spec 用 `openContextsForUsers(browser, 2)` 拿两个**独立** context 强制走后端
+      - ④ **observeList() 是 Step 4 的钩子**：plan 写明 Stage 2 Step 4 在 `providers.server.ts.observeList()` 内部启动 `RemoteSyncSource`。spec 在 setup 里 `__step4_obs__ = __repos__.providers.observeList()` 挂 window 防 GC + `await __repos__.providers.list()` bootstrap cache + lastVersion
+    - 判据真跑（Step 4 未实现状态下，commit `c30ae7b` 基线）：
+      - `pnpm test:e2e -g step4` → 4 个 active case：case4 baseline ✅ 1.6s；case3 providers-rest ✅ ~3s；case1 realtime-ws ❌ 因 B 端 dumpTable 一直空 / `expectRowSync` 输出 `B=undefined`；case2 realtime-ws ❌ B 重连后 dumpTable=`[]` / elapsed=1501ms
+      - 红的原因即 Step 4 未做的实证（plan 判据 #2 ✅）；红的具体输出包含 last A row + last B rows + elapsed，未来 Step 4 落地的 dev 可凭这三类信息定位
+      - case3/case4 绿证明判据正确隔离了"flag 关时不应破坏"边界（plan 判据 #2 后半 ✅）
+      - 命令 `pnpm test:e2e -g step4` 一把跑通（plan 判据 #3 ✅）
+    - plan 判据 #1（4 case 全绿）需 Stage 2 Step 4 落地后才能达成 —— 由 cloud-sync-migration plan 推进，本 plan Phase 5 验收只到 spec inkable + #2 / #3 ✅。一旦 Step 4 接 `providers.server.ts.observeList` ↔ `RemoteSyncSource` 完成，case1/case2 应自动转绿，无需改 spec
+  - Phase 6-7 未启动
+  - 下一步：Phase 6 反向回填把 cloud-sync plan 已完成 Step 的「通过判据」段末尾补 `api: tests/api/<file>::<test>` / `spec: tests/e2e/<file>::<test>` 引用 + `tests/README.md`；Stage 2 Step 4 在 cloud-sync-migration plan 推进时复用本 spec 当 TDD 红绿信号
 
 ---
 
