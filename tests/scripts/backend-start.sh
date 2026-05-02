@@ -48,6 +48,10 @@ export DATABASE_URL='postgresql+asyncpg://aiaw:aiaw_test@localhost:5434/aiaw_tes
 export JWT_SECRET='test-only-secret-do-not-use-in-prod'
 export BACKEND_DATA_API_ENABLED='true'
 export CORS_ALLOW_ORIGINS='http://localhost:9007,http://127.0.0.1:9007'
+# Open registration in tests so conftest can spin up users without managing
+# invite codes. Stage 1.5 plan defaults to invite mode, but that's a deploy
+# concern, not a test concern.
+export ALLOW_REGISTRATION='true'
 
 echo "[backend-start] alembic upgrade head"
 ( cd "$REPO_ROOT/src-backend" && "$VENV_ALEMBIC" upgrade head ) >>"$LOG_FILE" 2>&1

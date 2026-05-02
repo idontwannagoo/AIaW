@@ -33,8 +33,19 @@
     - package.json 加 `test:build` / `test:serve`
     - 判据真跑：cold baseline build 15.7s；二次跑 cache hit 0.38s；改 env 一字符 → cache miss + new key + 重 build 13.9s；env 复位 → 命中原 key（cache 确定性）；mid-build SIGINT 后 .env.local sha 与启动前一致；serve-build GET / → index.html、GET /workspaces/abc → SPA fallback 命中 index.html、GET /missing.png → 404
     - 备注：plan 原写 `.ts`，实际落地为 `.mjs`（plain Node ESM，无须 tsx/ts-node 等额外 dev dep；逻辑无 TS-only 特性）
-  - Phase 3-7 未启动
-  - 下一步：Phase 3（后端 pytest 层 + conftest fixture + Stage 1 / 1.5 / 2-Step1 判据沉淀）
+  - Phase 3 后端 pytest 层 ✅
+    - 依赖：`src-backend/requirements-dev.txt`（pytest 8.3.4 / pytest-asyncio 0.24.0 / psycopg[binary]>=3.2.10；httpx + websockets 已在 prod requirements）；`pnpm test:api:install` 装到现有 `src-backend/.venv`
+    - `pytest.ini`：testpaths=tests/api，asyncio_mode=auto，loop-scope=function（session scope 下 httpx async fixture cleanup 撞 closed loop，已切回 function），junit 输出 `tests/.results/api.junit.xml`
+    - `tests/api/conftest.py` 共享 fixture：`_backend_up`（session autouse，9011 不通直接 `pytest.exit` 而非每用例失败一次）/ `db_reset`（function autouse，TRUNCATE refresh_tokens+users+providers RESTART IDENTITY CASCADE + 重置 global_change_seq —— 比 plan 原写的 DROP+alembic 快得多且对 backend 池无副作用）/ `pg_conn`（同步 psycopg）/ `register_user`（factory）/ `user_a`/`user_b` + `client_a`/`client_b`（带 bearer 的 httpx）/ `anon_client` / `ws_connect`（异步 ctxmgr factory，subprotocol=`bearer.<token>`）
+    - 4 份 spec：`test_health.py` 1 case；`test_providers.py` 7 case 覆盖 plan Stage 1 / Step 2 全 6 场景（PUT 新增 / list / get / 更新 bumps version / `?since=N` 严格大于 / soft-delete tombstone / 跨账号隔离）+ unauth 401；`test_auth.py` 13 case 覆盖 Stage 1.5 注册/登录/refresh 轮换吊销/logout 吊销/expired access/link-dexie first-write-wins 等；`test_realtime_ws.py` 11 case 覆盖 Stage 2 Step 1 子协议鉴权 / empty replay-done / replay 后 live / delete tombstone event / 同账号双订阅 fan-out / 跨账号隔离 / unsubscribe 停推 / heartbeat 35s close（slow mark）
+    - 注意点：① email 域用 `@example.com`（`.local`/`.test` 被 email-validator 当 special-use 拒）；② access token 同秒签发可能字节相同（HS256 over (sub, iat-int, exp-int)），test 不 assert access_token 差异，只 assert refresh_token 差异 + 新 access 可用
+    - `tests/scripts/run-pytest.sh`：幂等启动 docker + backend（健康检查 200 复用，否则 `backend-start.sh`）后调 pytest 透传参数；package.json 加 `test:api` / `test:api:install`
+    - `tests/scripts/backend-start.sh` 加 `ALLOW_REGISTRATION=true` env（plan 默认 invite 是部署形态，不是测试形态；invite 模式下 conftest 注册全 422）
+    - 判据真跑：`pnpm test:api`（含 slow） 33 passed 49s（plan 预算 < 60s）；`-m "not slow"` 32 passed 13s
+    - 故障注入红测：① providers.py list_providers 去掉 `Provider.user_id == user_id` → `test_account_isolation` 红 + stdout 直接出 `B leaked A row: [{...}]` 含具体 dict（plan 判据 #2 ✅）。② stream.py `HEARTBEAT_INTERVAL` 25→100 → `test_ws_heartbeat_timeout_closes_connection` 红（slow mark 内 30s 等不到 ping）（plan 判据 #3 ✅，证明 case 不依赖具体 sleep 实现）。两次注入后均已恢复并验证 33/33 仍绿
+    - 备注：psycopg 改宽到 `>=3.2.10`（python 3.14 wheel 起 3.2.10）；运行时 1500+ 行 DeprecationWarning 全是 pytest-asyncio 0.24 自身用 `asyncio.get_event_loop_policy`，3.16 才删，暂忍
+  - Phase 4-7 未启动
+  - 下一步：Phase 4（Playwright 脚手架 + 核心 helper + smoke spec），Phase 6 同步把 cloud-sync plan 已完成 Step 的「通过判据」段末尾补 `api: tests/api/<file>::<test>` 引用
 
 ---
 
@@ -149,7 +160,7 @@ pytest.ini
 
 ---
 
-### Phase 3 — 后端 pytest 层
+### Phase 3 — 后端 pytest 层 ✅
 
 **做什么**
 - 依赖：`pytest`, `pytest-asyncio`, `httpx`, `websockets`, `psycopg[binary]`，加进 `src-backend/requirements.txt` 的 dev extras（或单独 `requirements-dev.txt`）。
