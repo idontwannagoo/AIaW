@@ -7,23 +7,13 @@
  * any gap. Token-expired closes (4001) trigger an auth refresh before the
  * next connect attempt.
  *
- * Step 3 ships the wiring + a Console-accessible singleton (`window.aiawRealtime`).
- * Step 4 is what hooks `providers.server.ts` into this; until then nothing in
- * the UI depends on it.
+ * The class is also driven by the auto-router (Step 5): `ready(timeoutMs)`
+ * exposes a one-shot promise so the router can demote to SSE if WS can't
+ * open within a budget, and `failed()` exposes the post-init failure signal.
  */
-import { watch } from 'vue'
 import { BackendApiBaseURL } from 'src/utils/config'
 import { authSource } from './auth'
-import type { ChangeEvent, SyncSource } from './sync-source'
-
-export interface RealtimeEvent<T = unknown> {
-  type: 'event'
-  table: string
-  op: 'put' | 'delete'
-  id: string
-  row?: T | null
-  rev: number
-}
+import type { RealtimeEvent, TransportConn } from './realtime-types'
 
 export type RealtimeState =
   | 'idle' // never connected (no subscribers, or no token yet)
@@ -37,6 +27,13 @@ interface TableBucket {
   lastRev: number
 }
 
+export interface WsTransportOptions {
+  /** Max consecutive reconnect attempts before declaring the transport dead.
+   *  Used by the auto-router; default `Infinity` keeps stand-alone WS-only
+   *  profile behavior (retry forever). */
+  maxReconnectAttempts?: number
+}
+
 const RECONNECT_BASE_MS = 250
 const RECONNECT_CAP_MS = 8_000
 const RECONNECT_HARD_CAP_MS = 30_000
@@ -48,34 +45,81 @@ function wsUrlFromHttp(httpUrl: string): string {
   return httpUrl.replace(/^http/i, 'ws').replace(/\/+$/, '')
 }
 
-class RealtimeConn {
+export class WsTransport implements TransportConn {
+  readonly transport = 'ws' as const
+
   private ws: WebSocket | null = null
   private subs = new Map<string, TableBucket>()
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private explicitlyClosed = false
   private _state: RealtimeState = 'idle'
+  private maxReconnectAttempts: number
+  private deadlySignaled = false
+  private readyResolvers: Array<{ resolve: () => void; reject: (e: Error) => void }> = []
+  private failureListeners: Set<(reason: string) => void> = new Set()
+
+  constructor(opts: WsTransportOptions = {}) {
+    this.maxReconnectAttempts = opts.maxReconnectAttempts ?? Number.POSITIVE_INFINITY
+  }
 
   get state(): RealtimeState { return this._state }
 
   /**
-   * Subscribe to events for one table. The callback fires for each `event`
-   * frame the server sends *and* once per replayed row right after the
-   * (re)subscribe — Step 4's cache writer doesn't need to distinguish, since
-   * `rev`-based LWW makes both idempotent.
+   * Resolves on the next successful `open`; rejects on timeout, explicit
+   * shutdown, or after `maxReconnectAttempts` attempts. Used by the
+   * auto-router to bail to the next transport.
    */
-  subscribe<T = unknown>(table: string, onEvent: (e: RealtimeEvent<T>) => void): () => void {
+  ready(timeoutMs = 5_000): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (this._state === 'open') {
+        resolve()
+        return
+      }
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        reject(new Error('ws ready timeout'))
+      }, timeoutMs)
+      this.readyResolvers.push({
+        resolve: () => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve()
+        },
+        reject: (e) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          reject(e)
+        }
+      })
+    })
+  }
+
+  onFailure(cb: (reason: string) => void): () => void {
+    this.failureListeners.add(cb)
+    return () => this.failureListeners.delete(cb)
+  }
+
+  subscribe<T = unknown>(
+    table: string,
+    onEvent: (e: RealtimeEvent<T>) => void,
+    since?: number
+  ): () => void {
     let bucket = this.subs.get(table)
     if (!bucket) {
-      bucket = { listeners: new Set(), lastRev: 0 }
+      bucket = { listeners: new Set(), lastRev: since ?? 0 }
       this.subs.set(table, bucket)
+    } else if (since !== undefined && since > bucket.lastRev) {
+      bucket.lastRev = since
     }
     const cb = onEvent as (e: RealtimeEvent) => void
     bucket.listeners.add(cb)
     if (bucket.listeners.size === 1) {
       this.ensureConnected()
-      // Will only actually go on the wire if state===open; on(re)connect we
-      // resubscribe everything in `subs`.
       this.sendSubscribe(table)
     }
     return () => {
@@ -92,18 +136,16 @@ class RealtimeConn {
 
   /**
    * Recover from `idle` when the auth source produces a token after we'd
-   * given up (cold subscribe before login, or 4001 + refresh failure followed
-   * by a manual re-login). Caller is the `authSource.user` watcher below.
-   * No-op if we're already connecting / open / closed-on-purpose.
+   * given up. No-op if connecting / open / closed-on-purpose.
    */
   wakeIfIdle(): void {
     if (this._state !== 'idle') return
     if (this.subs.size === 0) return
     this.reconnectAttempt = 0
+    this.deadlySignaled = false
     this.ensureConnected()
   }
 
-  /** Drop the connection and cancel any scheduled reconnect. Idempotent. */
   shutdown(): void {
     this.explicitlyClosed = true
     if (this.reconnectTimer != null) {
@@ -115,6 +157,28 @@ class RealtimeConn {
       this.ws = null
     }
     this._state = 'closed'
+    this.rejectReady(new Error('ws shut down'))
+  }
+
+  private rejectReady(err: Error): void {
+    const pending = this.readyResolvers
+    this.readyResolvers = []
+    for (const r of pending) r.reject(err)
+  }
+
+  private resolveReady(): void {
+    const pending = this.readyResolvers
+    this.readyResolvers = []
+    for (const r of pending) r.resolve()
+  }
+
+  private signalFailure(reason: string): void {
+    if (this.deadlySignaled) return
+    this.deadlySignaled = true
+    for (const fn of this.failureListeners) {
+      try { fn(reason) } catch (e) { console.error('[ws] failure listener', e) }
+    }
+    this.rejectReady(new Error(reason))
   }
 
   private ensureConnected(): void {
@@ -122,9 +186,6 @@ class RealtimeConn {
     if (this._state === 'open' || this._state === 'connecting') return
     const token = authSource.currentToken()
     if (!token) {
-      // No token yet (user not logged in / refresh in flight). Sit in `idle`
-      // until the next subscribe() call — typical Console-test path is
-      // login-then-subscribe so this rarely matters in practice.
       this._state = 'idle'
       return
     }
@@ -133,9 +194,6 @@ class RealtimeConn {
     const url = `${wsUrlFromHttp(BackendApiBaseURL)}/api/v1/stream`
     let ws: WebSocket
     try {
-      // Browser sends the subprotocol via Sec-WebSocket-Protocol; server
-      // pulls the JWT out of `bearer.<token>`. Token in URL would leak into
-      // proxy access logs, hence subprotocol.
       ws = new WebSocket(url, [`bearer.${token}`])
     } catch (e) {
       console.warn('[realtime] WS construct failed', e)
@@ -152,9 +210,8 @@ class RealtimeConn {
   private onOpen(): void {
     this._state = 'open'
     this.reconnectAttempt = 0
-    // Resubscribe everything with each table's lastRev so server SQL replay
-    // catches us up on whatever fired during the gap.
     for (const table of this.subs.keys()) this.sendSubscribe(table)
+    this.resolveReady()
   }
 
   private onMessage(raw: string): void {
@@ -207,7 +264,6 @@ class RealtimeConn {
       return
     }
     if (code === CLOSE_TOKEN_EXPIRED) {
-      // Server killed us because JWT exp passed. Refresh, then reconnect.
       console.info('[realtime] token expired (4001), refreshing')
       void authSource.tryRefresh().then((ok) => {
         if (ok) this.scheduleReconnect()
@@ -232,10 +288,14 @@ class RealtimeConn {
       this._state = 'closed'
       return
     }
+    if (this.reconnectAttempt >= this.maxReconnectAttempts) {
+      this._state = 'idle'
+      this.signalFailure(`ws max reconnect attempts (${this.maxReconnectAttempts}) reached`)
+      return
+    }
     this._state = 'reconnecting'
     this.reconnectAttempt += 1
     const base = Math.min(RECONNECT_BASE_MS * 2 ** (this.reconnectAttempt - 1), RECONNECT_CAP_MS)
-    // ±20% jitter so reconnect storms don't synchronize across tabs.
     const jitter = base * 0.2 * (Math.random() * 2 - 1)
     const delay = Math.min(RECONNECT_HARD_CAP_MS, Math.max(0, base + jitter))
     this.reconnectTimer = setTimeout(() => {
@@ -263,50 +323,3 @@ class RealtimeConn {
     }
   }
 }
-
-export const realtime = new RealtimeConn()
-
-/**
- * SyncSource backed by REST snapshot + WS event stream.
- * `fetchSnapshot` is what cold reads / cache-rebuild call;
- * `subscribe` rides the shared WS via `realtime.subscribe`.
- */
-export function createRemoteSyncSource<T>(
-  table: string,
-  fetchSnapshot: () => Promise<T[]>
-): SyncSource<T> {
-  return {
-    snapshot: fetchSnapshot,
-    subscribe(onChange) {
-      return realtime.subscribe<T>(table, (e) => {
-        const out: ChangeEvent<T> = {
-          op: e.op,
-          id: e.id,
-          rev: e.rev
-        }
-        if (e.op === 'put' && e.row != null) out.row = e.row
-        onChange(out)
-      })
-    }
-  }
-}
-
-// Console hook for Step 3 manual verification. Production builds keep this
-// global — it's cheap and useful for support debugging.
-if (typeof window !== 'undefined') {
-  ;(window as unknown as { aiawRealtime: RealtimeConn }).aiawRealtime = realtime
-}
-
-// Wake the singleton when the user (re)appears: covers (a) subscribe()
-// called before login, (b) 4001 close + tryRefresh failure followed by a
-// manual re-login, (c) refresh-token rotation across tabs that briefly
-// nulls accessToken. Without this watch, `idle` is a terminal state until
-// the next subscribe() call — meaning the UI silently stops receiving live
-// events. The watch lives at module scope; the singleton has the same
-// lifetime as the page so we don't need to stop it.
-watch(
-  () => authSource.user.value,
-  (next, prev) => {
-    if (next && !prev) realtime.wakeIfIdle()
-  }
-)

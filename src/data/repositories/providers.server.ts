@@ -3,7 +3,7 @@ import { db } from 'src/utils/db'
 import { RealtimeTransport } from 'src/utils/config'
 import type { CustomProvider } from 'src/utils/types'
 import { http, HttpError } from '../http'
-import { realtime } from '../realtime-ws'
+import { realtime } from '../realtime'
 import type { QuerySpec, Repository } from '../types'
 import { createDexieRepository } from './dexie'
 
@@ -20,14 +20,15 @@ interface ProviderRow {
 let lastVersion = 0
 let inflight: Promise<void> | null = null
 
-// Stage 2 / Step 4: server-driven cache writes. Subscribed once per page on
-// first observe call; events from the WS broker mirror into db.providers, and
-// liveQuery turns the IDB write into a UI refresh. Guarded by RealtimeTransport
-// so the providers-rest profile (no transport) stays purely pull-based.
+// Stage 2 / Step 4-5: server-driven cache writes. Subscribed once per page on
+// first observe call; events from the active transport mirror into
+// db.providers, and liveQuery turns the IDB write into a UI refresh. Empty
+// `RealtimeTransport` (providers-rest profile) keeps the cache purely
+// pull-based.
 let realtimeUnsubscribe: (() => void) | null = null
 
 function ensureRealtimeSubscription(): void {
-  if (RealtimeTransport !== 'ws') return
+  if (!RealtimeTransport) return
   if (realtimeUnsubscribe) return
   // Server emits the full ProviderRow envelope as `row`, mirroring what
   // `GET /api/v1/providers` returns. Unwrap to `row.data` so the cache stays

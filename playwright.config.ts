@@ -36,7 +36,10 @@ function requireEnv(name: string): string {
 const PROFILES: Profile[] = [
   { name: 'baseline', port: 9007, buildDir: requireEnv('E2E_BUILD_DIR_BASELINE') },
   { name: 'providers-rest', port: 9008, buildDir: requireEnv('E2E_BUILD_DIR_PROVIDERS_REST') },
-  { name: 'realtime-ws', port: 9009, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_WS') }
+  { name: 'realtime-ws', port: 9009, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_WS') },
+  { name: 'realtime-sse', port: 9012, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_SSE') },
+  { name: 'realtime-poll', port: 9013, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_POLL') },
+  { name: 'realtime-auto', port: 9014, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_AUTO') }
 ]
 
 export default defineConfig({

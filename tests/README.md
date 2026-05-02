@@ -15,8 +15,8 @@ pnpm test:api:install
 pnpm test:e2e:install
 
 # 跑全部
-pnpm test:api          # ~50s, 33 case
-pnpm test:e2e          # ~60s, 14 active case + 26 skipped (profile gate)
+pnpm test:api          # ~50s, 38 case
+pnpm test:e2e          # ~80s, 17 active case + 85 skipped (profile gate, 6 profiles)
 
 # 加过滤
 pnpm test:api -k providers
@@ -45,12 +45,15 @@ pnpm test:down           # docker compose down -v，删 5434 + volume
 |---|---|---|
 | Postgres | 5433 (volume `aiaw-postgres`) | 5434 (volume `aiaw_test_pg`) |
 | Backend (FastAPI) | 9010 | 9011 |
-| 前端 SPA | 9005 / 9006 (PWA) | 9007 (baseline) / 9008 (providers-rest) / 9009 (realtime-ws) |
+| 前端 SPA | 9005 / 9006 (PWA) | 9007 (baseline) / 9008 (providers-rest) / 9009 (realtime-ws) / 9012 (realtime-sse) / 9013 (realtime-poll) / 9014 (realtime-auto) |
 
 profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 - **baseline** — 全 flag 关，行为等同 Stage 0 (Dexie-only)
 - **providers-rest** — backend providers 接通 + `BACKEND_AUTH=true`，无 realtime
 - **realtime-ws** — 上面 + `REALTIME_TRANSPORT=ws`
+- **realtime-sse** — 上面 flag + `REALTIME_TRANSPORT=sse`（SSE 单向流降级）
+- **realtime-poll** — 上面 flag + `REALTIME_TRANSPORT=poll`（5s 轮询，最低保证最终一致）
+- **realtime-auto** — 上面 flag + `REALTIME_TRANSPORT=auto`（先试 ws → sse → poll，运行时降级）
 
 `process.env.*` 是构建期内联 → 不能 runtime 切 flag → 每 profile 必须独立 build。
 `build-frontend-profile.mjs` 按 `(env-sha256, git rev, package.json hash)` 联合 cache key 命中 `tests/.builds/<profile>/<key>/`，二次命中 < 1s。
@@ -73,6 +76,7 @@ profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 | Stage 2 / Step 1 WS broker | `api: tests/api/test_realtime_ws.py` (11 case) |
 | Stage 2 / Step 3 客户端 RealtimeConn | `spec: tests/e2e/stage2/step3-realtime-recovery.spec.ts` (scenarioB / C) |
 | Stage 2 / Step 4 接 RemoteSyncSource | `spec: tests/e2e/stage2/step4-providers-realtime.spec.ts` (4 case) |
+| Stage 2 / Step 5 SSE / poll / auto 降级 | `api: tests/api/test_realtime_sse.py` (5 case) + `spec: tests/e2e/stage2/step5-transport-degradation.spec.ts` (4 case) |
 
 ---
 
@@ -134,7 +138,8 @@ plan Stage 2 Step 4 落地转绿（providers.server.ts 接到 RemoteSyncSource�
 | 「双 tab 在 1.5s 内一致」 | `expectRowSync(pageA, pageB, table, id, { withinMs: 1500 })` |
 | 「等到 version >= N」 | `waitForVersion(page, table, id, minVersion)` |
 | 「断网」 | `setOffline(ctx, true)` |
-| 「禁 ws」 | `blockWS(ctx)` |
+| 「禁 ws」 | `blockWS(ctx)` — 走 Playwright 1.48+ `routeWebSocket()`，匹配 `**/api/v1/stream**` |
+| 「禁 sse」 | `blockSSE(ctx)` — `route('**/api/v1/stream/sse**', abort)` |
 | 「禁 dexie SaaS」 | `blockHost(ctx, 'znm3rqzc8.dexie.cloud')` |
 | 「捕 ws 帧」 | `captureWs(page)` → `waitForFrame(predicate, timeoutMs)` / `expectFrame(predicate)` |
 | 「导出 / 导入」 | `exportData(page)` → 文件路径 / `importData(page, filePath)` |

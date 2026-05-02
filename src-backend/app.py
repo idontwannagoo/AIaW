@@ -67,14 +67,16 @@ def _enable_backend_data_api(app: FastAPI) -> None:
     from data.routers import auth as auth_router
     from data.routers import health as health_router
     from data.routers import providers as providers_router
+    from data.routers import sse as sse_router
     from data.routers import stream as stream_router
 
     app.include_router(health_router.router)
     app.include_router(auth_router.router)
     app.include_router(providers_router.router)
     app.include_router(stream_router.router)
+    app.include_router(sse_router.router)
     logger.info(
-        'backend data API enabled (auth + providers + health + stream mounted)'
+        'backend data API enabled (auth + providers + health + stream + sse mounted)'
     )
 
 

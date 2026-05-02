@@ -12,6 +12,24 @@
 
 ## 修订记录
 
+- **2026-05-02 · Stage 2 / Step 5 落地**
+  - **背景**：Step 4 完成后客户端只有 WS 一种 transport。Step 5 加 SSE / poll 降级路径 + auto 自动选档，让代理 / NAT / 公司网络拒 WS upgrade 时仍能走最低保证最终一致。spec 在 Phase 6 落地（5 个 pytest case + 4 个 playwright case），代码缺位时 case2 poll / case3 / case4 spec-first 红（5 个 SSE pytest 全 404）。
+  - **变更**：
+    - 后端 `src-backend/data/routers/sse.py`：`GET /api/v1/stream/sse?since=&tables=...`，`text/event-stream`，鉴权走 `Authorization: Bearer <jwt>`，每帧带 `id:<rev>`，`Last-Event-ID` 头作为 `since` 兜底。复用 `realtime.broker` + `Subscription` 与 WS 同构；keepalive 用 SSE comment（`: keepalive`）每 25s 一发；未知表降级为 `event: error` 帧而非 close。`app.py` 把 `sse` 路由加进 `_enable_backend_data_api()` flag 守卫的挂载列表（与 stream / providers 同款 lazy import）。
+    - 前端 transport 抽象：新增 `src/data/realtime-types.ts`（`TransportConn` 接口 + `RealtimeEvent` / `TransportName` 类型），`src/data/realtime-ws.ts` 重构为 `WsTransport` 类（保留 `RealtimeState` 导出 + `maxReconnectAttempts` 选项让 auto-router 能限攻击），`src/data/realtime-sse.ts` 实现 `SseTransport`（用 `eventsource@3` 包注入 `customFetch` 让 `Authorization` 头能加上），`src/data/realtime-poll.ts` 实现 `PollTransport`（5s `setInterval` 调 Stage 1 已有的 `GET /api/v1/<table>?since=`，`row` 字段保持 `ProviderRow` envelope 与 WS / SSE 同款契约）。
+    - 新增 `src/data/realtime.ts` 作为 dispatcher：按 `RealtimeTransport` 选 `'ws' | 'sse' | 'poll' | 'auto' | ''(NullTransport)`；`AutoTransport` 用每个 transport 的 `ready(timeoutMs)` 做就绪探针（WS 3s、SSE 5s、poll 0s 即时），失败触发 `demote()`：unsubscribe 旧 transport 全部 listener → switch → 用 carryover 的 `lastRev` 在新 transport 上重 subscribe。`realtime.subscribe(table, onEvent, since?)` 是统一入口，`window.aiawRealtime.transport` 暴露当前档位（`'ws' | 'sse' | 'poll'`）供 e2e 校验；`watch(authSource.user)` 仍在本文件 hook（从 realtime-ws.ts 迁过来），冷启动 / 重新登录时叫醒底层 transport。
+    - `providers.server.ts`：import 改为 `from '../realtime'`；`ensureRealtimeSubscription()` 守卫从 `RealtimeTransport !== 'ws'` 放宽到 `!RealtimeTransport`（任何非空 transport 都启用），SSE / poll / auto 走同一份 `db.providers.put(e.row.data)` 解包契约。
+    - `src/data/index.ts`：`realtime` / `createRemoteSyncSource` / `RealtimeEvent` / `RealtimeState` 导出口从 `./realtime-ws` 改到 `./realtime`。
+    - 脚手架增量：`playwright.config.ts` 加 3 profile（`realtime-sse:9012` / `realtime-poll:9013` / `realtime-auto:9014`）；`tests/env/.env.test.realtime-{sse,poll,auto}` 三份；`tests/scripts/run-playwright.sh` 加 3 个 build-profile 步骤；`tests/scripts/backend-start.sh` `CORS_ALLOW_ORIGINS` 扩 9012 / 9013 / 9014（`localhost` + `127.0.0.1` 各一份）；`tests/e2e/helpers/net.ts` 新增 `blockSSE(context)` + 重写 `blockWS(context)` 用 Playwright 1.48+ 的 `routeWebSocket()`（旧实现用 `context.route('**/*')` 只覆盖 HTTP 不覆盖 WS upgrade，等同失效）。
+    - 测试：`tests/api/test_realtime_sse.py` 5 case（unauth 401 / invalid token 401 / replay then live / account isolation / Last-Event-ID resumes from rev）全绿；`tests/e2e/stage2/step5-transport-degradation.spec.ts` 4 case 全绿（case1 sse 2.0s / case2 poll 6.9s / case3 auto→sse 3.5s / case4 auto→poll 9.9s）。
+  - **影响范围**：
+    - `pnpm test:api` 33 → 38 全绿（+5 SSE case）；`pnpm test:e2e` 17 / 102（85 skipped 是 profile gate）全绿。
+    - `tests/README.md` §3 判据映射表加 Stage 2 / Step 5 行；§5 helper ↔ plan 词汇表加 `blockSSE`；§4 已知预期红仍空（spec-first 阶段的 5 SSE pytest red 已转绿）；§2 端口表新增 9012 / 9013 / 9014 三 profile。
+    - my-deploy 默认 `REALTIME_TRANSPORT=` 空（NullTransport），行为字节级等同 Stage 1 收尾；Northflank 控制台开 `REALTIME_TRANSPORT=auto` 即灰度启用全功能；`ws` / `sse` / `poll` 三个固定档也支持。
+  - **避坑（落地踩过 + 修了的）**：
+    - ① **PollTransport 的 `row` 字段最初传了 `row.data`**（unwrap），导致 providers.server.ts 的 `e.row && e.row.data` 解包条件 false → cache 永不 put → spec 报 "B did not converge ... last B rows: []"。修为传 `row` 完整 `ProviderRow` envelope，与 WS / SSE 同款。教训：每加新 transport 都要走「`row` = envelope，`row.data` = 业务对象」契约，否则 cache 形状会沉默错位（参考 CLAUDE.md 已有的相同警告）。
+    - ② **`blockWS` helper 旧实现用 `context.route('**/*')` 不能拦 WS upgrade**：Playwright 的 `route()` 只覆盖 HTTP/fetch/XHR，WebSocket 走另一通道，URL 也不是 `ws://...`（浏览器拿到的是 HTTP Upgrade 请求）。改用 Playwright 1.48+ 的 `context.routeWebSocket('**/api/v1/stream**', ws => ws.close({code: 1008}))`，case3 / case4 才能真把 WS 拒掉触发 fallback。
+    - ③ **build cache key 含 git rev 但不含工作树 diff**：每次源代码改动后没 commit 直接 `pnpm test:e2e`，cache 命中旧产物，bug 修了 spec 还是红。Step 5 需要 `rm -rf tests/.builds/<profile>` 才能强制 rebuild；连续修 + 跑红 → 修 + 跑绿的循环里这一步不能省（CLAUDE.md 已有警告但没 commit 习惯时仍会踩）。
 - **2026-05-02 · Stage 2 / Step 4 落地**
   - **背景**：Phase 5 在 Step 4 代码缺位时已将 4 条通过判据沉淀为 `tests/e2e/stage2/step4-providers-realtime.spec.ts`（spec-first：case1 / case2 在 realtime-ws profile 下 spec-first 红、case3 / case4 绿）。本次按 plan 把 `providers.server.ts.observeList()` 接到 `RemoteSyncSource`，并把 `REALTIME_TRANSPORT` env 暴露到 `src/utils/config.ts`。
   - **变更**：
@@ -85,7 +103,8 @@
     - Stage 2 Step 1 WS 账号隔离（A 订阅时 B 的 PUT 不进 A 频道） ✅
     - Stage 2 Step 1 心跳超时（25s ping + 10s 无 pong → 35s server close） ✅
   - **Stage 2 / Step 4**（`providers.server.ts.observeList()` 接 `RemoteSyncSource` + `RealtimeTransport=ws` 守卫）✅ — `pnpm test:e2e -g step4` 4 case 全绿（case1 1.6s / case2 31.5s / case3 3.5s / case4 1.6s）；详见修订记录 2026-05-02 · Stage 2 / Step 4 落地
-  - 下一步：进 Step 5（SSE / poll 降级路径），按 plan 在落地 PR 内同步落 `playwright.config.ts` 三新 profile + `tests/env/.env.test.realtime-{sse,poll,auto}` + `tests/e2e/stage2/step5-transport-degradation.spec.ts` + `tests/api/test_realtime_sse.py`。
+  - **Stage 2 / Step 5**（SSE / poll 降级路径 + auto 自动选档）✅ — `pnpm test:api` 33 → 38 全绿（+5 SSE case）；`pnpm test:e2e` 17 / 102（85 skipped 是 profile gate）全绿（step5 case1 sse 2.0s / case2 poll 6.9s / case3 auto→sse 3.5s / case4 auto→poll 9.9s）；故障注入红测：注掉 PollTransport 派发循环 → case2 报 "B did not converge ... last B rows: []" 红信号充足，恢复后转绿。详见修订记录 2026-05-02 · Stage 2 / Step 5 落地
+  - 下一步：进 Step 6（Stage 2 收官），按 plan 不引入新 spec、只 reuse Step 1-5 全套作为回归判据 + 写「上线把关」3 个手测交付物（bundle KB 数 / RSS 起止 MB 数 / p95 ms 数）进进度快照，然后翻 Stage 2 上线 flag 合 my-deploy。
 
 ---
 
