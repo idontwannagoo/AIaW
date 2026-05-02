@@ -15,8 +15,8 @@ pnpm test:api:install
 pnpm test:e2e:install
 
 # 跑全部
-pnpm test:api          # ~50s, 38 case
-pnpm test:e2e          # ~80s, 17 active case + 85 skipped (profile gate, 6 profiles)
+pnpm test:api          # ~74s, 96 case
+pnpm test:e2e          # ~4.7min, 63 active case + 224 skipped (profile gate, 6 profiles)
 
 # 加过滤
 pnpm test:api -k providers
@@ -78,6 +78,8 @@ profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 | Stage 2 / Step 4 接 RemoteSyncSource | `spec: tests/e2e/stage2/step4-providers-realtime.spec.ts` (4 case) |
 | Stage 2 / Step 5 SSE / poll / auto 降级 | `api: tests/api/test_realtime_sse.py` (5 case) + `spec: tests/e2e/stage2/step5-transport-degradation.spec.ts` (4 case) |
 | Stage 3 / 批次-3a reactives KV | `api: tests/api/test_reactives.py` (8 case) + `spec: tests/e2e/stage3/reactives-realtime.spec.ts` (4 case) + `tests/e2e/stage3/reactives-cache-roundtrip.spec.ts` (2 case) + `tests/e2e/stage3/persistent-reactive-passthrough.spec.ts` (1 case) |
+| Stage 3 / 批次-3b assistants / installedPlugins / avatarImages | `api: tests/api/test_{assistants,installed_plugins,avatar_images}.py` (各 8 case) + `spec: tests/e2e/stage3/{assistants,installed-plugins,avatar-images}-{realtime,cache-roundtrip}.spec.ts` |
+| Stage 4 硬前置 2 BlobStore + `/api/v1/blobs` | `api: tests/api/test_blobs.py` (27 case：CRUD + 64KB 边界 + 5MB roundtrip + 跨用户隔离 + presign sig 篡改/过期/缺失/未知 sha + delete ref + unauth 401 + LocalFS 分片路径) + `spec: tests/e2e/stage4_pre/blob-client.spec.ts` (6 case：putBlob round-trip + dedup + serializeAttachment 阈值 + materialize inline/ref + baseline guard) |
 
 ---
 
@@ -85,7 +87,9 @@ profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 
 当前无已知预期红。Phase 5 的 step4 case1 / case2 已随 cloud-sync-migration
 plan Stage 2 Step 4 落地转绿（providers.server.ts 接到 RemoteSyncSource）。
-`pnpm test:api && pnpm test:e2e` 一把全绿。
+`pnpm test:api && pnpm test:e2e` 一把全绿，唯一 timing-flake 是
+`step3-realtime-recovery.spec.ts::scenarioB ws auto-reconnect after offline window`
+（`waitForState` 5s 内偶尔等不到 'open'→close transition），与 Stage 4 硬前置 2 工作无关。
 
 ---
 
@@ -146,6 +150,7 @@ plan Stage 2 Step 4 落地转绿（providers.server.ts 接到 RemoteSyncSource�
 | 「禁 dexie SaaS」 | `blockHost(ctx, 'znm3rqzc8.dexie.cloud')` |
 | 「捕 ws 帧」 | `captureWs(page)` → `waitForFrame(predicate, timeoutMs)` / `expectFrame(predicate)` |
 | 「导出 / 导入」 | `exportData(page)` → 文件路径 / `importData(page, filePath)` |
+| 「上传 blob / 反向 / 自动分流」（Stage 4 硬前置 2） | `(window as any).__blobClient__.putBlob(buf, ct)` / `.fetchBlob(ref)` / `.serializeAttachment(buf, ct)` / `.materializeAttachment(env)`——挂在 `window.__blobClient__` 由 `boot/expose-debug.ts` 暴露，需要 `EXPOSE_DB=true` profile + `BACKEND_DATA_API_URL` 设了才能 putBlob，否则 `serializeAttachment(>=64KB)` 会抛 |
 
 ### 5.3 Stage 3 第一张表：`reactives`（已落地，可作为模板）
 

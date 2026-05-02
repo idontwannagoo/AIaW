@@ -90,7 +90,8 @@
 - **Stage 2.5** ✅ 摘 `dexie-cloud-addon` + 删双登录 UI + 删 `linked_dexie_email` 字段链 + 后端 alembic migration drop 列（`c4f1e2d3a8b0`）
 - **Stage 3 / 批次-3a** ✅ `reactives` KV 表迁到 backend：复合主键 `(user_id, key)` + envelope `{key, version, updated_at, deleted, data}` + alembic migration `d6a3f8c91e22` + WS / SSE 加 reactives 白名单 + 前端 `reactives.server.ts` 路由 + `BACKEND_DATA_TABLES=providers,reactives`。`persistent-reactive.ts` 透明走 server，跨 tab 实时同步可用
 - **Stage 3 / 批次-3b** ✅ `assistants` (id-PK) + `installedPlugins` (KV-PK like reactives, 但 `data` 是整行) + `avatarImages` (id-PK + ArrayBuffer↔base64 wire) 三张叶子表迁到 backend：alembic migration `e4b2c5f9d017` + 3 个 router + WS / SSE 加 3 张表白名单 + 3 个 `<table>.server.ts` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages`
-- **测试脚手架** ✅ pytest（`tests/api/`，69 case 全绿 ~64s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，57 passed / 194 skipped 4.5 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
+- **Stage 4 硬前置 2** ✅ 对象存储 BlobStore + `/api/v1/blobs` endpoint：`blobs` 表 (sha256 PK + size + content_type + storage_key) + `blob_refs` 表 ((user_id, sha256) 复合 PK + last_seen_at) + alembic migration `f1a3b8c5d4e2`；`BlobStore` 抽象接口 + `LocalFsBlobStore` 默认实现（src-backend/.blob-store 分片路径 `<sha[:2]>/<rest>`）+ `S3BlobStore` 骨架 (boto3 lazy import)；HMAC-SHA256(JWT_SECRET, `sha\|exp`) 签名 URL TTL 1h；POST 上传 + GET metadata + HEAD + GET `/{sha}/data?exp=&sig=` presign + DELETE per-user ref；前端 `src/data/blob-client.ts`（`putBlob` / `fetchBlob` / `serializeAttachment` / `materializeAttachment` + `BLOB_INLINE_MAX_BYTES=64KB`）
+- **测试脚手架** ✅ pytest（`tests/api/`，96 case 全绿 ~74s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，63 passed / 224 skipped + 1 pre-existing flake `scenarioB ws auto-reconnect` ~4.7 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
 
 ### 部署状态
 
@@ -102,13 +103,13 @@
   - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/auth/register` 422
   - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages 跨设备同步可用（reactives 跨 tab 由 persistent-reactive 透传到 user-data / user-perfs / plugins store）；其他 5 张表（workspaces / dialogs / messages / artifacts / items）仍只在本地 IndexedDB；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
 
-### 下一步：开 Stage 4 硬前置 1（大行 WS 协议改造）+ 硬前置 2（对象存储 BlobStore + `/api/v1/blobs`）
+### 下一步：开 Stage 4 硬前置 1（大行 WS 协议改造）
 
-Stage 3 全部完成。Stage 4 主体（`workspaces` / `dialogs` / `items` / `artifacts` / `messages`）落地前必须先做完两件硬前置：① WS event payload 改 `{table, op, id, rev}` only（不带完整 row，避免 broker 队列爆）；② 对象存储分流（≥ 64KB 走 multipart `/api/v1/blobs` + `{type:'ref', url, sha256, size}`，避免 PG TEXT 列线性膨胀）。详见 Stage 4 段「硬前置」。
+Stage 3 + 硬前置 2 已完成。剩 Stage 4 硬前置 1：WS event payload 改 `{table, op, id, rev}` only（不带完整 row，避免 broker 队列在 messages / artifacts 大行场景爆）+ `?since=N` 加 `limit` + cursor 续拉。仅 messages / artifacts 走新协议；providers / assistants 等小表保持原 envelope。完成后开 Stage 4 主体批次。
 
 ### 未启动（按依赖顺序）
 
-- **Stage 4 硬前置** 1（大行 WS 协议改造） ⏳ + 硬前置 2（对象存储 BlobStore + `/api/v1/blobs`） ⏳
+- **Stage 4 硬前置 1**（大行 WS 协议改造） ⏳
 - **Stage 4 主体** 批次-4a `workspaces` → 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages` ⏳
 - **Stage 4.5** 服务端 Import Job + bootstrap ⏳ ← **可让老用户用的物理分水岭**
 - **Stage 4.9** flag 路由层 + dexie 实现一次性下架 ⏳ ← 需 Stage 4.5 端到端验收通过 + 稳定运行 1 周
@@ -687,12 +688,40 @@ interface AuthSource {
   - DELETE row 时不立即 delete blob（多 row 可能引用同 sha256）；用周期 GC job 扫 `(blob, refcount)`，refcount=0 且超过 7 天再删
 - 客户端读路径：`<table>.server.ts` 拉到 row 后遇到 `{type:'ref', url}` 字段，下载 blob 写入 IndexedDB 缓存（保持现有 Blob 对象形态），UI 透明无感
 - 客户端 IndexedDB 仍可缓存 Blob（不强制 ref 化），让离线读路径不变
-- **通过判据**（待 spec 落地）：
-  - api: PUT 5MB attachment → server PG row 里 attachment 字段是 `{type:'ref', url, sha256, size}`，对象存储里 `<sha256>` 文件存在
-  - api: 同一 sha256 第二次上传去重（PG `blobs` 表行不增，对象存储不重复写）
-  - api: 64KB 边界 → < 64KB inline 进 PG，= 64KB 走对象存储
+- **落地状态（2026-05-02）**：✅ 已完成
+  - 后端：`models/blob.py`（Blob + BlobRef） + `routers/blobs.py`（POST 上传 / GET metadata / HEAD / GET `/{sha}/data?exp=&sig=` presign / DELETE per-user ref） + `data/blob_store.py`（BlobStore 抽象 + LocalFsBlobStore + S3BlobStore 骨架 + HMAC-SHA256(JWT_SECRET, `sha\|exp`) 签名）+ alembic migration `f1a3b8c5d4e2`（blobs + blob_refs，FK ON DELETE CASCADE，索引 ix_blob_refs_sha256 用作 GC 反向扫描）+ `app.py::_enable_backend_data_api` 挂载 blobs_router
+  - 前端：`src/data/blob-client.ts`（`putBlob` / `fetchBlob` / `serializeAttachment` 自动按 `BLOB_INLINE_MAX_BYTES` 阈值二选一 inline / ref / `materializeAttachment` 反向）+ `src/data/index.ts` 导出 + `src/boot/expose-debug.ts` 加 `__blobClient__` 钩子
+  - 测试：96 case 全绿（API 层 27 case + 故障注入两轮 ① skip ownership check → 跨用户隔离 case 红 stdout 直出 sha + envelope dict / ② sha256 反转 → 多 case 红 stdout 直出 'expected vs got sha 对照'，恢复后绿）
+  - 端到端：providers-rest profile 6 case + baseline guard 1 case 全绿
+- **API 层判据**（pytest）：
+  - api: `tests/api/test_blobs.py::test_post_creates_blob_row_and_storage_file` (PUT bytes → PG `blobs` 行 + LocalFS storage_key 文件存在 + url 含 sig+exp)
+  - api: `tests/api/test_blobs.py::test_post_creates_per_user_ref` (per-user blob_refs 行)
+  - api: `tests/api/test_blobs.py::test_same_content_second_upload_is_deduped` (PG `blobs` 行不增，第二次 deduped=True)
+  - api: `tests/api/test_blobs.py::test_signed_url_returns_bytes` (anon_client 用 sig URL 拿到 bytes)
+  - api: `tests/api/test_blobs.py::test_get_metadata_returns_envelope` + `::test_head_returns_metadata_headers`
+  - api: `tests/api/test_blobs.py::test_boundary_size_64kb_round_trip[1/65535/65536/65537]` (4 边界尺寸都能往返)
+  - api: `tests/api/test_blobs.py::test_large_5mb_round_trip` (slow mark, messages-级 attachment 端到端)
+  - api: `tests/api/test_blobs.py::test_empty_body_rejected` (400)
+  - api: `tests/api/test_blobs.py::test_cross_user_each_owns_independent_ref` (同 sha 两用户独立 ref，bytes 全局去重)
+  - api: `tests/api/test_blobs.py::test_user_b_cannot_see_a_uploaded_blob` + `::test_user_b_cannot_delete_a_ref` (404 mask 隐藏存在性)
+  - api: `tests/api/test_blobs.py::test_signed_url_rejects_tampered_signature` + `::test_signed_url_rejects_expired` + `::test_signed_url_path_rejects_missing_query` + `::test_signed_url_for_unknown_sha_returns_404` (presign 安全边界)
+  - api: `tests/api/test_blobs.py::test_invalid_sha_format_400`
+  - api: `tests/api/test_blobs.py::test_delete_ref_drops_only_callers_ownership` (跨用户隔离 + bytes 留待 GC)
+  - api: `tests/api/test_blobs.py::test_a_can_repost_after_delete_ref` (delete + re-upload roundtrip)
+  - api: `tests/api/test_blobs.py::test_unauth_post/metadata/head/delete_rejected` (鉴权 401)
+  - api: `tests/api/test_blobs.py::test_localfs_writes_sharded_path` (`<sha[:2]>/<sha[2:]>` 分片磁盘路径)
+- **前端层判据**（Playwright，providers-rest profile）：
+  - spec: `tests/e2e/stage4_pre/blob-client.spec.ts::putBlob round-trips small bytes + signed URL fetch works` (端到端：FormData multipart + Bearer + sha256 + signed URL 拿回 bytes)
+  - spec: `tests/e2e/stage4_pre/blob-client.spec.ts::putBlob dedup: same bytes → same sha256` (浏览器端 dedup 一致性)
+  - spec: `tests/e2e/stage4_pre/blob-client.spec.ts::serializeAttachment: <64KB → inline, >=64KB → ref` (4 边界尺寸 1B / 65535 / 65536 / 65636 类型分流正确)
+  - spec: `tests/e2e/stage4_pre/blob-client.spec.ts::materializeAttachment: inline → Blob round-trip` + `::ref → fetch via signed URL` (反向链路 inline / ref 双分支)
+  - spec: `tests/e2e/stage4_pre/blob-client.spec.ts::baseline: putBlob throws when BACKEND_DATA_API_URL is not configured` (flag 关时 fail-fast，bundle 不带后端依赖)
+- **未来 Stage 4 主体批次还需补的判据**（messages / artifacts 落地时新加）：
   - spec: client 端 PUT message with 5MB attachment → 第二 tab 收到 event → GET row → 通过 ref URL 下载 blob → UI 渲染 attachment，端到端 < 5s
   - spec: 客户端 IndexedDB 清空后刷新 → ref blob 重新从对象存储拉回 → UI 一致
+- **未来扩展（不在本批次）**：
+  - 周期 GC job：扫 `blobs LEFT JOIN blob_refs` 找无 ref 行 + 超 7 天 → 删 BlobStore bytes + DELETE blob 行（FK CASCADE 自动清 blob_refs）。当前 row delete 时不立即 delete blob bytes 这点需 Stage 4 主体批次 messages / artifacts row-CRUD 接好 blob_refs 增减后才能跑通——本批次只把 schema + endpoint 落地，GC 留待后续
+  - Stage 4.5 ImportJob 多部分上传协议：`BlobStore.create_multipart_upload` / `generate_part_url` / `complete_multipart_upload` / `abort_multipart_upload` 4 个方法；本批次只暴露单 POST 上传，多部分留 4.5
 
 #### 主体迁移工作
 

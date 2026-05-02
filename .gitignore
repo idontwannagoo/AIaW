@@ -62,6 +62,8 @@ pnpm-debug.log*
 *.py[cod]
 .venv/
 venv/
+# Stage 4 硬前置 2: BlobStore LocalFS bytes — content-addressed, never commit.
+/src-backend/.blob-store/
 
 .aider*
 /.claude
