@@ -23,7 +23,7 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 - **每完成一个 Step 必须更新 plan**：在 plan 对应 Step 标 ✅，同步更新「进度快照」段；同一次提交里把代码改动与 plan 更新一起 commit，避免 plan 与代码漂移。**不要在 plan 里写当前 commit 自身的 hash**——commit hash 由内容（含 plan）决定，自指数学上无解（amend 后 hash 漂移，plan 写的 hash 失效）。要追溯具体提交直接 `git log` / `git blame` plan 文件。已完成的前序 step 想顺手附个短 hash 做导航锚 OK，但非必须；标 ✅ + Step 名足以定位。
 - **方案有调整必须加修订记录**：当某阶段假设被否定 / 子步骤拆分 / 顺序调整 / 上线策略变化时，在 plan 顶部「修订记录」追加一条带日期 + 背景 + 变更 + 影响范围的条目，再改正文。不要静默改正文。
 - **每次代码修改必须配套通过判据**：每个 Step 在 plan 里都有「通过判据」段，代码改动落地后必须按判据真测一遍（curl / Console / 多 tab / 清缓存等），把结果记进进度快照。判据失败时优先修代码，而不是改判据。
-- **flag 机制保留作"应急 disable 开关"，不再用作"上线节奏 / 灰度兜底"**（2026-05-02 plan 方向调整修订生效）：new-deploy 是空库新实例 + my-deploy 是天然回滚通道，不需要 new-deploy 上"flag 默认关 + 字节级回滚"的兜底。**Stage 3+ 每张表 PR 同 PR 直接把表名加进 `.env.docker` 的 `BACKEND_DATA_TABLES` CSV 并 push 翻开**，不走"上线但不启用 → 单独 PR 翻 flag"两步节奏。`BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` / `REALTIME_TRANSPORT` / `BACKEND_DATA_API_ENABLED` 这套 flag 仍然存在（用作 server.ts 写炸时秒级 disable 单表的应急开关），但默认状态从"全关"改成"按 plan 灰度顺序逐档全开"，整套机制最终在 **Stage 4.9 一次性下架**（前提：Stage 4.5 端到端验收通过 + 稳定运行 ≥ 1 周）。云同步重构相关代码**永不合 my-deploy**——详见下方「部署分支拓扑」段。
+- **flag 机制保留作"应急 disable 开关"，不再用作"上线节奏 / 灰度兜底"**（2026-05-02 plan 方向调整修订生效）：new-deploy 是空库新实例 + my-deploy 是天然回滚通道，不需要 new-deploy 上"flag 默认关 + 字节级回滚"的兜底。**Stage 3+ 每张表落地时同一批 commit 内直接把表名加进 `.env.docker` 的 `BACKEND_DATA_TABLES` CSV 并 push 翻开**，不走"上线但不启用 → 后续批次再翻 flag"两步节奏。`BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` / `REALTIME_TRANSPORT` / `BACKEND_DATA_API_ENABLED` 这套 flag 仍然存在（用作 server.ts 写炸时秒级 disable 单表的应急开关），但默认状态从"全关"改成"按 plan 灰度顺序逐档全开"，整套机制最终在 **Stage 4.9 一次性下架**（前提：Stage 4.5 端到端验收通过 + 稳定运行 ≥ 1 周）。云同步重构相关代码**永不合 my-deploy**——详见下方「部署分支拓扑」段。
 - **后端模块条件挂载**：新增 backend 子模块（如 Stage 2 `realtime.py`）若依赖 `JWT_SECRET` 等强制 env，必须放在 `_enable_backend_data_api()` flag 守卫的 lazy import 里，不能让无 flag 的 Northflank 部署在 import 期就崩。
 - **提交信息**：遵循全局规则（中文、不带 `Co-Authored-By` 与 AI 署名）；项目惯用 `<scope>: <短描述>` 或 `云同步重构stageX-stepY: <内容>` 形式（参考 `git log`）。
 
@@ -37,7 +37,7 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 - **`new-deploy`** —— **新版部署分支（默认工作目标）**。HEAD 在 Stage 2 收官（commit `5c689ab` 起）。包含 Stage 0/1/1.5/2 全套云同步重构 + 测试脚手架（`tests/`） + 全部 plan（`plans/`）+ 本 CLAUDE.md。Stage 3+ 工作只合到这里 → 部署到独立 Northflank 服务 + 独立 Postgres + Stage 4 起独立对象存储 + 独立域名。
 - **`backup/my-deploy-pre-reset`** —— safety net 永久分支，指向 reset 前 my-deploy HEAD（`5c689ab`）。半年内不删，作为「万一新拓扑要整体回滚」的逃生通道。
 
-### 工作流契约（PR / merge 目标硬性约束）
+### 工作流契约（变更落到哪个分支的硬性约束）
 
 | 改动类型 | 工作分支 base | merge 目标 |
 |---|---|---|
@@ -51,11 +51,11 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 ### Northflank 部署侧约束
 
 - **服务 1（指向 `my-deploy`）**：保留现状。env 不再开 `BACKEND_DATA_API_ENABLED` / `JWT_SECRET` / `BACKEND_AUTH` / `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `REALTIME_TRANSPORT` 等任何 backend flag。Stage 5 落地后由 active 用户迁移率（建议 ≥ 80%）触发 6 周下线窗，到期关闭。
-- **服务 2（指向 `new-deploy`，待新建）**：独立 Postgres 实例 + Stage 4 起独立 R2/MinIO bucket；env 至少开 `BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` 启用 backend data API。前端 flag（`BACKEND_AUTH` / `BACKEND_DATA_TABLES` / `REALTIME_TRANSPORT`）按 plan 灰度 —— 注意前端是构建期内联，开 flag 必须改 `new-deploy` 上的 `.env.docker` 后 push 重 build，控制台 env override 对前端无效。
+- **服务 2（指向 `new-deploy`）**：已上线（公网域名 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run`），独立 Postgres 实例 + Stage 4 起独立 R2/MinIO bucket；env 已开 `BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` 启用 backend data API。前端 flag（`BACKEND_AUTH` / `BACKEND_DATA_TABLES` / `REALTIME_TRANSPORT`）按 plan 灰度 —— 注意前端是构建期内联，开 flag 必须改 `new-deploy` 上的 `.env.docker` 后 push 重 build，控制台 env override 对前端无效。当前实例属性：仅适合 dev preview，不要导入真实数据 / 不要邀请他人，直到 Stage 4.5 落地+真实端到端验收通过（详见 plan「上线节奏与人工端到端测试分工」段）。
 
 ### 老用户迁移路径（导入导出 only）
 
-老用户在 `my-deploy` 域名上 ExportDataDialog 导出 `aiaw_user_db.json` → 在 `new-deploy` 域名上 ImportDataDialog 导入。Stage 4.5 落地后导入走 server-side worker（浏览器只切片直传）。新版默认不挂 dexie-cloud-addon（Stage 5 卸），不愿迁的老用户继续用 my-deploy 不动；存在 bug 时回退路径就是「用回 my-deploy URL」，零数据风险。
+老用户在 `my-deploy` 域名上 ExportDataDialog 导出 `aiaw_user_db.json` → 在 `new-deploy` 域名上 ImportDataDialog 导入。Stage 4.5 落地后导入走 server-side worker（浏览器只切片直传）。new-deploy 镜像不挂 `dexie-cloud-addon`（Stage 2.5 已卸），不愿迁的老用户继续用 my-deploy 不动；存在 bug 时回退路径就是「用回 my-deploy URL」，零数据风险。
 
 ### 部署分支 reset 操作 SOP（如未来再需要）
 
@@ -78,8 +78,8 @@ force-push deploy 分支是分水岭操作，必须按 4 步走：① 在远端�
 ### 工作流（每个需求都必须遵守）
 
 - **判据即代码**：`plans/cloud-sync-migration.md` 每条「通过判据」必须映射到具体 pytest test name 或 Playwright spec name，并在 plan 对应 Step 段尾写下 `- api: tests/api/<file>::<test>` / `- spec: tests/e2e/<path>::<test>` 引用。手测判据不再视为完成标准。
-- **新需求落地 = 同 PR 落 spec + 真跑过测试**：任何新 Step / 新功能 / 新表 / 新 endpoint / bug 修复，**代码变更必须在同一 PR 里附对应自动化 case**，并在本地真跑过 `pnpm test:api && pnpm test:e2e`。三种情况都视为未完成、不允许 commit / push：① 只改代码不写 spec；② 写了 spec 但本地没跑；③ 跑了但有非「文档化预期红」的 case 红。回归套件持续累积，不允许欠账。
-- **TDD 默认顺序**：spec-first → 跑红（确认 spec 真在卡功能）→ 写代码 → 跑绿。Phase 5 的 step4 spec 就是范例（红的输出本身证明 Step 4 未做）。无法先写 spec 的纯重构 / 配置改动可以后置 spec，但同 PR 必须有。
+- **新需求落地 = 同批次落 spec + 真跑过测试**：任何新 Step / 新功能 / 新表 / 新 endpoint / bug 修复，**代码变更必须在同一批次里附对应自动化 case**，并在本地真跑过 `pnpm test:api && pnpm test:e2e`。三种情况都视为未完成、不允许 commit / push：① 只改代码不写 spec；② 写了 spec 但本地没跑；③ 跑了但有非「文档化预期红」的 case 红。回归套件持续累积，不允许欠账。
+- **TDD 默认顺序**：spec-first → 跑红（确认 spec 真在卡功能）→ 写代码 → 跑绿。Phase 5 的 step4 spec 就是范例（红的输出本身证明 Step 4 未做）。无法先写 spec 的纯重构 / 配置改动可以后置 spec，但同批次必须有。
 - **改动什么 → 跑什么**：
   - 改 `src-backend/data/`（路由 / 模型 / auth / realtime / migration）→ 必跑 `pnpm test:api`，必要时跑 `pnpm test:e2e -g <相关 spec>`
   - 改 `src/data/`（repos / auth source / sync source / http / realtime-ws）→ 必跑 `pnpm test:e2e`（至少跑相关 stage 的 spec）
