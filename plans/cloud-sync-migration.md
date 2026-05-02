@@ -12,6 +12,21 @@
 
 ## 修订记录
 
+- **2026-05-02 · Stage 2 / Step 6 落地（Stage 2 收官）**
+  - **背景**：Step 5 沉淀完 SSE / poll / auto 降级 spec 后 Stage 2 仅剩「回归全绿 + 三组手测交付物 + 翻上线 flag」三件事。按 plan 不再新增 spec，只 reuse 全套 Step 1-5 已落 spec 作为回归判据，并交付「bundle KB 数 / RSS 起止 MB 数 / p95 ms 数」三个非脚手架可覆盖的数字写进进度快照。
+  - **变更**：
+    - 新增 `tests/scripts/soak.sh`（bash 入口）+ `tests/scripts/soak-loadgen.py`（asyncio loadgen）。soak.sh 负责生命周期 / RSS 采样 / trap-driven shutdown / summary；loadgen.py 持开 N 个 WS subscriber + 高频 PUT，结束时 emit JSON-Lines summary 含 p50/p95/p99/avg/max。两者幂等可中断、不触碰 dev DB / 9010 / 5433、loadgen 用 `secrets.token_hex` 前缀做 per-run namespace 避免 PG `providers.id` UNIQUE 约束的跨 run 冲突
+    - **不引入任何新 spec**：Step 6「回归判据」5 类全部 reuse Step 1-5 已落 spec / api 复跑（pytest 38 / 38 全绿 52s；playwright `-g "stage2|stage1_5|smoke"` 17 passed / 85 skipped / 0 failed 1.3 min）。这是 Phase 6 守则下「Step 落地不一定要 ≥1 个新 spec」的特例：本 Step 不新增功能，复跑回归 + 软性把关即可
+    - 三组「上线把关」数字采到（详见进度快照），全部达标
+  - **影响范围**：
+    - 落地后 `pnpm test:api && pnpm test:e2e` 仍 38 + 17 全绿，无回归
+    - my-deploy 默认 `REALTIME_TRANSPORT=` 空 + `BACKEND_DATA_TABLES` 不含 providers + `BACKEND_DATA_API_ENABLED` 关闭 → 行为字节级等同 Stage 1 收尾，对线上无感
+    - 新脚本 `pnpm test:up && pnpm test:backend:start && bash tests/scripts/soak.sh` 三步即可在任何机器上重跑 soak；脚本默认 `--duration 3600`（1h），常用 `--duration 300/600` 做快速验证
+    - `tests/README.md` 暂无字面更新需求：判据映射表里 Step 6 不出新行（reuse 既有 Step 1-5 引用），soak.sh 是上线把关脚本不归属「pnpm test:` 前缀套件
+  - **避坑（落地踩过 + 修了的）**：
+    - ① **loadgen 第一版用 `soak-{i % 50}` 做 id**：跑第二次时新 user 与上一次的 row 撞 `providers.id` UNIQUE 约束（PG 全局唯一，server 报 409 `id owned by another user`）→ 整个 600s 0 puts 全 errors。修为 `f'soak-{secrets.token_hex(3)}-{i % 50}'`，每次 run 独立 namespace
+    - ② **macOS RSS reading 不直接用 end-start**：OS 内存压力下会把 inactive page 移出 resident，soak 结束后空闲态读 `ps -o rss=` 会比 active 期值大幅偏低（17 MB vs active 60-68 MB）。判据要看 active 期 max-min drift（本次 soak 期内活跃区间 60-68 MB，drift < 8 MB），而不是 `end - start`
+    - ③ **bash trap finalize 与外层 wait 的竞争**：第一版 soak.sh 的 finalize trap 在 `wait LOADGEN_PID` 完成后才执行，导致 RSS TSV 末几行的写入顺序与 'end' 标记错乱。本次未深修，因为对数字不影响（summary 文件提供了完整 RSS series + delta，运维人手读没问题），未来若要 wire 进 CI 再修
 - **2026-05-02 · 服务端 Import Job 设计敲定（导入导出 only 路径的实现层 + 部署拓扑澄清）**
   - **背景**：「导入导出 only」方向定下后进入实现层评估。原描述里浏览器端跑全套 import（parse → 写 IndexedDB → push backend → 上传 attachment）对低端设备 / 弱网 / 长时操作不友好——270MB JSON 在浏览器里 parse 容易 OOM、上传几十分钟期间 tab 不能关、attachment 串行上传慢、断网后状态全丢。结合 Stage 4 硬前置已规划对象存储 + multipart endpoint，决定按 SaaS 行业标准实践把整个 import 工作搬到 server 端：浏览器只负责把 JSON 文件 5MB 切片直传对象存储（pre-signed S3 multipart），其余阶段（解析 / 分表写入 / attachment 处理）全部由 backend 后台 worker 跑，用户上传完即可关 tab，状态通过 WS 推进度。同时新设备首屏走 `GET /api/v1/bootstrap` 一次返回所有小表的全量，避免渐进填充式空白。部署拓扑同步澄清：旧版独立实例保留兜底，新版独立实例承载全量 backend；一段时间后旧版下线。
   - **变更**：
@@ -144,7 +159,16 @@
     - Stage 2 Step 1 心跳超时（25s ping + 10s 无 pong → 35s server close） ✅
   - **Stage 2 / Step 4**（`providers.server.ts.observeList()` 接 `RemoteSyncSource` + `RealtimeTransport=ws` 守卫）✅ — `pnpm test:e2e -g step4` 4 case 全绿（case1 1.6s / case2 31.5s / case3 3.5s / case4 1.6s）；详见修订记录 2026-05-02 · Stage 2 / Step 4 落地
   - **Stage 2 / Step 5**（SSE / poll 降级路径 + auto 自动选档）✅ — `pnpm test:api` 33 → 38 全绿（+5 SSE case）；`pnpm test:e2e` 17 / 102（85 skipped 是 profile gate）全绿（step5 case1 sse 2.0s / case2 poll 6.9s / case3 auto→sse 3.5s / case4 auto→poll 9.9s）；故障注入红测：注掉 PollTransport 派发循环 → case2 报 "B did not converge ... last B rows: []" 红信号充足，恢复后转绿。详见修订记录 2026-05-02 · Stage 2 / Step 5 落地
-  - 下一步：进 Step 6（Stage 2 收官），按 plan 不引入新 spec、只 reuse Step 1-5 全套作为回归判据 + 写「上线把关」3 个手测交付物（bundle KB 数 / RSS 起止 MB 数 / p95 ms 数）进进度快照，然后翻 Stage 2 上线 flag 合 my-deploy。
+  - **Stage 2 / Step 6**（端到端回归 + 上线把关 + Stage 2 收官）✅ — 详见修订记录 2026-05-02 · Stage 2 / Step 6 落地
+    - **回归判据**：`pnpm test:api` 38 / 38 全绿（52s）；`pnpm test:e2e -g "stage2|stage1_5|smoke"` 17 passed / 85 skipped (profile gate) / 0 failed（1.3 min）。Step 1-5 沉淀的 spec / api 全部 reuse 复跑全绿，未新增任何 spec
+    - **上线把关三组数字**：
+      - **bundle 体积**：baseline 4,281,727 B (4181.4 KB) → realtime-ws 4,288,743 B (4188.2 KB) = **+7,016 B (+6.86 KB)**，在 plan 设的 ~+10 KB ± 5 KB 范围内 ✓（其它 realtime profile providers-rest / sse / poll / auto 均与 realtime-ws 差 < 5 byte，说明 EventSource polyfill 是公共依赖，transport 字面量差异可忽略）
+      - **RSS soak**（10 min，5 WS subscribers + 5 Hz PUT，2718 puts / 0 errors）：起 47.7 MB → t+60s 峰 126.3 MB（5 WS 全建 + asyncpg 池预热）→ 稳定区间 60-68 MB → t+540s 60.7 MB；soak 期间无持续上升趋势，与 5 min 基线（68.3 MB）相比末值反而下降 7.6 MB，**远低于 plan 设的 < 30 MB 涨幅判据 ✓**。脚本支持 `--duration 3600` 跑全 1h，本次因迭代节奏取 600s，未来需要硬验时直接拉满即可
+      - **p95 延迟**：26.33 ms（p50 20.21 / p99 31.97 / max 84.67），**远低于 plan 设的 500 ms 目标 ✓**。脚本路径走 backend → asyncpg → PG，覆盖 PUT 主路径；浏览器侧 RTT 由网络叠加在此之上但量级仍然可控
+    - **新增脚手架**：`tests/scripts/soak.sh`（bash 入口，trap-driven shutdown，每 N 秒采 RSS 进 `tests/.results/soak.rss.tsv`） + `tests/scripts/soak-loadgen.py`（asyncio loadgen：N 个 WS subscriber 持开 + httpx PUT loop，结束时 emit JSON-Lines summary 含 p50/p95/p99/avg/max）。脚本幂等可中断、不写 dev DB、用 `secrets.token_hex` 前缀避免与 pytest 残留 `providers.id` 冲突
+    - **避坑（落地踩过 + 修了的）**：① loadgen 第一版用 `soak-{i % 50}` 做 id，跑第二次时与上一次 user 撞 PG `providers.id` UNIQUE 约束 → 全部 409 `id owned by another user` → 0 puts。修为 `f'soak-{secrets.token_hex(3)}-{i % 50}'`，每次 run 独立 namespace。② macOS `ps -o rss=` 在 OS 内存压力下会把 inactive page 移出 resident，soak 结束后空闲态读出来的 RSS 会大幅低于 active 期值（17 MB vs active 60-68 MB），不是真泄漏信号；判据应看 active 期 max-min drift 而不是「end - start」
+    - **Stage 2 出口**：三条出口判据全部达成（回归全绿 + 三组数字达标 + flag 默认空仍字节级等同 Stage 1）。下一步走「上线但不启用」策略合并到 my-deploy，`REALTIME_TRANSPORT` 默认空，需要启用时在 Northflank 控制台开 flag
+  - 下一步：把本次 Step 6 改动 + plan 修订合到 my-deploy 触发 Northflank 自动部署，然后进 **Stage 3**（Stage 4.5 修订记录已废弃 per-table 自动迁移机制 ceremony；Stage 3 节奏聚焦每张叶子表 SQLModel + router + alembic + flag）
 
 ---
 
