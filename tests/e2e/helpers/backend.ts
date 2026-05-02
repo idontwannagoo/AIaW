@@ -124,3 +124,82 @@ export async function deleteReactive(
     `/api/v1/reactives/${encodeURIComponent(key)}`
   )
 }
+
+// Stage 3 / 批次-3b — assistants endpoint (id-PK, mirrors providers).
+export interface AssistantRow {
+  id: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: Record<string, unknown> | null
+}
+
+export async function putAssistant(
+  token: string,
+  id: string,
+  data: Record<string, unknown>
+): Promise<AssistantRow> {
+  return backendClient(token).put(`/api/v1/assistants/${id}`, data)
+}
+
+export async function deleteAssistant(
+  token: string,
+  id: string
+): Promise<AssistantRow> {
+  return backendClient(token).del(`/api/v1/assistants/${id}`)
+}
+
+// Stage 3 / 批次-3b — installed_plugins endpoint (KV-shaped, mirrors reactives
+// envelope but `data` carries the full plugin row not a value blob).
+export interface InstalledPluginRow {
+  key: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: Record<string, unknown> | null
+}
+
+export async function putInstalledPlugin(
+  token: string,
+  key: string,
+  data: Record<string, unknown>
+): Promise<InstalledPluginRow> {
+  return backendClient(token).put(
+    `/api/v1/installed-plugins/${encodeURIComponent(key)}`,
+    data
+  )
+}
+
+export async function deleteInstalledPlugin(
+  token: string,
+  key: string
+): Promise<InstalledPluginRow> {
+  return backendClient(token).del(
+    `/api/v1/installed-plugins/${encodeURIComponent(key)}`
+  )
+}
+
+// Stage 3 / 批次-3b — avatar_images endpoint (id-PK; client serializes
+// ArrayBuffer → base64 before PUT, server is opaque JSON).
+export interface AvatarImageRow {
+  id: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: { id: string; contentBuffer: string; mimeType: string } | null
+}
+
+export async function putAvatarImage(
+  token: string,
+  id: string,
+  data: { id: string; contentBuffer: string; mimeType: string }
+): Promise<AvatarImageRow> {
+  return backendClient(token).put(`/api/v1/avatar-images/${id}`, data)
+}
+
+export async function deleteAvatarImage(
+  token: string,
+  id: string
+): Promise<AvatarImageRow> {
+  return backendClient(token).del(`/api/v1/avatar-images/${id}`)
+}

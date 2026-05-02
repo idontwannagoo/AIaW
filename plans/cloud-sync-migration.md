@@ -89,25 +89,25 @@
 - **Stage 2** ✅ 实时通道：后端 broker + WS `/api/v1/stream`；前端 `RemoteSyncSource` + WS / SSE / poll / auto 四档 transport 降级；`providers` 表整张接通 realtime 跨 tab
 - **Stage 2.5** ✅ 摘 `dexie-cloud-addon` + 删双登录 UI + 删 `linked_dexie_email` 字段链 + 后端 alembic migration drop 列（`c4f1e2d3a8b0`）
 - **Stage 3 / 批次-3a** ✅ `reactives` KV 表迁到 backend：复合主键 `(user_id, key)` + envelope `{key, version, updated_at, deleted, data}` + alembic migration `d6a3f8c91e22` + WS / SSE 加 reactives 白名单 + 前端 `reactives.server.ts` 路由 + `BACKEND_DATA_TABLES=providers,reactives`。`persistent-reactive.ts` 透明走 server，跨 tab 实时同步可用
-- **测试脚手架** ✅ pytest（`tests/api/`，45 case 全绿 ~64s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，28 passed / 116 skipped 2.1 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
+- **Stage 3 / 批次-3b** ✅ `assistants` (id-PK) + `installedPlugins` (KV-PK like reactives, 但 `data` 是整行) + `avatarImages` (id-PK + ArrayBuffer↔base64 wire) 三张叶子表迁到 backend：alembic migration `e4b2c5f9d017` + 3 个 router + WS / SSE 加 3 张表白名单 + 3 个 `<table>.server.ts` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages`
+- **测试脚手架** ✅ pytest（`tests/api/`，69 case 全绿 ~64s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，57 passed / 194 skipped 4.5 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
 
 ### 部署状态
 
 - **服务 1（指向 `my-deploy`）**：HEAD `2b26349`（Stage 0 baseline + Dexie 路径 bug fix）。env 不开任何 backend flag。承载老用户。Stage 5 落地后由 active 用户迁移率 ≥ 80% 触发 6 周下线窗
 - **服务 2（指向 `new-deploy`）**：公网域名 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run`，独立 Postgres
-  - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers,reactives` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
+  - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
   - 后端 Northflank 控制台 env：`BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=true`
   - Dockerfile 第二阶段含 `alembic upgrade head` 启动钩子
-  - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/auth/register` 422
-  - **当前能用 / 不能用**：providers + reactives 跨设备同步可用（reactives 跨 tab 由 persistent-reactive 透传到 user-data / user-perfs / plugins store）；其他 8 张表仍只在本地 IndexedDB；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
+  - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/auth/register` 422
+  - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages 跨设备同步可用（reactives 跨 tab 由 persistent-reactive 透传到 user-data / user-perfs / plugins store）；其他 5 张表（workspaces / dialogs / messages / artifacts / items）仍只在本地 IndexedDB；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
 
-### 下一步：开 Stage 3 / 批次-3b (`assistants` + `installedPluginsV2` + `avatarImages`)
+### 下一步：开 Stage 4 硬前置 1（大行 WS 协议改造）+ 硬前置 2（对象存储 BlobStore + `/api/v1/blobs`）
 
-3 张叶子表合一批：schema 都是 `id` 主键 + 没级联 + 没大行 + 决策点小，可共享 `providers.server.ts` 模板。`avatarImages` 含小 blob，单条 ≥ 64KB 走 base64 内联即可（Stage 4 硬前置 2 才引入对象存储分流）。每个批次必须包含的产物 / 测试 / 翻 flag / 跑红 → 绿守则同 批次-3a，详见 Stage 3 段「每个批次必须包含」。
+Stage 3 全部完成。Stage 4 主体（`workspaces` / `dialogs` / `items` / `artifacts` / `messages`）落地前必须先做完两件硬前置：① WS event payload 改 `{table, op, id, rev}` only（不带完整 row，避免 broker 队列爆）；② 对象存储分流（≥ 64KB 走 multipart `/api/v1/blobs` + `{type:'ref', url, sha256, size}`，避免 PG TEXT 列线性膨胀）。详见 Stage 4 段「硬前置」。
 
 ### 未启动（按依赖顺序）
 
-- **Stage 3** 批次-3b `assistants` / `installedPluginsV2` / `avatarImages` ⏳
 - **Stage 4 硬前置** 1（大行 WS 协议改造） ⏳ + 硬前置 2（对象存储 BlobStore + `/api/v1/blobs`） ⏳
 - **Stage 4 主体** 批次-4a `workspaces` → 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages` ⏳
 - **Stage 4.5** 服务端 Import Job + bootstrap ⏳ ← **可让老用户用的物理分水岭**
@@ -645,7 +645,14 @@ interface AuthSource {
   - spec: `tests/e2e/stage3/reactives-realtime.spec.ts::case1 / case2 / case3 / case4`（4 case） + `tests/e2e/stage3/reactives-cache-roundtrip.spec.ts::case1 / case2`（2 case） + `tests/e2e/stage3/persistent-reactive-passthrough.spec.ts`（1 case）
   - 测试输出：`pnpm test:api` 45 passed ~64s（37 → 45）；`pnpm test:e2e` 28 passed / 116 skipped ~2.1 min（17 → 28）
   - 红测验证：① api 层临时把 `_to_row` 的 `data` 写死 `None`，5/8 case 红，stdout 准确报 `assert None == {...}`，恢复后绿 ② e2e 第一次跑时发现 stream.py / sse.py `TABLE_MODELS` 仅白名单 `providers`，realtime case 全红 → 加 reactives whitelist + serializer 后绿（spec 真信号准确）
-- 批次-3b (`assistants` / `installedPluginsV2` / `avatarImages`)：⏳ 未开
+- 批次-3b (`assistants` / `installedPluginsV2` / `avatarImages`)：✅ 落地
+  - 后端：`models/{assistant,avatar_image,installed_plugin}.py` + `routers/{assistants,avatar_images,installed_plugins}.py` + alembic migration `e4b2c5f9d017` + WS / SSE 加 3 张表白名单与 serializer + `app.py::_enable_backend_data_api` 挂载 3 个 router
+  - 前端：`assistants.server.ts` (id-PK，复用 providers 模板) + `installed-plugins.server.ts` (KV-PK 但 `data` 是整行——区别于 reactives 的 value-blob unwrap) + `avatar-images.server.ts` (id-PK + ArrayBuffer↔base64 wire 边界编解码) + `repositories/index.ts` flag 路由扩展 + `SERVER_CAPABLE_TABLES` 加 3 张表（前端用 camelCase 名 `assistants` / `installedPlugins` / `avatarImages` 与 `repos.*` 属性同名；后端 endpoint 是 snake_case `installed-plugins` / `avatar-images`，转换在 server.ts 内）
+  - env：`.env.docker` `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages`；`tests/env/.env.test.{providers-rest,realtime-{ws,sse,poll,auto}}` 同步
+  - api: `tests/api/test_assistants.py` (8 case) + `tests/api/test_avatar_images.py` (8 case) + `tests/api/test_installed_plugins.py` (8 case)，全绿
+  - spec: `tests/e2e/stage3/{assistants,installed-plugins,avatar-images}-realtime.spec.ts` (各 4 case) + `tests/e2e/stage3/{assistants,installed-plugins,avatar-images}-cache-roundtrip.spec.ts` (各 2 case)，profile 切片后约 30 个 batch-3b 实测 case，全绿
+  - 测试输出：`pnpm test:api` 69 passed ~64s（45 → 69，+24）；`pnpm test:e2e` 57 passed / 194 skipped ~4.5 min（28 → 57）
+  - 红测验证：① api 层临时把 assistants `_to_row` 的 `data` 写死 `None`，3/8 case 红，stdout 准确报 `TypeError`，恢复后绿 ② installedPluginsV2 server.ts 因 InstalledPlugin 类型经 MCP SDK 引入 JSONSchema7 → KeyPath 递归类型爆，TS2615 卡 build；改用 per-row puts 替代 `db.transaction()` 包装，typecheck 过 ③ cache-roundtrip 一开始用预测固定 id（`cache-asst-1` 等），realtime-ws → realtime-auto profile 间复用同一 backend 触发 409 owned-by-another-user；改 `id + Math.random()` 后绿 ④ 涉及 ArrayBuffer 的 avatarImages-realtime 一开始用 `eval()` 把 factory 字符串注入 page 上下文，eslint 拦截；改成 `pagePutAvatar()` 函数把 buffer 创建移到 `page.evaluate` 闭包内，绿
 
 ---
 

@@ -86,7 +86,8 @@ def db_reset() -> Iterator[None]:
     with psycopg.connect(PG_DSN, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                'TRUNCATE TABLE refresh_tokens, users, providers, reactives '
+                'TRUNCATE TABLE refresh_tokens, users, providers, reactives, '
+                'assistants, avatar_images, installed_plugins '
                 'RESTART IDENTITY CASCADE'
             )
             cur.execute('ALTER SEQUENCE global_change_seq RESTART WITH 1')

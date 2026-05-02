@@ -8,9 +8,20 @@ import type {
 import { createDexieRepository } from './dexie'
 import { serverProvidersRepository } from './providers.server'
 import { serverReactivesRepository } from './reactives.server'
+import { serverAssistantsRepository } from './assistants.server'
+import { serverInstalledPluginsRepository } from './installed-plugins.server'
+import { serverAvatarImagesRepository } from './avatar-images.server'
 import type { Repository } from '../types'
 
-const SERVER_CAPABLE_TABLES = new Set(['providers', 'reactives'])
+const SERVER_CAPABLE_TABLES = new Set([
+  'providers',
+  'reactives',
+  'assistants',
+  // Frontend names match Dexie table names; backend maps these to its own
+  // snake_case tables (`installed_plugins` / `avatar_images`).
+  'installedPlugins',
+  'avatarImages'
+])
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const t = <T, K extends string = string>(getter: () => any): (() => Table<T, K>) => () => getter() as Table<T, K>
@@ -21,16 +32,19 @@ function routeToServer(table: string): boolean {
 
 const dexieProviders = createDexieRepository<CustomProvider, string>(t(() => db.providers)) as Repository<CustomProvider, string>
 const dexieReactives = createDexieRepository<StoredReactive, string>(t(() => db.reactives)) as Repository<StoredReactive, string>
+const dexieAssistants = createDexieRepository<Assistant, string>(t(() => db.assistants)) as Repository<Assistant, string>
+const dexieInstalledPlugins = createDexieRepository<InstalledPlugin, string>(t(() => db.installedPluginsV2)) as Repository<InstalledPlugin, string>
+const dexieAvatarImages = createDexieRepository<AvatarImage, string>(t(() => db.avatarImages)) as Repository<AvatarImage, string>
 
 export const repos = {
   workspaces: createDexieRepository<Workspace | Folder, string>(t(() => db.workspaces)) as Repository<Workspace | Folder, string>,
   dialogs: createDexieRepository<Dialog, string>(t(() => db.dialogs)) as Repository<Dialog, string>,
   messages: createDexieRepository<Message, string>(t(() => db.messages)) as Repository<Message, string>,
-  assistants: createDexieRepository<Assistant, string>(t(() => db.assistants)) as Repository<Assistant, string>,
+  assistants: routeToServer('assistants') ? serverAssistantsRepository : dexieAssistants,
   artifacts: createDexieRepository<Artifact, string>(t(() => db.artifacts)) as Repository<Artifact, string>,
-  installedPlugins: createDexieRepository<InstalledPlugin, string>(t(() => db.installedPluginsV2)) as Repository<InstalledPlugin, string>,
+  installedPlugins: routeToServer('installedPlugins') ? serverInstalledPluginsRepository : dexieInstalledPlugins,
   reactives: routeToServer('reactives') ? serverReactivesRepository : dexieReactives,
-  avatarImages: createDexieRepository<AvatarImage, string>(t(() => db.avatarImages)) as Repository<AvatarImage, string>,
+  avatarImages: routeToServer('avatarImages') ? serverAvatarImagesRepository : dexieAvatarImages,
   items: createDexieRepository<StoredItem, string>(t(() => db.items)) as Repository<StoredItem, string>,
   providers: routeToServer('providers') ? serverProvidersRepository : dexieProviders
 }

@@ -38,6 +38,9 @@ from realtime import Subscription, broker
 
 from ..auth import _decode_access
 from ..db import SessionLocal
+from ..models.assistant import Assistant
+from ..models.avatar_image import AvatarImage
+from ..models.installed_plugin import InstalledPlugin
 from ..models.provider import Provider
 from ..models.reactive import Reactive
 from ..models.user import User
@@ -48,7 +51,13 @@ router = APIRouter(tags=['stream'])
 
 # Mirrors stream.py — kept separate so the WS module is the source of truth
 # for the WS subprotocol path and SSE only depends on the public broker API.
-TABLE_MODELS = {'providers': Provider, 'reactives': Reactive}
+TABLE_MODELS = {
+    'providers': Provider,
+    'reactives': Reactive,
+    'assistants': Assistant,
+    'avatar_images': AvatarImage,
+    'installed_plugins': InstalledPlugin,
+}
 
 # SSE keepalives are comments; clients (including event-source-polyfill)
 # treat them as heartbeats. Send slightly under typical proxy idle timeouts.
@@ -91,7 +100,67 @@ def _serialize_reactive(r: Reactive) -> dict[str, Any]:
     }
 
 
-SERIALIZERS = {'providers': _serialize_provider, 'reactives': _serialize_reactive}
+def _serialize_assistant(a: Assistant) -> dict[str, Any]:
+    deleted = a.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'assistants',
+        'op': 'delete' if deleted else 'put',
+        'id': a.id,
+        'rev': a.version,
+        'row': None if deleted else {
+            'id': a.id,
+            'version': a.version,
+            'updated_at': a.updated_at.isoformat(),
+            'deleted': False,
+            'data': a.data,
+        },
+    }
+
+
+def _serialize_avatar_image(a: AvatarImage) -> dict[str, Any]:
+    deleted = a.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'avatar_images',
+        'op': 'delete' if deleted else 'put',
+        'id': a.id,
+        'rev': a.version,
+        'row': None if deleted else {
+            'id': a.id,
+            'version': a.version,
+            'updated_at': a.updated_at.isoformat(),
+            'deleted': False,
+            'data': a.data,
+        },
+    }
+
+
+def _serialize_installed_plugin(p: InstalledPlugin) -> dict[str, Any]:
+    deleted = p.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'installed_plugins',
+        'op': 'delete' if deleted else 'put',
+        'id': p.key,
+        'rev': p.version,
+        'row': None if deleted else {
+            'key': p.key,
+            'version': p.version,
+            'updated_at': p.updated_at.isoformat(),
+            'deleted': False,
+            'data': p.data,
+        },
+    }
+
+
+SERIALIZERS = {
+    'providers': _serialize_provider,
+    'reactives': _serialize_reactive,
+    'assistants': _serialize_assistant,
+    'avatar_images': _serialize_avatar_image,
+    'installed_plugins': _serialize_installed_plugin,
+}
 
 
 def _format_sse(*, event: str, data: dict[str, Any], event_id: Optional[int] = None) -> bytes:
