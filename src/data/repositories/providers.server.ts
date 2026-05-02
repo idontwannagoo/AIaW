@@ -84,11 +84,8 @@ function shallowMerge<T>(base: T, changes: Partial<T> | Record<string, unknown>)
 }
 
 export const serverProvidersRepository: Repository<CustomProvider, string> = (() => {
-  // dexie-cloud-addon widens db.providers to DexieCloudTable; the cache
-  // helper only needs the plain Table surface, so cast to drop the addon
-  // fields. Mirrors the pattern used in repositories/index.ts.
   const cache = createDexieRepository<CustomProvider, string>(
-    () => db.providers as unknown as Table<CustomProvider, string>
+    () => db.providers as Table<CustomProvider, string>
   )
 
   async function putOne(value: CustomProvider): Promise<string> {

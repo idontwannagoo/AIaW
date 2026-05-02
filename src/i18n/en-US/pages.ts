@@ -36,12 +36,7 @@ export default {
     syncServiceType: 'Cloud Sync Service',
     apiBudgetType: 'Model Quota (CNY)',
     apiBudgetUsdType: 'Model Quota (USD)',
-    amount: 'Amount',
-    dexieLegacyHeader: 'Legacy Dexie Cloud Account',
-    dexieLegacyDescription: 'During the cloud-sync migration, tables not yet moved to the self-hosted backend continue to sync via Dexie Cloud. Sign in here to access/import data from the legacy account.',
-    dexieLegacyEmailLabel: 'Email',
-    dexieLegacyLoginButton: 'Sign in to Dexie account',
-    dexieLegacyLogoutButton: 'Sign out of Dexie account'
+    amount: 'Amount'
   },
   modelPricing: {
     modelPrice: 'Model Price',

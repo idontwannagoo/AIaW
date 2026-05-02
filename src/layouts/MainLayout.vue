@@ -86,7 +86,7 @@
           items-center
         >
           <account-btn
-            v-if="DexieDBURL"
+            v-if="BackendAuth"
             flat
             no-caps
           />
@@ -166,7 +166,7 @@ import { useRoute } from 'vue-router'
 import AccountBtn from 'src/components/AccountBtn.vue'
 import DarkSwitchBtn from 'src/components/DarkSwitchBtn.vue'
 import MenuItem from 'src/components/MenuItem.vue'
-import { DexieDBURL } from 'src/utils/config'
+import { BackendAuth } from 'src/utils/config'
 import { useQuasar } from 'quasar'
 import version from 'src/version.json'
 import { useI18n } from 'vue-i18n'

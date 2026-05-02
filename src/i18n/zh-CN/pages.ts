@@ -36,12 +36,7 @@ export default {
     syncServiceType: '云同步服务',
     apiBudgetType: '模型额度',
     apiBudgetUsdType: '模型额度(USD)',
-    amount: '数量',
-    dexieLegacyHeader: '原 Dexie Cloud 账号',
-    dexieLegacyDescription: '云同步迁移期间，未迁移到自托管后端的表仍由 Dexie Cloud 提供同步。如需访问/导入原账号下的数据，请在此登录。',
-    dexieLegacyEmailLabel: '电子邮箱',
-    dexieLegacyLoginButton: '登录原 Dexie 账号',
-    dexieLegacyLogoutButton: '退出原 Dexie 账号'
+    amount: '数量'
   },
   modelPricing: {
     modelPrice: '模型价格',

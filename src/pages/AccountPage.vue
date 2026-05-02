@@ -240,58 +240,6 @@
           </q-item-section>
         </q-item>
       </q-list>
-      <q-list
-        pb-2
-        v-if="BackendAuth && dexieAuthSource.enabled"
-        max-w="1000px"
-        mx-a
-      >
-        <q-separator spaced />
-        <q-item-label header>
-          {{ $t('accountPage.dexieLegacyHeader') }}
-        </q-item-label>
-        <q-item>
-          <q-item-section>
-            <q-item-label caption>
-              {{ $t('accountPage.dexieLegacyDescription') }}
-            </q-item-label>
-          </q-item-section>
-        </q-item>
-        <q-item v-if="dexieUser?.isLoggedIn">
-          <q-item-section>
-            {{ $t('accountPage.dexieLegacyEmailLabel') }}
-          </q-item-section>
-          <q-item-section side>
-            {{ dexieUser.email }}
-          </q-item-section>
-        </q-item>
-        <q-item
-          v-if="dexieUser?.isLoggedIn"
-          clickable
-          v-ripple
-          @click="dexieLogout"
-        >
-          <q-item-section avatar>
-            <q-icon name="sym_o_logout" />
-          </q-item-section>
-          <q-item-section>
-            {{ $t('accountPage.dexieLegacyLogoutButton') }}
-          </q-item-section>
-        </q-item>
-        <q-item
-          v-else
-          clickable
-          v-ripple
-          @click="dexieLogin"
-        >
-          <q-item-section avatar>
-            <q-icon name="sym_o_login" />
-          </q-item-section>
-          <q-item-section>
-            {{ $t('accountPage.dexieLegacyLoginButton') }}
-          </q-item-section>
-        </q-item>
-      </q-list>
     </q-page>
   </q-page-container>
 </template>
@@ -299,10 +247,10 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useUiStateStore } from 'src/stores/ui-state'
-import { authSource, dexieAuthSource } from 'src/data'
+import { authSource } from 'src/data'
 import { useQuasar } from 'quasar'
 import SubscribeDialog from 'src/components/SubscribeDialog.vue'
-import { BackendAuth, BudgetBaseURL, LitellmBaseURL, SyncServicePrice, SyncServicePriceUSD } from 'src/utils/config'
+import { BudgetBaseURL, LitellmBaseURL, SyncServicePrice, SyncServicePriceUSD } from 'src/utils/config'
 import TopupDialog from 'src/components/TopupDialog.vue'
 import { useRouter } from 'vue-router'
 import PayDialog from 'src/components/PayDialog.vue'
@@ -367,22 +315,7 @@ function topupDialog() {
 
 async function logout() {
   await authSource.logout()
-  // Dexie session lives in IndexedDB and isn't bound to the backend account.
-  // Without this cascade, switching backend accounts on the same browser
-  // leaks the previous Dexie session into the next user — they see X's email
-  // in the legacy entry and cloud sync still runs as X.
-  if (BackendAuth && dexieAuthSource.enabled && dexieUser.value?.isLoggedIn) {
-    try { await dexieAuthSource.logout() } catch { /* best effort */ }
-  }
   router.replace('/')
-}
-
-const dexieUser = dexieAuthSource.user
-async function dexieLogin() {
-  await dexieAuthSource.login()
-}
-async function dexieLogout() {
-  await dexieAuthSource.logout()
 }
 
 const llmBalance = ref(null)

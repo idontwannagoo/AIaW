@@ -1,5 +1,5 @@
 import { useQuasar } from 'quasar'
-import { DexieDBURL, LitellmBaseURL } from 'src/utils/config'
+import { BackendAuth, LitellmBaseURL } from 'src/utils/config'
 import { authSource } from 'src/data'
 import { localData } from 'src/utils/local-data'
 import { dialogOptions } from 'src/utils/values'
@@ -18,7 +18,7 @@ export function useFirstVisit() {
       return
     }
     if (!localData.visited) {
-      const serviceAvailable = DexieDBURL && LitellmBaseURL
+      const serviceAvailable = BackendAuth && LitellmBaseURL
       const message = serviceAvailable
         ? t('firstVisit.messageWithLogin')
         : t('firstVisit.messageWithoutLogin')

@@ -7,8 +7,9 @@ import type {
 } from 'src/utils/types'
 import { createDexieRepository } from './dexie'
 import { serverProvidersRepository } from './providers.server'
-import { SERVER_CAPABLE_TABLES } from '../server-tables'
 import type { Repository } from '../types'
+
+const SERVER_CAPABLE_TABLES = new Set(['providers'])
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const t = <T, K extends string = string>(getter: () => any): (() => Table<T, K>) => () => getter() as Table<T, K>
