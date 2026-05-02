@@ -238,37 +238,3 @@ async def test_a_token_cannot_read_b_data(
     assert r_a.json()['id'] == user_a['id']
     assert r_b.json()['id'] == user_b['id']
     assert r_a.json()['id'] != r_b.json()['id']
-
-
-# ---- 7. link-dexie first-write-wins -----------------------------------------
-
-
-async def test_link_dexie_first_write_wins(
-    register_user, anon_client: httpx.AsyncClient,
-) -> None:
-    u = await register_user()
-    headers = {'Authorization': f'Bearer {u["access_token"]}'}
-
-    r = await anon_client.post(
-        '/api/v1/auth/link-dexie',
-        headers=headers,
-        json={'dexie_email': 'first@example.com'},
-    )
-    assert r.status_code == 200
-    assert r.json()['linked_dexie_email'] == 'first@example.com'
-
-    # Re-linking the same email is idempotent.
-    r = await anon_client.post(
-        '/api/v1/auth/link-dexie',
-        headers=headers,
-        json={'dexie_email': 'first@example.com'},
-    )
-    assert r.status_code == 200
-
-    # Linking a different email returns 409.
-    r = await anon_client.post(
-        '/api/v1/auth/link-dexie',
-        headers=headers,
-        json={'dexie_email': 'second@example.com'},
-    )
-    assert r.status_code == 409

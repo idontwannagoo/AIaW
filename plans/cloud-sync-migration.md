@@ -12,6 +12,32 @@
 
 ## 修订记录
 
+- **2026-05-02 · Stage 2.5 落地：摘双登录 UI + dexie-cloud-addon + Stage 5 deprecated 清理整体前置**
+  - **背景**：2026-05-02 部署分支拓扑硬切完成、new-deploy 第 1+2+3 档 flag 全开后，复盘发现 plan 与代码两条线不再一致：plan 文档已经把「导入导出 only」+「新版默认不挂 dexie-cloud-addon」+「Stage 5 才清 ~150 行 deprecated 代码」写得很清楚（2026-05-02 转向修订记录），但 new-deploy 上线时仍然按旧 Stage 1.5「双写窗口」设计走 —— `.env.docker` 里 `DEXIE_DB_URL=https://znm3rqzc8.dexie.cloud` 把 new-deploy 接到原 Dexie SaaS、AccountPage 仍展示「登录原 Dexie 账号」入口、login-dialogs.ts 仍并行绑定双 source、`linked_dexie_email` 列 + `link-dexie` endpoint + 首次登录调用钩子全部仍在。这些遗留对「新版空库 + 用户主动 export → import」的方向纯属误导：用户在新版登原 Dexie 账号根本读不到任何后端表，dexie-cloud-addon 还在挂载意味着新用户首屏多一份对外 SaaS 依赖。同时把 ~150 行清理推迟到 Stage 5 也无技术必要 —— Stage 2 已收官、in-flight 风险消失，可以现在就清。
+    - 第一次降险动作（env 改空）暴露了第二个问题：`MainLayout.vue` 的登录按钮 gate 是 `v-if="DexieDBURL"`，env 留空后登录按钮整个消失。说明双登录设计在路由 / layout / composables 多个层面都假设 `DexieDBURL` 是「是否启用账号系统」的代理变量，方向转向后必须把 gate 全部换成 `BackendAuth`。
+  - **变更**：
+    - **代码侧（commit `748f0a0` 前端 + 后端清理 commit）**：
+      - 删 `src/data/auth.dexie.ts`（dexieAuthSource 整个模块）+ `src/data/server-tables.ts`（unsyncedTables 计算所需，addon 摘后无意义）
+      - 删 `src/utils/db.ts` 的 `dexieCloud` addon 挂载、`db.cloud.configure(...)`、`unsyncedTables` 计算；`DexieCloudTable<T,'id'>` → `Dexie.Table<T,string>`
+      - 删 `src/utils/config.ts` 的 `DexieDBURL` 导出（不再被任何代码读）
+      - 删 `src/data/auth.ts` 的 `BACKEND_AUTH` 分支：`authSource = backendAuthSource`（baseline 测试 `BACKEND_DATA_API_URL` 空时 `backendAuthSource.enabled=false`，与原 `dexieAuthSource enabled=false` 行为一致）
+      - 删 `src/data/index.ts` 的 `dexieAuthSource` 重导出 + `src/composables/login-dialogs.ts` 的双绑分支 + `src/boot/expose-debug.ts` 的 `__dexieAuthSource__` window 暴露
+      - 删 `src/pages/AccountPage.vue` 的"原 Dexie 账号"区块 + `dexieLogin/dexieLogout` + 主登出时的级联 `dexieAuthSource.logout()` + `linkedDexieEmail` 显示行；删 `src/i18n/{zh-CN,zh-TW,en-US}/pages.ts` 的 `dexieLegacy*` 文案
+      - `src/layouts/MainLayout.vue`: `<account-btn v-if="DexieDBURL" />` → `v-if="BackendAuth"`；`src/router/routes.ts` `/account` gate `(DexieDBURL || BackendAuth)` → `BackendAuth`、`/model-pricing` gate `(DexieDBURL && LitellmBaseURL)` → `(BackendAuth && LitellmBaseURL)`；`src/composables/first-visit.ts` `serviceAvailable` 同步换 `BackendAuth` gate
+      - `package.json` + `pnpm-lock.yaml` 卸 `dexie-cloud-addon`
+      - 后端：写 alembic migration `c4f1e2d3a8b0_drop_linked_dexie_email`（drop 列 + UNIQUE 约束，downgrade-safe）；删 `src-backend/data/models/user.py` 的 `linked_dexie_email` 字段；删 `src-backend/data/routers/auth.py` 的 `LinkDexieIn` / `link_dexie` endpoint / `UserOut.linked_dexie_email` 字段 / `_to_user_out` 同字段；删 `tests/api/test_auth.py::test_link_dexie_first_write_wins`
+      - 前端：删 `src/data/auth.backend.ts` `BackendUser.linked_dexie_email` + `toCloudUser` 里的 `linkedDexieEmail` data 转换；删 `src/components/BackendLoginDialog.vue` 同字段
+    - **env 侧（commit `7abaa87`，先于代码 push）**：`.env.docker` 把 `DEXIE_DB_URL=https://znm3rqzc8.dexie.cloud` 改空，加注释说明 new-deploy 自始至终不连原 Dexie SaaS；同步把 .env.docker 里"第 1 档：双登录入口"措辞改成"自家 JWT 鉴权"
+    - **plan 侧（本条 + Stage 5 段重写）**：Stage 5「主体清理 / deprecated 代码一次性清理」段标"已在 Stage 2.5 完成"，正文收窄到「全新设备登录 + 卸载重装 + 旧版导出 → 新版导入往返字节一致 + 对象存储桥接」四条验证；Stage 1.5 段顶部 deprecated 列表标"已在 Stage 2.5 清理完成"
+  - **影响范围**：
+    - 测试：`pnpm test:api` 38 → 37（删 `test_link_dexie_first_write_wins`），全绿 52s；`pnpm test:e2e` 17 passed / 85 skipped (profile gate) / 0 failed 1.3 min，与 Stage 2 收官基线一致
+    - bundle：dexie-cloud-addon 在 baseline / new-deploy 两套 build 都被 tree-shake 掉（之前一直挂着），净影响主要是删除前端 ~250 行代码 + 后端 ~30 行 endpoint + 1 个新 migration
+    - my-deploy：本次 Stage 2.5 改动**只合 new-deploy**，my-deploy 仍停在 `2b26349` 老 baseline 不动，老用户路径完全不受影响
+    - 用户体验：new-deploy 上 AccountPage 现在只有一个登录入口（自家 JWT），登录按钮在 BackendAuth=true 时常亮；不再向原 Dexie SaaS 发任何请求
+  - **避坑（这次踩过 + 修了的）**：
+    - ① **方向已转 / 但代码 + env 仍按旧设计上线**：plan 修订记录里把 deprecated 项整理得清晰，但「等 Stage 5 一起清」给了一个"以后再说"的借口；当 Stage 2 收官 + new-deploy 上线时，deprecated 项已经误导用户。教训：方向转向时如果新路径 / 旧代码并存只会带来认知摩擦（在线上 UI 看到「登录原 Dexie 账号」是真实困惑源），且 Stage 5 距 Stage 2.5 之间还要走 Stage 3 / 4 / 4.5 一堆工作，过渡期几个月里这套残留会被反复读到。规则：方向转向修订记录里标 deprecated 的项，**下一个最近的 PR / 部署窗口**就清掉，不要拖到「最终 Stage」
+    - ② **`.env.docker` 改 `DEXIE_DB_URL=` 空之后登录按钮消失**：登录按钮的 gate 之前是 `v-if="DexieDBURL"`，env 改空就 false。env 改动是为了"解除 Dexie SaaS 依赖"，但同时意外把"账号系统是否启用"也关掉了，因为这两件事在旧代码里共用 `DexieDBURL` 当代理变量。教训：变量在旧设计里承担多个语义角色时，删它必须同时把所有语义点改成新代理；本次把 `DexieDBURL` 全替换为 `BackendAuth`（路由 / layout / first-visit）一并提交，恢复登录按钮可见
+    - ③ **alembic migration 文件命名风格沿用项目惯例**：用 12 hex char rev id（`c4f1e2d3a8b0`）+ snake_case 描述后缀，down_revision 指向 `72ae82a9bb6d`（前一个 migration）。downgrade 用 `op.batch_alter_table` 是因为 SQLite 不支持 inline drop column，PG 上等价 ALTER TABLE
 - **2026-05-02 · 部署分支拓扑硬切：my-deploy reset + new-deploy 单独承载 stage 1+**
   - **背景**：Stage 2 收官后 feature/change-cloud-sync-claude（Stage 0 / 1 / 1.5 / 2 + 测试脚手架 + plan 共 23 commit）fast-forward merge 到 my-deploy 并 push，触发了一次 Northflank 部署。事后复盘发现 my-deploy 是「老用户兜底实例」分支 —— 按本 plan 2026-05-02 修订记录定下的「导入导出 only」迁移路径，my-deploy 本不应承载任何 backend 重构代码：flag 默认全关时 Stage 1 / 1.5 / 2 的 ~7 KB 前端 bundle 增量 + 几十 KB 后端 Python data 路由对老用户是纯 dead weight，违背 plan 同条修订记录 line 43 / 767 的「新版独立实例承载全量 stage 1+ 功能」拓扑设计。错位的根因是 plan 把部署拓扑只埋在修订记录里、没固化进 CLAUDE.md，操作时被「my-deploy 是当前唯一线上分支」的事实带跑偏。
   - **变更**：
@@ -186,6 +212,7 @@
     - **避坑（落地踩过 + 修了的）**：① loadgen 第一版用 `soak-{i % 50}` 做 id，跑第二次时与上一次 user 撞 PG `providers.id` UNIQUE 约束 → 全部 409 `id owned by another user` → 0 puts。修为 `f'soak-{secrets.token_hex(3)}-{i % 50}'`，每次 run 独立 namespace。② macOS `ps -o rss=` 在 OS 内存压力下会把 inactive page 移出 resident，soak 结束后空闲态读出来的 RSS 会大幅低于 active 期值（17 MB vs active 60-68 MB），不是真泄漏信号；判据应看 active 期 max-min drift 而不是「end - start」
     - **Stage 2 出口**：三条出口判据全部达成（回归全绿 + 三组数字达标 + flag 默认空仍字节级等同 Stage 1）
   - **部署分支拓扑硬切（B 方案 reset）**✅ — 详见修订记录 2026-05-02 · 部署分支拓扑硬切。my-deploy 退到 `2b26349` 干净 baseline（仅 Stage 0 抽象层 + Dexie 路径 bug fix）；`new-deploy` 拉自 `5c689ab` 承载 Stage 1+ 全套；`backup/my-deploy-pre-reset` 远端永久保留作为逃生通道。CLAUDE.md 新增「部署分支拓扑」段固化分支角色 / 工作流契约 / Northflank 约束 / 老用户迁移路径 / reset SOP，所有未来工作以此为准
+  - **Stage 2.5 摘双登录 UI + dexie-cloud-addon 前置清理** ✅ — 详见修订记录 2026-05-02 · Stage 2.5 落地。env commit `7abaa87`（DEXIE_DB_URL 留空）+ 前端清理 commit `748f0a0`（删 auth.dexie.ts / server-tables.ts / db.cloud.configure / 双登录 UI / linkedDexieEmail 字段链 / dexie-cloud-addon 包）+ 后端清理 commit（drop linked_dexie_email migration + endpoint + test）一并合 new-deploy。`pnpm test:api` 38 → 37 全绿；`pnpm test:e2e` 17 / 102 全绿（85 skipped 是 profile gate，与 Stage 2 收官基线一致）。Stage 5 因此收窄为「导入导出端到端验证」单条
   - 下一步：在 Northflank 新建第二个服务指向 `new-deploy` 分支 + 独立 Postgres + 独立域名；按 plan 灰度顺序逐档开 backend flag（`BACKEND_DATA_API_ENABLED` → `BACKEND_AUTH` + `BACKEND_DATA_API_URL` → `BACKEND_DATA_TABLES=providers` → `REALTIME_TRANSPORT=auto`）。所有 Stage 3+ 代码改动 / spec / plan 修订仅合到 `new-deploy`，不再触碰 my-deploy。Stage 4.5 修订记录已废弃 per-table 自动迁移机制 ceremony，Stage 3 节奏聚焦每张叶子表 SQLModel + router + alembic + flag
 
 ---
@@ -379,12 +406,12 @@ interface AuthSource {
 
 ### Stage 1.5 — 自家鉴权（多用户 Ready）
 
-> **⚠️ 部分内容已 deprecated（2026-05-02 · 迁移路径转向）**：本段中以下与「双写窗口 / Dexie 账号关联」相关的设计在导入导出 only 路径下不再需要，但已落地代码不立刻删，等 Stage 5 一起清：
-> - `users.linked_dexie_email` 列 + UNIQUE 约束 + alembic migration
-> - `POST /api/v1/auth/link-dexie` endpoint + `tests/api/test_auth.py::test_link_dexie_first_write_wins`
-> - 前端首次登录调 `link-dexie` 的逻辑
-> - 「与 Dexie Cloud 共存策略（双写窗口）」整段
-> - 「用户身份关联（为后续数据迁移铺路）」整段
+> **⚠️ 部分内容已清理（2026-05-02 · Stage 2.5 落地完成）**：本段中以下与「双写窗口 / Dexie 账号关联」相关的设计在导入导出 only 路径下从未生效，已在 Stage 2.5 整体清理：
+> - ~~`users.linked_dexie_email` 列 + UNIQUE 约束 + alembic migration~~（drop migration `c4f1e2d3a8b0` 已落地）
+> - ~~`POST /api/v1/auth/link-dexie` endpoint + `tests/api/test_auth.py::test_link_dexie_first_write_wins`~~
+> - ~~前端首次登录调 `link-dexie` 的逻辑~~（实际从未接入，从 plan 中抽除）
+> - ~~「与 Dexie Cloud 共存策略（双写窗口）」整段~~
+> - ~~「用户身份关联（为后续数据迁移铺路）」整段~~
 >
 > 鉴权主体（用户表 / refresh token / JWT 签验 / register / login / refresh / logout / me / `BackendAuthSource`）保持有效，是后续所有 stage 的基础。
 
@@ -965,29 +992,17 @@ ImportDataDialog
 
 ---
 
-### Stage 5 — 摘除 `dexie-cloud-addon` + 清理 deprecated 代码
+### Stage 5 — 导入导出收尾验证
+
+> **2026-05-02 · Stage 2.5 落地**：本阶段计划的「摘除 dexie-cloud-addon」+「deprecated 代码一次性清理」已整体前置到 Stage 2.5 完成（详见顶部修订记录）。Stage 5 现在只剩「导入导出端到端验证」一项工作。
 
 **前置**：Stage 4.5 已上线（`IMPORT_JOB_ENABLED` 已默认开），老用户有可用迁移路径（旧版导出 → 新版 ImportDataDialog）。在 Stage 4.5 缺位时直接进 Stage 5 会让老用户失去迁移路径，必须串行。
 
-**目标**：拆掉 dexie-cloud 残留 + 一次性清理 2026-05-02 修订记录里标记为 deprecated 的 ~150 行代码。鉴权早在 Stage 1.5 已经全部走 `BackendAuthSource`；导入导出 only 路径下从未存在过「双写窗口」/「双登录入口」，本阶段没有"过渡 UI 回归单入口"工作。
-
-**主体清理**
-
-- `src/utils/db.ts` 从 `addons` 摘掉 `dexieCloud`；所有表退化为本地缓存
-- `src/router/routes.ts` `/account` / `/model-pricing` 改按 `BACKEND_DATA_API_URL` 注册（如 Stage 1.5 已完成则只确认）
-- `package.json` 移除 `dexie-cloud-addon`
-
-**deprecated 代码一次性清理**（2026-05-02 修订记录 · 合计 ~150 行）
-
-- 删 `users.linked_dexie_email` 列 + UNIQUE 约束（写一份 alembic downgrade-safe 的 drop migration）
-- 删 `POST /api/v1/auth/link-dexie` endpoint + `tests/api/test_auth.py::test_link_dexie_first_write_wins`
-- 删前端首次登录调 `/auth/link-dexie` 的逻辑
-- 删 `src/utils/db.ts` 的 `unsyncedTables` 计算 + `src/data/server-tables.ts` 模块（dexie-cloud-addon 已摘，无 middleware 需要绕）
-- `BackendAuthSource` 内删去与 `linked_dexie_email` 相关的字段 / 调用
+**目标**：验证「导入导出 only」迁移路径在 Stage 4.5 ImportJob 落地后端到端可用。
 
 **导入导出收尾**
 
-- 验证 `ExportDataDialog` / `ImportDataDialog` 在 `dexie-cloud-addon` 摘除后仍能读写 `aiaw_user_db.json`（dexie-export-import 不依赖 addon，理论上没问题，但要 e2e 真跑过）
+- 验证 `ExportDataDialog` / `ImportDataDialog` 在 `dexie-cloud-addon` 摘除后（Stage 2.5 已完成）仍能读写 `aiaw_user_db.json`（dexie-export-import 不依赖 addon，理论上没问题，但要 e2e 真跑过）
 - 验证「跨版本导入/导出兼容」段定义的对象存储桥接（导出时 fetch ref → 转 base64；导入时按阈值上传 / 留 inline）端到端正确
 
 **验证**

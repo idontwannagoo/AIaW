@@ -6,7 +6,6 @@ interface BackendUser {
   id: string
   email: string
   status: string
-  linked_dexie_email?: string | null
   created_at: string
   last_login_at?: string | null
 }
@@ -71,8 +70,7 @@ function toCloudUser(u: BackendUser, token: string | undefined): CloudUser {
     isLoggedIn: true,
     email: u.email,
     userId: u.id,
-    accessToken: token,
-    data: { linkedDexieEmail: u.linked_dexie_email ?? undefined }
+    accessToken: token
   }
 }
 

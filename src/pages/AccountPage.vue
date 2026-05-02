@@ -44,12 +44,6 @@
             >{{ user.userId }}</span>
           </q-item-section>
         </q-item>
-        <q-item v-if="user.data?.linkedDexieEmail">
-          <q-item-section>Linked Dexie Email</q-item-section>
-          <q-item-section side>
-            {{ user.data.linkedDexieEmail }}
-          </q-item-section>
-        </q-item>
         <q-separator spaced />
         <q-item
           clickable

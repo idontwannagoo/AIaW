@@ -6,7 +6,6 @@ Endpoints:
 - POST /api/v1/auth/refresh
 - POST /api/v1/auth/logout
 - GET  /api/v1/auth/me
-- POST /api/v1/auth/link-dexie
 """
 from __future__ import annotations
 
@@ -44,7 +43,6 @@ class UserOut(BaseModel):
     id: str
     email: EmailStr
     status: str
-    linked_dexie_email: Optional[EmailStr] = None
     created_at: datetime
     last_login_at: Optional[datetime] = None
 
@@ -76,16 +74,11 @@ class LogoutIn(BaseModel):
     refresh_token: str
 
 
-class LinkDexieIn(BaseModel):
-    dexie_email: EmailStr
-
-
 def _to_user_out(u: User) -> UserOut:
     return UserOut(
         id=u.id,
         email=u.email,
         status=u.status,
-        linked_dexie_email=u.linked_dexie_email,
         created_at=u.created_at,
         last_login_at=u.last_login_at,
     )
@@ -189,31 +182,4 @@ async def logout(
 
 @router.get('/me', response_model=UserOut)
 async def me(user: User = Depends(current_user)) -> UserOut:
-    return _to_user_out(user)
-
-
-@router.post('/link-dexie', response_model=UserOut)
-async def link_dexie(
-    body: LinkDexieIn,
-    user: User = Depends(current_user),
-    session: AsyncSession = Depends(get_session),
-) -> UserOut:
-    dexie_email = body.dexie_email.lower()
-    if user.linked_dexie_email is not None:
-        if user.linked_dexie_email == dexie_email:
-            return _to_user_out(user)
-        raise HTTPException(
-            status_code=409,
-            detail='user already linked to a different dexie email',
-        )
-    user.linked_dexie_email = dexie_email
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail='dexie email already linked to another user',
-        )
-    await session.refresh(user)
     return _to_user_out(user)

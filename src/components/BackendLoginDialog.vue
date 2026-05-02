@@ -83,7 +83,6 @@ interface BackendUser {
   id: string
   email: string
   status: string
-  linked_dexie_email?: string | null
   created_at: string
   last_login_at?: string | null
 }
