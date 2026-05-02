@@ -12,6 +12,23 @@
 
 ## 修订记录
 
+- **2026-05-02 · 部署分支拓扑硬切：my-deploy reset + new-deploy 单独承载 stage 1+**
+  - **背景**：Stage 2 收官后 feature/change-cloud-sync-claude（Stage 0 / 1 / 1.5 / 2 + 测试脚手架 + plan 共 23 commit）fast-forward merge 到 my-deploy 并 push，触发了一次 Northflank 部署。事后复盘发现 my-deploy 是「老用户兜底实例」分支 —— 按本 plan 2026-05-02 修订记录定下的「导入导出 only」迁移路径，my-deploy 本不应承载任何 backend 重构代码：flag 默认全关时 Stage 1 / 1.5 / 2 的 ~7 KB 前端 bundle 增量 + 几十 KB 后端 Python data 路由对老用户是纯 dead weight，违背 plan 同条修订记录 line 43 / 767 的「新版独立实例承载全量 stage 1+ 功能」拓扑设计。错位的根因是 plan 把部署拓扑只埋在修订记录里、没固化进 CLAUDE.md，操作时被「my-deploy 是当前唯一线上分支」的事实带跑偏。
+  - **变更**：
+    - 远端创建 `backup/my-deploy-pre-reset` 分支锚定 reset 前的 my-deploy HEAD `5c689ab`，本地 + 远端双副本永久保留作为逃生通道（半年内不删）
+    - 远端创建 `new-deploy` 分支起点 = `5c689ab`，承载 Stage 0 / 1 / 1.5 / 2 + 测试脚手架 + plan 全套；后续 Stage 3+ 工作只合这里
+    - 本地 my-deploy `git reset --hard 2b26349`，远端 `git push --force-with-lease origin my-deploy`：把 my-deploy 退到「Stage 0 抽象层重构完成 + Dexie 路径 3 个 bug fix」干净 baseline，移除 Stage 1 / 1.5 / 2 / 测试脚手架 / plan 共 33 个 commit。Northflank 服务 1 自动拉新镜像（实际是反向更新），老用户视角是一次镜像更新，运行时行为字节级回到 Stage 0 完成时
+    - 顶级 CLAUDE.md 新增「部署分支拓扑（2026-05-02 起生效）」H2 段，固化分支角色 + 工作流契约 + Northflank 约束 + 老用户迁移路径 + 部署分支 reset SOP 共 5 个子段；同步把 CLAUDE.md 现有的「flag 默认关 = 字节级一致」规则中「合并到 my-deploy」措辞改为「合并到 new-deploy」，新增一句「云同步重构相关代码永不合 my-deploy」交叉引用
+    - 本 plan 进度快照新增条目记录硬切完成
+  - **影响范围**：
+    - my-deploy 镜像净 -几十 KB（Python data 路由 + 测试脚手架 + plan 不再随镜像走），bundle 净 -7 KB；老用户行为 0 变化（flag 关时 Stage 0 完成态与 reset 前字节级一致）
+    - 33 个 commit 物理保留：在 `new-deploy` + `backup/my-deploy-pre-reset` 上 anchor 牢固，零代码丢失。本 plan 文件 my-deploy 上不再存在（plan 是云同步重构产物，被 reset 出去了）；plan 唯一权威版在 `new-deploy` 与工作分支
+    - 后续 Stage 3 起所有 plan / spec / 代码改动只在 `new-deploy`；my-deploy 进入「维护态」直到 Stage 5 落地后由迁移率决定下线时机
+  - **避坑（这次踩过 + 修了的）**：
+    - ① **没把"导入导出 only 部署拓扑"写进 CLAUDE.md** —— 只在 plan 修订记录里有一句话提及「新版独立实例」，操作时被忽略。修复：CLAUDE.md 加「部署分支拓扑」段固化为静态规则，未来任何会话开始读 CLAUDE.md 即可看到，无法再次错位
+    - ② **把 23 个云同步 commit fast-forward 到 my-deploy 是错位的**：「上线但不启用」适合"同一用户群特性灰度"，**不**适合"新旧用户分流"。导入导出 only 路径下，前端 flag 是 quasar build 期内联无法 per-user 切换 → 一份镜像服务一群用户 → my-deploy 镜像里有 stage 1+ 代码就是浪费。下次 stage 落地前必须先确认 merge 目标是 new-deploy
+    - ③ **force-push deploy 分支必须先建 safety net**：本次按「拉 backup → 拉 new-deploy → reset local → force-push」四步走，每步独立验证后再继续；safety net 远端 + 本地双副本，恢复成本一行命令（`git reset --hard backup/my-deploy-pre-reset && git push --force-with-lease`）。这个 SOP 已写进 CLAUDE.md 部署分支拓扑段，未来任何 deploy 分支 reset 都按此走
+    - ④ **Permission system 对 force-push 单独设保护**：第一次 force-push 即使在 auto mode 下也被 permission system 拒，要求用户对具体的 force-push 命令再次显式批准。这是合理的安全边界，不要尝试绕过，每次老老实实让用户在 prompt 里点允许或用 `! command` 形式直接执行
 - **2026-05-02 · Stage 2 / Step 6 落地（Stage 2 收官）**
   - **背景**：Step 5 沉淀完 SSE / poll / auto 降级 spec 后 Stage 2 仅剩「回归全绿 + 三组手测交付物 + 翻上线 flag」三件事。按 plan 不再新增 spec，只 reuse 全套 Step 1-5 已落 spec 作为回归判据，并交付「bundle KB 数 / RSS 起止 MB 数 / p95 ms 数」三个非脚手架可覆盖的数字写进进度快照。
   - **变更**：
@@ -167,8 +184,9 @@
       - **p95 延迟**：26.33 ms（p50 20.21 / p99 31.97 / max 84.67），**远低于 plan 设的 500 ms 目标 ✓**。脚本路径走 backend → asyncpg → PG，覆盖 PUT 主路径；浏览器侧 RTT 由网络叠加在此之上但量级仍然可控
     - **新增脚手架**：`tests/scripts/soak.sh`（bash 入口，trap-driven shutdown，每 N 秒采 RSS 进 `tests/.results/soak.rss.tsv`） + `tests/scripts/soak-loadgen.py`（asyncio loadgen：N 个 WS subscriber 持开 + httpx PUT loop，结束时 emit JSON-Lines summary 含 p50/p95/p99/avg/max）。脚本幂等可中断、不写 dev DB、用 `secrets.token_hex` 前缀避免与 pytest 残留 `providers.id` 冲突
     - **避坑（落地踩过 + 修了的）**：① loadgen 第一版用 `soak-{i % 50}` 做 id，跑第二次时与上一次 user 撞 PG `providers.id` UNIQUE 约束 → 全部 409 `id owned by another user` → 0 puts。修为 `f'soak-{secrets.token_hex(3)}-{i % 50}'`，每次 run 独立 namespace。② macOS `ps -o rss=` 在 OS 内存压力下会把 inactive page 移出 resident，soak 结束后空闲态读出来的 RSS 会大幅低于 active 期值（17 MB vs active 60-68 MB），不是真泄漏信号；判据应看 active 期 max-min drift 而不是「end - start」
-    - **Stage 2 出口**：三条出口判据全部达成（回归全绿 + 三组数字达标 + flag 默认空仍字节级等同 Stage 1）。下一步走「上线但不启用」策略合并到 my-deploy，`REALTIME_TRANSPORT` 默认空，需要启用时在 Northflank 控制台开 flag
-  - 下一步：把本次 Step 6 改动 + plan 修订合到 my-deploy 触发 Northflank 自动部署，然后进 **Stage 3**（Stage 4.5 修订记录已废弃 per-table 自动迁移机制 ceremony；Stage 3 节奏聚焦每张叶子表 SQLModel + router + alembic + flag）
+    - **Stage 2 出口**：三条出口判据全部达成（回归全绿 + 三组数字达标 + flag 默认空仍字节级等同 Stage 1）
+  - **部署分支拓扑硬切（B 方案 reset）**✅ — 详见修订记录 2026-05-02 · 部署分支拓扑硬切。my-deploy 退到 `2b26349` 干净 baseline（仅 Stage 0 抽象层 + Dexie 路径 bug fix）；`new-deploy` 拉自 `5c689ab` 承载 Stage 1+ 全套；`backup/my-deploy-pre-reset` 远端永久保留作为逃生通道。CLAUDE.md 新增「部署分支拓扑」段固化分支角色 / 工作流契约 / Northflank 约束 / 老用户迁移路径 / reset SOP，所有未来工作以此为准
+  - 下一步：在 Northflank 新建第二个服务指向 `new-deploy` 分支 + 独立 Postgres + 独立域名；按 plan 灰度顺序逐档开 backend flag（`BACKEND_DATA_API_ENABLED` → `BACKEND_AUTH` + `BACKEND_DATA_API_URL` → `BACKEND_DATA_TABLES=providers` → `REALTIME_TRANSPORT=auto`）。所有 Stage 3+ 代码改动 / spec / plan 修订仅合到 `new-deploy`，不再触碰 my-deploy。Stage 4.5 修订记录已废弃 per-table 自动迁移机制 ceremony，Stage 3 节奏聚焦每张叶子表 SQLModel + router + alembic + flag
 
 ---
 
@@ -302,7 +320,7 @@ interface AuthSource {
 > **执行顺序**：Stage 1 内部分 7 个 Step。原 Step 3（JWKS 桥接鉴权）已废弃，被 **Stage 1.5（自家 JWT 多用户鉴权）** 整体替代。真实执行顺序：
 > **Step 1 ✅ → Step 2 ✅ → Stage 1.5 → Step 4 → Step 5 → Step 6 → Step 7 → Stage 2**
 >
-> **上线策略**：Stage 1 全部 7 个 Step + Stage 1.5 完成后才算"Stage 1 收尾"，整体按「**上线但不启用**」策略合并到 my-deploy：代码合上线，但前端 `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` 与后端 `BACKEND_DATA_API_ENABLED` 默认全不开 → 行为与 Stage 0 完全等同；按需在部署里开 flag 灰度。回滚不需 revert，关 flag 即可。
+> **上线策略**：Stage 1 全部 7 个 Step + Stage 1.5 完成后才算"Stage 1 收尾"，整体按「**上线但不启用**」策略合并到 **new-deploy**（2026-05-02 部署分支拓扑硬切前为 my-deploy，硬切后所有 stage 1+ 工作走 new-deploy）：代码合上线，但前端 `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` 与后端 `BACKEND_DATA_API_ENABLED` 默认全不开 → 行为与 Stage 0 完全等同；按需在部署里开 flag 灰度。回滚不需 revert，关 flag 即可。
 
 #### Step 1 — 后端骨架 + Postgres + 健康检查 ✅ commit `e4d3210`
 
@@ -355,7 +373,7 @@ interface AuthSource {
 3. **flag 关闭回滚**：关 flag → 刷新 → UI 走缓存数据 → 行为回到 Stage 0
 4. **双向兼容**：flag 关时建 Q1（走 Dexie）→ 切 flag 开 → Q1 不会自动出现在 Postgres（迁移机制属于「现有用户数据迁移」段，Stage 3+ 才生效）但 IndexedDB 仍能读
 
-**Stage 1 出口判据**：4 个场景全过 + bundle 体积变化可接受 + flag 默认关时与 Stage 0 行为字节级一致 → 可合并到 my-deploy 上线。
+**Stage 1 出口判据**：4 个场景全过 + bundle 体积变化可接受 + flag 默认关时与 Stage 0 行为字节级一致 → 可合并到 new-deploy 上线（2026-05-02 拓扑硬切前为 my-deploy）。
 
 ---
 
@@ -648,7 +666,7 @@ interface AuthSource {
 **Stage 2 出口判据**
 - 「回归判据」5 类全部 reuse 复跑全绿（含 Step 5 新增的 SSE / poll / auto case）：`pnpm test:api && pnpm test:e2e -g "stage2|stage1_5|smoke"` 一把全绿
 - 「上线把关判据」3 条手测结果（bundle KB / RSS MB / p95 ms 三个具体数）写进 plan 进度快照
-- 走「上线但不启用」策略：合并到 my-deploy 时 `REALTIME_TRANSPORT` 默认空 → 行为字节级等同 Stage 1 收尾；按需在 Northflank 控制台开 flag 灰度
+- 走「上线但不启用」策略：合并到 new-deploy 时 `REALTIME_TRANSPORT` 默认空 → 行为字节级等同 Stage 1 收尾；按需在 Northflank 控制台开 flag 灰度
 
 **回滚**：`REALTIME_TRANSPORT=` 空（关闭实时通道，退回 Stage 1 行为）；如有更严重问题，从 `BACKEND_DATA_TABLES` 摘掉 providers 退回 Stage 0 行为。
 

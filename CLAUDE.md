@@ -23,9 +23,43 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 - **每完成一个 Step 必须更新 plan**：在 plan 对应 Step 标 ✅，同步更新「进度快照」段；同一次提交里把代码改动与 plan 更新一起 commit，避免 plan 与代码漂移。**不要在 plan 里写当前 commit 自身的 hash**——commit hash 由内容（含 plan）决定，自指数学上无解（amend 后 hash 漂移，plan 写的 hash 失效）。要追溯具体提交直接 `git log` / `git blame` plan 文件。已完成的前序 step 想顺手附个短 hash 做导航锚 OK，但非必须；标 ✅ + Step 名足以定位。
 - **方案有调整必须加修订记录**：当某阶段假设被否定 / 子步骤拆分 / 顺序调整 / 上线策略变化时，在 plan 顶部「修订记录」追加一条带日期 + 背景 + 变更 + 影响范围的条目，再改正文。不要静默改正文。
 - **每次代码修改必须配套通过判据**：每个 Step 在 plan 里都有「通过判据」段，代码改动落地后必须按判据真测一遍（curl / Console / 多 tab / 清缓存等），把结果记进进度快照。判据失败时优先修代码，而不是改判据。
-- **flag 默认关 = 字节级一致**：任何阶段的代码合并到 my-deploy 时，前端 `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` / `REALTIME_TRANSPORT` 与后端 `BACKEND_DATA_API_ENABLED` 默认全不开，行为必须与上一阶段完全一致。这是回滚兜底，不可破坏。
+- **flag 默认关 = 字节级一致**：任何阶段的代码合并到 **new-deploy** 时，前端 `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` / `REALTIME_TRANSPORT` 与后端 `BACKEND_DATA_API_ENABLED` 默认全不开，行为必须与上一阶段完全一致。这是回滚兜底，不可破坏。（注：云同步重构相关代码**永不合 my-deploy** —— 详见下方「部署分支拓扑」段。）
 - **后端模块条件挂载**：新增 backend 子模块（如 Stage 2 `realtime.py`）若依赖 `JWT_SECRET` 等强制 env，必须放在 `_enable_backend_data_api()` flag 守卫的 lazy import 里，不能让无 flag 的 Northflank 部署在 import 期就崩。
 - **提交信息**：遵循全局规则（中文、不带 `Co-Authored-By` 与 AI 署名）；项目惯用 `<scope>: <短描述>` 或 `云同步重构stageX-stepY: <内容>` 形式（参考 `git log`）。
+
+## 部署分支拓扑（2026-05-02 起生效）
+
+本仓库有**两个独立部署分支**对应**两个独立 Northflank 服务**，承载两批用户。这是 plan `cloud-sync-migration.md` 2026-05-02 修订记录确定的「导入导出 only」迁移路径的部署侧实现 —— 老用户继续用老实例直到主动迁移，新版独立实例承载全量 stage 1+ backend 功能。
+
+### 分支角色
+
+- **`my-deploy`** —— 老用户兜底实例。HEAD 锁在 Stage 0 抽象层重构 + Dexie 路径 bug fix 干净 baseline（commit `2b26349`）。线上服务连官方 Dexie Cloud SaaS（`znm3rqzc8.dexie.cloud`），数据走 IndexedDB + dexie-cloud-addon 推 SaaS。**不接受任何云同步重构 commit**，包括 Stage 1 / 1.5 / 2 / 3+ 任何后续阶段；只接：上游 `master` 同步、老 Dexie 路径 bug 修复、与云同步无关的 UI / 性能改进。
+- **`new-deploy`** —— **新版部署分支（默认工作目标）**。HEAD 在 Stage 2 收官（commit `5c689ab` 起）。包含 Stage 0/1/1.5/2 全套云同步重构 + 测试脚手架（`tests/`） + 全部 plan（`plans/`）+ 本 CLAUDE.md。Stage 3+ 工作只合到这里 → 部署到独立 Northflank 服务 + 独立 Postgres + Stage 4 起独立对象存储 + 独立域名。
+- **`backup/my-deploy-pre-reset`** —— safety net 永久分支，指向 reset 前 my-deploy HEAD（`5c689ab`）。半年内不删，作为「万一新拓扑要整体回滚」的逃生通道。
+
+### 工作流契约（PR / merge 目标硬性约束）
+
+| 改动类型 | 工作分支 base | merge 目标 |
+|---|---|---|
+| 上游 `master` 同步 | `master` | `my-deploy` + `new-deploy` 各 merge 一次 |
+| 老 Dexie 路径 bug 修复 | `my-deploy` | `my-deploy` → 然后 cherry-pick 或 merge 到 `new-deploy` |
+| 云同步 Stage 3+ 新功能 / 新表 / 新 endpoint / spec / plan 修订 | `new-deploy` | **只合 `new-deploy`，永不合 `my-deploy`** |
+| 测试脚手架（`tests/`、`docker-compose.test.yml`、`tests/scripts/`） | `new-deploy` | **只合 `new-deploy`** |
+
+违背契约的后果：my-deploy 被 dead weight 污染（Stage 1+ 代码 flag 关时无害但镜像膨胀几十 KB），要清理就得再跑一次 force-push reset，引入额外部署事件。
+
+### Northflank 部署侧约束
+
+- **服务 1（指向 `my-deploy`）**：保留现状。env 不再开 `BACKEND_DATA_API_ENABLED` / `JWT_SECRET` / `BACKEND_AUTH` / `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `REALTIME_TRANSPORT` 等任何 backend flag。Stage 5 落地后由 active 用户迁移率（建议 ≥ 80%）触发 6 周下线窗，到期关闭。
+- **服务 2（指向 `new-deploy`，待新建）**：独立 Postgres 实例 + Stage 4 起独立 R2/MinIO bucket；env 至少开 `BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` 启用 backend data API。前端 flag（`BACKEND_AUTH` / `BACKEND_DATA_TABLES` / `REALTIME_TRANSPORT`）按 plan 灰度 —— 注意前端是构建期内联，开 flag 必须改 `new-deploy` 上的 `.env.docker` 后 push 重 build，控制台 env override 对前端无效。
+
+### 老用户迁移路径（导入导出 only）
+
+老用户在 `my-deploy` 域名上 ExportDataDialog 导出 `aiaw_user_db.json` → 在 `new-deploy` 域名上 ImportDataDialog 导入。Stage 4.5 落地后导入走 server-side worker（浏览器只切片直传）。新版默认不挂 dexie-cloud-addon（Stage 5 卸），不愿迁的老用户继续用 my-deploy 不动；存在 bug 时回退路径就是「用回 my-deploy URL」，零数据风险。
+
+### 部署分支 reset 操作 SOP（如未来再需要）
+
+force-push deploy 分支是分水岭操作，必须按 4 步走：① 在远端创建 `backup/<branch>-pre-reset` safety net 锚定当前 HEAD；② 创建承接代码的新分支并 push；③ 本地 `git reset --hard <target>`；④ `git push --force-with-lease origin <branch>`（不要用 `--force`）。每步独立验证后再继续。
 
 ## 测试体系（静态规则）
 
