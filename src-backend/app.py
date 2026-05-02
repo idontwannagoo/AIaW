@@ -71,6 +71,7 @@ def _enable_backend_data_api(app: FastAPI) -> None:
     from data.routers import dialogs as dialogs_router
     from data.routers import health as health_router
     from data.routers import installed_plugins as installed_plugins_router
+    from data.routers import items as items_router
     from data.routers import providers as providers_router
     from data.routers import reactives as reactives_router
     from data.routers import sse as sse_router
@@ -87,12 +88,13 @@ def _enable_backend_data_api(app: FastAPI) -> None:
     app.include_router(blobs_router.router)
     app.include_router(workspaces_router.router)
     app.include_router(dialogs_router.router)
+    app.include_router(items_router.router)
     app.include_router(stream_router.router)
     app.include_router(sse_router.router)
     logger.info(
         'backend data API enabled '
         '(auth + providers + reactives + assistants + avatar_images + '
-        'installed_plugins + blobs + workspaces + dialogs + health + stream + sse mounted)'
+        'installed_plugins + blobs + workspaces + dialogs + items + health + stream + sse mounted)'
     )
 
 

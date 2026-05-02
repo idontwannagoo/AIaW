@@ -87,7 +87,7 @@ def db_reset() -> Iterator[None]:
         with conn.cursor() as cur:
             cur.execute(
                 'TRUNCATE TABLE refresh_tokens, users, providers, reactives, '
-                'assistants, avatar_images, installed_plugins, dialogs, '
+                'assistants, avatar_images, installed_plugins, items, dialogs, '
                 'workspaces, blob_refs, blobs '
                 'RESTART IDENTITY CASCADE'
             )

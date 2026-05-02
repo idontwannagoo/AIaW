@@ -271,3 +271,37 @@ export async function deleteDialog(
 ): Promise<DialogRow> {
   return backendClient(token).del(`/api/v1/dialogs/${id}`)
 }
+
+// Stage 4 / 批次-4c — items endpoint (id-PK; data carries the StoredItem
+// row, dialog_id is server-side promoted to its own column + FK to
+// dialogs. `data.contentBuffer`, when present, is an
+// `AttachmentEnvelope` from blob-client.ts — see items.server.ts).
+export interface ItemRow {
+  id: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: Record<string, unknown> | null
+}
+
+export async function putItem(
+  token: string,
+  id: string,
+  data: Record<string, unknown>
+): Promise<ItemRow> {
+  return backendClient(token).put(`/api/v1/items/${id}`, data)
+}
+
+export async function listItems(
+  token: string,
+  since = 0
+): Promise<ItemRow[]> {
+  return backendClient(token).get(`/api/v1/items?since=${since}`)
+}
+
+export async function deleteItem(
+  token: string,
+  id: string
+): Promise<ItemRow> {
+  return backendClient(token).del(`/api/v1/items/${id}`)
+}
