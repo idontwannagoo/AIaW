@@ -20,14 +20,21 @@
 
 - **进度快照（2026-05-02）**
   - plan 文件入库 ✅ `aa15721`
-  - Phase 1 测试环境底座 ✅ 本次提交
+  - Phase 1 测试环境底座 ✅ `8e61258`
     - docker-compose.test.yml（Postgres 16 → 5434，project name `aiaw-test`，volume `aiaw_test_pg`，pg_isready healthcheck）
     - tests/scripts/{test-up,test-down,backend-start,backend-stop}.sh（全 chmod +x）
     - package.json 加 `test:up` / `test:down` / `test:backend:start` / `test:backend:stop`
     - .gitignore 加 `/tests/.builds/` `/tests/.results/`
     - 判据真跑：`/api/v1/health` → `{status:"ok",db:"ok"}`；dev 5433/aiaw-postgres 不受影响；`test:down` 释放 5434 + 删 volume；二次 up/start 幂等；5434/9011 被占时 lsof 友好报错
-  - Phase 2-7 未启动
-  - 下一步：Phase 2（前端 profile 构建管理 + sha256 cache + serve-build）
+  - Phase 2 前端 profile 构建管理 ✅ 本次提交
+    - tests/env/.env.test.{baseline,providers-rest,realtime-ws}（含 EXPOSE_DB=true 给 e2e 钩子用）
+    - tests/scripts/build-frontend-profile.mjs（cache key = sha256(profile + env-sha + git rev + pkg-sha)，trap-style .env.local 还原：finally + SIGINT/SIGTERM/SIGHUP/uncaughtException 多入口 idempotent restore）
+    - tests/scripts/serve-build.mjs（plain node:http，SPA fallback：无扩展名路径 → index.html，带扩展名缺失 → 404；EADDRINUSE 友好报错）
+    - package.json 加 `test:build` / `test:serve`
+    - 判据真跑：cold baseline build 15.7s；二次跑 cache hit 0.38s；改 env 一字符 → cache miss + new key + 重 build 13.9s；env 复位 → 命中原 key（cache 确定性）；mid-build SIGINT 后 .env.local sha 与启动前一致；serve-build GET / → index.html、GET /workspaces/abc → SPA fallback 命中 index.html、GET /missing.png → 404
+    - 备注：plan 原写 `.ts`，实际落地为 `.mjs`（plain Node ESM，无须 tsx/ts-node 等额外 dev dep；逻辑无 TS-only 特性）
+  - Phase 3-7 未启动
+  - 下一步：Phase 3（后端 pytest 层 + conftest fixture + Stage 1 / 1.5 / 2-Step1 判据沉淀）
 
 ---
 
@@ -123,7 +130,7 @@ pytest.ini
 
 ---
 
-### Phase 2 — 前端 profile 构建管理
+### Phase 2 — 前端 profile 构建管理 ✅
 
 **做什么**
 - `tests/env/.env.test.<profile>`：先建 3 个（`baseline` / `providers-rest` / `realtime-ws`），后续 Stage 加表只新增 profile。

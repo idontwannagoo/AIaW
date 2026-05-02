@@ -13,6 +13,8 @@
     "test:down": "bash tests/scripts/test-down.sh",
     "test:backend:start": "bash tests/scripts/backend-start.sh",
     "test:backend:stop": "bash tests/scripts/backend-stop.sh",
+    "test:build": "node tests/scripts/build-frontend-profile.mjs",
+    "test:serve": "node tests/scripts/serve-build.mjs",
     "dev": "quasar dev",
     "build": "quasar build",
     "docs:dev": "vitepress dev docs",
