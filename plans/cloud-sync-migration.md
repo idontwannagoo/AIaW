@@ -16,6 +16,24 @@
 
 > **术语说明**：plan 中"批次" / "批次-Xx"指**一组原子的、可整体回滚的提交集合**——本仓库是单人 + AI 开发，没有 GitHub PR 流程，"批次"对应"一次落地的 commit 序列"，不暗示 review / merge 流程。批次代号仍按字母分组方便引用（如 `批次-3a` / `批次-4b`）。
 
+- **2026-05-03 · 4c items 重新归类为「依赖硬前置 2 的附件载体表」**
+  - **背景**：上一轮规划 4c 把 items 当"独立简单叶子表"，schema 决策段写为「`type` 联合；`dialogId` 可为 null（工作区级 item vs 对话级 item）」，并在 line 38 依赖排序中把 items 与 dialogs 并列为"可并行的简单表"。复盘发现两处错：① **代码事实**：`StoredItem` 形态是 `{id, dialogId:string(必填), type:'text'|'file'|'quote', references:number, contentBuffer?:ArrayBuffer, mimeType?, name?, contentText?}`，`dialogId` 必填不可 null；`contentBuffer` 是用户上传的真附件 bytes（`DialogView.vue::949` 的 `repos.items.bulkPut(items)` 就是处理用户拖文件 / 上传图片 / 引用大段文字的入口，`type:'file'` 的 contentBuffer 可达 5MB+）。② **未来一致性**：plan 4e messages 端到端判据写"5MB attachment 端到端 → ref URL 下载 blob"，实际数据流走 items（message 只持 `StoredItemId[]`），所以**items 必须支持 blob ref 才能让 4e 跑通**，否则 4e 落地时回头改 items 污染历史
+  - **未来约束**：
+    - **4c items 重新归类为依赖硬前置 2**（与 4d/4e 同档），不再是"独立简单"；硬前置 2 已落地故不阻塞，仅排序约束改变
+    - **依赖排序刷新**：`workspaces` ✅ → `dialogs` ✅（FK→workspaces）→ `items`（FK→dialogs，依赖硬前置 2 ✅）→ `artifacts`（依赖硬前置 2 ✅）→ `messages`（依赖硬前置 1+2 ✅）。dialogs / items 并行已不成立——items 有 FK 到 dialogs
+    - **wire 形态**：`items.server.ts` 用 `src/data/blob-client.ts` 的 `serializeAttachment` / `materializeAttachment` 处理 `contentBuffer`：`< 64KB` → `{type:'inline', data:base64, content_type, size}` 内联在 row；`≥ 64KB` → `{type:'ref', url, sha256, size, content_type}` 上 BlobStore。row 其它字段（id / dialogId / type / references / mimeType / name / contentText）保持原样
+    - **后端**：`routers/items.py` 仍把 `data` 当 opaque JSONB 处理，**不感知 inline/ref 形态**。后端 PG 行设计单一 `data:JSONB` 列即可，不要拆 attachment 字段——这与 dialogs / workspaces 模板一致
+    - **dialog FK**：`dialog_id` 提到顶层列、FK→`dialogs.id` ON DELETE CASCADE（与 dialogs/workspaces FK 模式一致）；router PUT 校验 `data.dialogId` 存在 + 同 user，缺失/跨 user 返 409
+    - **blob_refs 增删**：items.put 时 `serializeAttachment` 自动建 `(user_id, sha256)` ref；items.delete 时**不主动 delete blob ref**（多 row 共享 sha256，且后续 messages 可能再引用），交 plan 未来扩展 GC job
+    - **测试加 ref 形态判据**：api 加 `test_put_item_with_ref_attachment_round_trips` + `test_inline_at_64kb_minus_one` + `test_ref_at_64kb_threshold`；spec 加 `items-ref-attachment.spec.ts`（A tab 写 100KB ArrayBuffer → blob-client 自动走 ref → B tab realtime 收到 → fetchBlob 还原 → 字节级一致）
+    - **plan 内连带改动**：line 38 依赖排序、line 121/123/125 进度快照、line 774-776 4c schema 决策段、line 830 4c 状态行
+  - **避坑**：
+    - **不要拷贝 avatarImages 模板的 wire 处理**！avatarImages 是 < 64KB 头像（叶子表），plan 顶部 2026-05-02 修订记录明确写"叶子表（含 avatarImages）走 base64 内联即可"。items **不是叶子表**——它是消息附件载体，必须走 `serializeAttachment`
+    - 后端 PG 行 `data:JSONB` 列存 client 序列化后整体（含 inline 或 ref 子对象），**不要在 PG 拆 attachment 字段单独建列**——blob 元数据归 `blobs` / `blob_refs` 表，items 行只是"指向"
+    - `serializeAttachment` 是 async + 走网络（ref 模式时），调用点 `repos.items.put` 必须 await；`bulkPut` 必须 sequential 调用 putOne（与 dialogs 模板一致），不能 Promise.all 并行——多 sha256 同时 putBlob 会撞 ref 唯一约束 race
+    - 跨 tab realtime apply ref item 时 `materializeAttachment` 也走网络，apply 链路必须容忍 fetchBlob 失败（presigned URL 1h 过期 / 网络抖动）：失败时 row 仍写入 IndexedDB 但 contentBuffer 留 undefined，UI 渲染时再按需 retry。**这条 4c 落地时必须有专门 spec 验证**
+    - 4c 落地时 `routers/workspaces.py::delete_workspace` 的 cascade 分支按 dialogs 模板加 items update-tombstone 链路，与 dialogs cascade 共用同一 `cascade_version`（前端按 LWW 处理，跨 tab 收到一组事件无序也无所谓）
+
 - **2026-05-02 · 硬前置 1 收窄：保留 inline envelope 流式同步 + cursor 分页（砍掉 notify-only 协议）**
   - **背景**：硬前置 1 原设计含两块——① WS / SSE event 改 notify-only（去 `row` 字段，客户端 GET row 按需拉）+ ② `?since=N` 加 cursor 续拉。实施一半发现 ① 当前朴素实现对**流式云同步**场景**零正收益、负 RTT**：bytes-on-wire 仍是 O(N²)（GET 拉的也是当前累积 row），多 N 个 RTT + N 次 PG 查询。要让 notify-only 真省带宽必须配合客户端 event coalesce/dedup + 服务端 ETag/304，~200–300 行额外异步逻辑。broker 队列内存优势（10MB → 20KB / 活跃 sub）只有大规模 SaaS 才兑现，本项目（个人 / 小规模独立部署）触不到。同时 notify-only 引入「event 到了 row 没到」中间态 + race condition + 404-as-tombstone 启发式，让多 tab / 跨设备流式同步在弱网下反而 UX 变差（断断续续 / 偶尔倒退 / 帧缺失）。
   - **未来约束**：
@@ -35,7 +53,7 @@
   - **未来约束**：
     - **① 砍 flag 默认关上线节奏**：Stage 3+ 每张表落地时同一批 commit 内直接把表名加进 `.env.docker` 的 `BACKEND_DATA_TABLES` CSV 并 push 触发重 build，不再走「先关 flag → 后续批次再翻 flag」两步。**flag 机制本身保留到 Stage 4.9** 一次性删除（用作 server.ts 写炸时秒级 disable 单表的应急开关）
     - **② Stage 3 批次拆分**：`reactives` 自成 1 批（KV 形主键 `(user_id, key)` + envelope 重新设计）；`assistants` + `installedPluginsV2` + `avatarImages` 合成 1 批（schema 简单 + 决策点小）。共 2 批
-    - **③ Stage 4 主体保持 5 批次**（每张表都有重大 schema 决策），强制依赖排序：`workspaces` → `dialogs` / `items`（可并行）→ `artifacts`（依赖硬前置 2）→ `messages`（依赖硬前置 1+2）
+    - **③ Stage 4 主体保持 5 批次**（每张表都有重大 schema 决策），强制依赖排序：`workspaces` → `dialogs`（FK→workspaces）→ `items`（FK→dialogs，依赖硬前置 2）→ `artifacts`（依赖硬前置 2）→ `messages`（依赖硬前置 1+2）。**注**：items 原写为"与 dialogs 可并行的简单表"已于 2026-05-03 修订记录纠正——items 是消息附件载体，FK 到 dialogs 且走 blob ref
     - **④ 新增 Stage 4.9「flag 路由层 + dexie 实现一次性下架」**：前提是 Stage 4.5 端到端验收通过 + 至少稳定运行 1 周；删 9 张 `<table>.dexie.ts` + flag 路由 + `SERVER_CAPABLE_TABLES` + `BACKEND_DATA_TABLES` 配置位
     - **⑤ Stage 4.5 = "可让老用户用"的物理分水岭**：之前不强制人工端到端，自动化测试 + 5-10 min 主路径冒烟足够；之后必须做真实数据 export → import 端到端 + 跨设备 + 跨平台真机。详见「上线节奏与人工端到端测试分工」段
     - **⑥ 回滚策略统一**：所有 Stage 3+ 工作的回滚都是「用回 my-deploy URL」，不是「flag 翻回 dexie」（虽然 Stage 4.9 之前 flag 仍可作为应急开关）
@@ -122,7 +140,7 @@
 
 ### 下一步：开 Stage 4 主体批次-4c（`items`）
 
-批次-4b dialogs 落地后，按依赖顺序进入 4c items（独立无 FK 依赖，可独立做）→ 4d artifacts（依赖硬前置 2 对象存储）→ 4e messages（依赖硬前置 1+2，inline envelope 流式同步，最难）。`workspaces.delete(?cascade=true)` 当前已经 server-side 真级联到 dialogs；4c/4d/4e 落地时按相同模板把 items / artifacts / messages 各自的 update-tombstone 链路加进 `routers/workspaces.py::delete_workspace` 的 cascade 分支即可。
+批次-4b dialogs 落地后，按依赖顺序进入 4c items（FK→dialogs + 依赖硬前置 2 BlobStore）→ 4d artifacts（依赖硬前置 2 对象存储）→ 4e messages（依赖硬前置 1+2，inline envelope 流式同步，最难）。**items 是消息附件载体**——`StoredItem.contentBuffer:ArrayBuffer` 是用户上传的真附件 bytes（5MB PDF / 图片 / 文档），用 `src/data/blob-client.ts::serializeAttachment` 按 64KB 阈值二选一 inline / ref；后端 PG 行只是个 envelope 指针。详见 2026-05-03 修订记录。`workspaces.delete(?cascade=true)` 当前已经 server-side 真级联到 dialogs；4c/4d/4e 落地时按相同模板把 items / artifacts / messages 各自的 update-tombstone 链路加进 `routers/workspaces.py::delete_workspace` 的 cascade 分支即可（cascade 路径也要走 dialogs cascade 触发出来的 dialog FK CASCADE，items 同事务 update tombstone 共用 cascade_version）。
 
 ### 未启动（按依赖顺序）
 
@@ -771,9 +789,19 @@ interface AuthSource {
   - schema 决策：`workspaceId` FK + `ON DELETE CASCADE`；is_active / draft 字段
   - 测试：`tests/api/test_dialogs.py` ~8 case（CRUD + workspaceId FK 失效拒绝 + 级联删 messages / items / artifacts）；`tests/e2e/stage4/dialogs-realtime.spec.ts` ~4 case
 
-- **批次-4c · `items`**（独立，可与 批次-4b 并行）
-  - schema 决策：`type` 联合（不同 type 不同 payload 形态）；`dialogId` 可为 null（工作区级 item vs 对话级 item）
-  - 测试：`tests/api/test_items.py` ~6 case；`tests/e2e/stage4/items-realtime.spec.ts` ~3 case
+- **批次-4c · `items`**（FK→dialogs，**依赖硬前置 2 BlobStore**——items 是消息附件载体）
+  - **schema 决策**（2026-05-03 修订；废弃旧"独立简单叶子表 + dialogId 可为 null"假设）：
+    - `dialog_id` 提到顶层列、FK→`dialogs.id` ON DELETE CASCADE，**必填不可 null**（与代码 `StoredItem.dialogId:string` 一致）
+    - `data:JSONB` opaque 列承载 `{id, dialogId, type:'text'|'file'|'quote', references:number, contentText?, contentBuffer?:AttachmentEnvelope, name?, mimeType?}`，其中 `contentBuffer` 字段在 wire 上是 `AttachmentEnvelope`（来自 `blob-client.ts`）：
+      - `< 64KB` → `{type:'inline', data:base64, content_type, size}` 内联在 row（PG 不膨胀）
+      - `≥ 64KB` → `{type:'ref', url, sha256, size, content_type}`，bytes 上 BlobStore，PG 行只持 ref（~几百字节）
+    - 客户端 `items.server.ts::putOne` 调 `serializeAttachment(buf, mimeType)` 后 PUT；`pull` / realtime apply 时遇到 `contentBuffer` 字段调 `materializeAttachment` 还原为 ArrayBuffer 写 IndexedDB
+    - 后端 `routers/items.py` 当 `data` opaque JSON 处理，**不感知 inline/ref**；与 dialogs / workspaces 模板一致，PG 不拆 attachment 列
+    - blob_refs 增删：items.put 时 `serializeAttachment` 自动建 `(user_id, sha256)` ref；items.delete **不主动 delete blob ref**（多 row 共享 sha256），交未来 GC job
+    - workspace cascade 链路：dialog cascade → dialog FK ON DELETE CASCADE 自动连带 items（PG 层）；同时 `workspaces.delete_workspace` cascade 分支显式 update items.deleted_at + 共用 cascade_version + 发独立 WS event 链（与 dialogs 同模板，前端按 LWW idempotent apply）
+  - **测试**：`tests/api/test_items.py` ~10 case：基础 CRUD（put / get / list / delete + soft-delete tombstone + delete-then-put-revives + since 增量 + account isolation + unauth 401）+ FK 校验（`test_put_rejects_missing_dialog_id` / `test_put_rejects_unknown_dialog` / `test_put_rejects_cross_user_dialog`）+ ref 形态（`test_put_item_with_inline_attachment` / `test_put_item_with_ref_attachment_round_trips` / `test_inline_below_64kb` / `test_ref_at_or_above_64kb`）+ workspace cascade（`test_workspace_cascade_true_tombstones_items_via_dialog`）+ dialog cascade（`test_dialog_delete_cascades_items_via_pg_fk`，验证 PG 层 ON DELETE CASCADE 真触发）+ 跨 user 不能跨删
+  - **测试**：`tests/e2e/stage4/items-realtime.spec.ts` ~5 case：① ws 双 tab 小 inline item put / update / delete realtime 同步（与 dialogs case1 同模板）；② ws 双 tab 100KB ref attachment：A 写入 → blob-client 走 ref → B realtime 收到 → `materializeAttachment` 还原 → contentBuffer bytes 字节级一致；③ workspace delete cascade：A 删 workspace → B 收到一组 dialogs + items tombstone events → IndexedDB 清空；④ providers-rest profile 无 realtime 刷新仍同步；⑤ baseline profile 走 dexie（4.9 删除）。**故障注入**（必须真跑红一次再绿）：跑 case2 时把 `items.server.ts` 的 `materializeAttachment` 注掉一次，验证 stdout 报"contentBuffer bytes mismatch / B got undefined while A had ArrayBuffer(102400)"；恢复后绿
+  - **避坑**：见 2026-05-03 修订记录尾的避坑段（不要拷 avatarImages 模板 / 不要在 PG 拆 attachment 列 / `serializeAttachment` 是 async 走网络 / `materializeAttachment` 失败容忍 / cascade 共用 cascade_version）
 
 - **批次-4d · `artifacts`**（依赖 Stage 4 硬前置 2 对象存储 + cursor 分页）
   - schema 决策：内容字段大小阈值 → ≥ 64KB 走对象存储 ref；`workspaceId` / `dialogId` 双 FK
@@ -827,7 +855,7 @@ interface AuthSource {
   - 测试输出：`pnpm test:api` 132 passed ~90s（117 → 132，+15）；`pnpm test:e2e` 72 passed / 264 skipped ~5 min（68 → 72，+4 含 4b 1 case × 4 profile 切片实跑）
   - 红测验证（api）：在 `routers/workspaces.py::delete_workspace` 把 `if cascade:` 临时改为 `if False and cascade:` 关掉级联分支，3 个 cascade 相关 case 红、stdout 准确报 `assert by_id['d1']['deleted'] is True → AssertionError: d1 still alive: {'id': 'd1', ..., 'deleted': False, 'data': {...}}`；恢复后绿
   - 红测验证（e2e）：在 `dialogs.server.ts` 的 realtime subscribe 回调里把 put / delete 分发注释掉，case1/case2 红、stdout 报 `row dialogs/dlg-xxx did not converge within 1500ms (A={"id":"dlg-xxx","name":"d1",...} B=undefined)`；恢复后绿。注意：build profile cache 不感知工作树 diff，红测后必须 `rm -rf tests/.builds/realtime-ws` 才能让新版代码进 bundle
-- 批次-4c (`items`)：⏳ 未开
+- 批次-4c (`items`)：⏳ 未开 · **依赖硬前置 2 BlobStore（已落地）**+ FK→dialogs；items 是消息附件载体，contentBuffer 走 blob-client `serializeAttachment` 64KB 阈值分流（详见 2026-05-03 修订 + 4c schema 决策段）
 - 批次-4d (`artifacts`)：⏳ 未开 · 依赖 Stage 4 硬前置 2 对象存储完成 + 硬前置 1 cursor 分页落地
 - 批次-4e (`messages`)：⏳ 未开 · 依赖 Stage 4 硬前置 1 cursor 分页 + 硬前置 2 对象存储全部完成
 
