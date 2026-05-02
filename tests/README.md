@@ -78,13 +78,9 @@ profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 
 ## 4. 已知预期红（spec-first）
 
-| Spec | Case | 红的原因 | 转绿条件 |
-|---|---|---|---|
-| `step4-providers-realtime.spec.ts` | `case1 ws double-tab` | Stage 2 Step 4 未实现：`providers.server.ts.observeList()` 还没接 `RemoteSyncSource` | cloud-sync-migration plan Stage 2 Step 4 落地 |
-| `step4-providers-realtime.spec.ts` | `case2 ws reconnect catch-up` | 同上 | 同上 |
-
-这两个是 `plans/test-infrastructure.md` Phase 5 的 spec-first 设计 ——
-代码先写 spec，红的输出本身是 Step 4 「未做」的实证。其它 case 全绿。
+当前无已知预期红。Phase 5 的 step4 case1 / case2 已随 cloud-sync-migration
+plan Stage 2 Step 4 落地转绿（providers.server.ts 接到 RemoteSyncSource）。
+`pnpm test:api && pnpm test:e2e` 一把全绿。
 
 ---
 

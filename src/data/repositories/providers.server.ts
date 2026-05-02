@@ -1,7 +1,9 @@
 import type { Table } from 'dexie'
 import { db } from 'src/utils/db'
+import { RealtimeTransport } from 'src/utils/config'
 import type { CustomProvider } from 'src/utils/types'
 import { http, HttpError } from '../http'
+import { realtime } from '../realtime-ws'
 import type { QuerySpec, Repository } from '../types'
 import { createDexieRepository } from './dexie'
 
@@ -17,6 +19,34 @@ interface ProviderRow {
 // will replace polling and reset this on reconnect.
 let lastVersion = 0
 let inflight: Promise<void> | null = null
+
+// Stage 2 / Step 4: server-driven cache writes. Subscribed once per page on
+// first observe call; events from the WS broker mirror into db.providers, and
+// liveQuery turns the IDB write into a UI refresh. Guarded by RealtimeTransport
+// so the providers-rest profile (no transport) stays purely pull-based.
+let realtimeUnsubscribe: (() => void) | null = null
+
+function ensureRealtimeSubscription(): void {
+  if (RealtimeTransport !== 'ws') return
+  if (realtimeUnsubscribe) return
+  // Server emits the full ProviderRow envelope as `row`, mirroring what
+  // `GET /api/v1/providers` returns. Unwrap to `row.data` so the cache stays
+  // in CustomProvider shape — same contract as `pull()` above.
+  realtimeUnsubscribe = realtime.subscribe<ProviderRow>('providers', (e) => {
+    void (async () => {
+      try {
+        if (e.op === 'delete') {
+          await db.providers.delete(e.id)
+        } else if (e.op === 'put' && e.row && e.row.data) {
+          await db.providers.put(e.row.data)
+        }
+        if (e.rev > lastVersion) lastVersion = e.rev
+      } catch (err) {
+        console.warn('[providers.server] realtime apply failed', err)
+      }
+    })()
+  })
+}
 
 async function pull(): Promise<void> {
   if (inflight) return inflight
@@ -139,9 +169,19 @@ export const serverProvidersRepository: Repository<CustomProvider, string> = (()
     },
 
     // Observers ride on Dexie's liveQuery — server writes mirror to db.providers
-    // above, so subscribers see updates without extra wiring.
-    observeList: cache.observeList,
-    observeFind: cache.observeFind,
-    observeOne: cache.observeOne
+    // here, plus the WS subscription started below pushes remote events into
+    // the same cache, so subscribers see live updates without extra wiring.
+    observeList: ((options) => {
+      ensureRealtimeSubscription()
+      return cache.observeList(options)
+    }) as typeof cache.observeList,
+    observeFind: ((spec, options) => {
+      ensureRealtimeSubscription()
+      return cache.observeFind(spec, options)
+    }) as typeof cache.observeFind,
+    observeOne: ((id, options) => {
+      ensureRealtimeSubscription()
+      return cache.observeOne(id, options)
+    }) as typeof cache.observeOne
   }
 })()

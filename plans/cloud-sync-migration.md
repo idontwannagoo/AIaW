@@ -12,6 +12,19 @@
 
 ## 修订记录
 
+- **2026-05-02 · Stage 2 / Step 4 落地**
+  - **背景**：Phase 5 在 Step 4 代码缺位时已将 4 条通过判据沉淀为 `tests/e2e/stage2/step4-providers-realtime.spec.ts`（spec-first：case1 / case2 在 realtime-ws profile 下 spec-first 红、case3 / case4 绿）。本次按 plan 把 `providers.server.ts.observeList()` 接到 `RemoteSyncSource`，并把 `REALTIME_TRANSPORT` env 暴露到 `src/utils/config.ts`。
+  - **变更**：
+    - `src/utils/config.ts`：新增 `RealtimeTransport`（trim 后字符串），Step 4 仅识别 `'ws'`，`'sse' / 'poll' / 'auto'` 留给 Step 5。
+    - `src/data/repositories/providers.server.ts`：模块级 `realtimeUnsubscribe` + `ensureRealtimeSubscription()`，第一次 `observeList / observeFind / observeOne` 调用时 lazy 启动 `realtime.subscribe<ProviderRow>('providers', ...)`；handler 把 server 的 `ProviderRow` envelope 解包到 `e.row.data` 写回 `db.providers` cache（`pull()` 同款解包契约），同步 `lastVersion`。订阅 idempotent，整个页面生命期一份。
+    - flag 守卫：`RealtimeTransport !== 'ws'` 时 `ensureRealtimeSubscription()` early return → providers-rest profile 不会建 WS（保留 case3 期望）；baseline 走 dexie repo，Step 4 代码不被加载（保留 case4 字节级一致）。
+  - **影响范围**：
+    - 落地后 `pnpm test:e2e -g step4` 4 case 全绿（case1 1.6s / case2 31.5s 含 30s 离线窗 / case3 3.5s / case4 1.6s）；`pnpm test:api` 33 / 33 仍绿；整套 `pnpm test:e2e` 13 passed / 26 skipped / 0 failed。
+    - `tests/README.md` §4「已知预期红」清空 step4 case1 / case2 行（预期红已转绿）。
+    - my-deploy 默认 `REALTIME_TRANSPORT=` 为空，行为字节级等同 Stage 1 收尾；Northflank 控制台开 `REALTIME_TRANSPORT=ws` 灰度即可启用。
+  - **避坑（落地踩过 + 修了的）**：
+    - ① **server WS event 的 `row` 字段是完整 `ProviderRow` envelope，不是 unwrap 过的 `CustomProvider`**（`src-backend/data/routers/providers.py::_to_event` 写明了）。最初 handler 直接 `db.providers.put(e.row)` 让 B 端 IDB 存了 envelope，case1 expectRowSync 输出 A=unwrap / B=envelope 不一致。改为 `db.providers.put(e.row.data)` 与 `pull()` 同款解包契约后转绿。
+    - ② **build cache key 含 git rev 但不含工作树 diff**：未提交的源代码改动 cache 命中旧产物，跑出来的 spec 仍然红。需要 `rm -rf tests/.builds/<profile>` 强制 rebuild，或先 commit 让 git rev 推进。Step 5 / 后续 Step 落地时同样需要注意。
 - **2026-05-01 · 鉴权方案变更**
   - **背景**：原 Stage 1 假设可走「JWKS 桥接」——后端拉 Dexie Cloud 的 `/.well-known/jwks.json` 本地验签 token。实测 Dexie Cloud **未公开 JWKS、也无 token introspection 端点**（仅暴露 `/token` + `/sync`），桥接路径不可行。
   - **结合多用户目标**：「解码不验签 Dexie JWT」只能撑单用户多账号、对真实多用户场景是裸奔，不可接受。
@@ -71,7 +84,8 @@
     - Stage 1 Step 2 soft-delete tombstone（DELETE 后 list 仍出 `deleted:true,data:null`） ✅
     - Stage 2 Step 1 WS 账号隔离（A 订阅时 B 的 PUT 不进 A 频道） ✅
     - Stage 2 Step 1 心跳超时（25s ping + 10s 无 pong → 35s server close） ✅
-  - 下一步：场景 B（断网重连）/ 场景 C（4001 + refresh + 重连）按 plan 仍需浏览器手测，本次跳过；进 Step 4 把 `providers.server.ts` 接到 `RemoteSyncSource`。
+  - **Stage 2 / Step 4**（`providers.server.ts.observeList()` 接 `RemoteSyncSource` + `RealtimeTransport=ws` 守卫）✅ — `pnpm test:e2e -g step4` 4 case 全绿（case1 1.6s / case2 31.5s / case3 3.5s / case4 1.6s）；详见修订记录 2026-05-02 · Stage 2 / Step 4 落地
+  - 下一步：进 Step 5（SSE / poll 降级路径），按 plan 在落地 PR 内同步落 `playwright.config.ts` 三新 profile + `tests/env/.env.test.realtime-{sse,poll,auto}` + `tests/e2e/stage2/step5-transport-degradation.spec.ts` + `tests/api/test_realtime_sse.py`。
 
 ---
 

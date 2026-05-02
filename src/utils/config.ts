@@ -18,6 +18,9 @@ export const BackendDataTables = new Set(
 // literal `true` (see @quasar/app-vite/lib/utils/env.js), so `=== 'true'`
 // would always be false. Coerce so both inlined boolean and string forms work.
 export const BackendAuth = String(process.env.BACKEND_AUTH) === 'true'
+// Stage 2: 实时通道传输形态。Step 4 仅识别 'ws'；'sse' / 'poll' / 'auto' 留给 Step 5。
+// 空字符串 = 关闭实时通道，写入靠下一次 list() / 刷新拉取（Stage 1 行为）。
+export const RealtimeTransport = (process.env.REALTIME_TRANSPORT ?? '').trim()
 export const LitellmBaseURL = process.env.LITELLM_BASE_URL
 export const BudgetBaseURL = process.env.BUDGET_BASE_URL
 export const SearxngBaseURL = process.env.SEARXNG_BASE_URL
