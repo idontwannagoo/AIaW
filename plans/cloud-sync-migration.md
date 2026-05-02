@@ -12,6 +12,46 @@
 
 ## 修订记录
 
+- **2026-05-02 · 服务端 Import Job 设计敲定（导入导出 only 路径的实现层 + 部署拓扑澄清）**
+  - **背景**：「导入导出 only」方向定下后进入实现层评估。原描述里浏览器端跑全套 import（parse → 写 IndexedDB → push backend → 上传 attachment）对低端设备 / 弱网 / 长时操作不友好——270MB JSON 在浏览器里 parse 容易 OOM、上传几十分钟期间 tab 不能关、attachment 串行上传慢、断网后状态全丢。结合 Stage 4 硬前置已规划对象存储 + multipart endpoint，决定按 SaaS 行业标准实践把整个 import 工作搬到 server 端：浏览器只负责把 JSON 文件 5MB 切片直传对象存储（pre-signed S3 multipart），其余阶段（解析 / 分表写入 / attachment 处理）全部由 backend 后台 worker 跑，用户上传完即可关 tab，状态通过 WS 推进度。同时新设备首屏走 `GET /api/v1/bootstrap` 一次返回所有小表的全量，避免渐进填充式空白。部署拓扑同步澄清：旧版独立实例保留兜底，新版独立实例承载全量 backend；一段时间后旧版下线。
+  - **变更**：
+    - 新增 **Stage 4.5「服务端 Import Job + 新设备首屏 bootstrap」段**，介于 Stage 4 与 Stage 5 之间，含 8 个 Step：① ImportJob 模型 + Phase A 解析骨架；② S3 multipart 上传 5 个 endpoint；③ Phase B 结构表写入；④ Phase C messages 文字写入；⑤ Phase D attachments → 对象存储；⑥ WS 进度推送 + 状态持久化；⑦ 前端 ImportDataDialog 重写 + 上传切片 helper；⑧ `GET /api/v1/bootstrap` endpoint + 首屏路由 guard
+    - 「现有用户数据迁移」章节扩写：增加 200MB 用户完整时序表（4 phase + 可关 tab 节点 + UI 可用节点）+ 多设备协调说明 + 失败回退路径，引用 Stage 4.5 实现
+    - 「跨版本导入/导出兼容」章节同步：明确**新版 import 不再写客户端 IndexedDB**，由 Stage 4.5 worker 写 PG → realtime 推送 → IndexedDB 自然填充；export 流程保持客户端跑（含对象存储 ref → base64 桥接），是因为 export 是用户主动行为且数据流向反过来，server-side 化收益不抵复杂度
+    - Stage 5 顶部补一句「依赖 Stage 4.5 完成」：dexie-cloud-addon 卸载前提是老用户已有可用迁移路径
+    - **测试脚手架增量**（与 test-infrastructure plan Phase 7 同步）：
+      - `docker-compose.test.yml` 加 MinIO 服务（端口 9100，作为 BlobStore S3 后端）
+      - 新 profile：`import-job` → 9015 → `tests/env/.env.test.import-job`（启用 `IMPORT_JOB_ENABLED=true` + `BLOB_STORE_KIND=s3` + MinIO endpoint）
+      - 新 helper：`tests/e2e/helpers/import-job.ts`（封装 multipart upload + 状态订阅 + phase 等待）
+      - 新 fixture：`tests/api/fixtures/dexie_export.py`（生成 small / medium / large / huge 四档 `aiaw_user_db.json`，huge = 200MB）
+      - 各 Step「通过判据」按 Phase 6 守则配套 pytest + playwright case，全部沿 plan 现有 `- api:` / `- spec:` 引用格式
+    - 部署拓扑澄清写进 Stage 0 与 Stage 4.5 上线策略段：旧版（Dexie Cloud SaaS）独立实例不下线作为回退；新版（自家 backend）独立实例承载全量 stage 1+；用户主动迁移；旧版下线时机由实际迁移率决定（建议 active 用户 ≥ 80% 迁完后宣告 6 周下线窗）
+  - **影响范围**：
+    - Stage 4.5 落地后老用户迁移路径完整可用；Stage 5 仅做 dexie-cloud-addon 卸载 + deprecated 代码清理（~150 行），不再有任何"过渡 UI"工作
+    - 客户端工作量大幅降低：浏览器侧只剩「文件切片上传 + 状态订阅 + bootstrap 拉取」三件事，约 250 行
+    - 服务端工作量集中在 Stage 4.5：~800 行（worker ~500 + imports router ~200 + bootstrap router ~100）+ 1 个 alembic migration
+    - 测试新增：~25 个 pytest case + ~10 个 playwright case；MinIO 容器加入 `pnpm test:up`
+    - 200MB 老用户感知"卡住"时间从 30-60 分钟降到 3-10 分钟（仅上传阶段需要浏览器在线）
+    - 部署侧需要对象存储（R2 / S3 / MinIO 任选），plan 此前已规划在 Stage 4 硬前置；Stage 4.5 只复用同 bucket 的 `imports/<user>/<job_id>.json` 前缀，TTL 7 天自动清
+  - **维护后续**：本修订记录落地后 plan 主体按 8 个 Step 同步；test-infrastructure plan Phase 7+ 需要按这里新增 helper / profile / fixture 同步更新「helper ↔ plan 词汇表」+「端口表」+「已知预期红」段
+- **2026-05-02 · 迁移路径转向：导入导出 only + 对象存储升格为 Stage 4 硬前置**
+  - **背景**：复盘 200MB 老用户场景（messages + 大量内联 base64 attachments / artifacts）后识别到现 plan「客户端驱动一次性 push」路径在三处暴露结构性瓶颈：① WS event payload 带完整 row → broker `maxsize=200` 队列在大行场景秒爆；② `?since=N` 全 row 返回 → 客户端 fetch 几十 MB 卡死；③ Postgres TEXT 列存 base64 attachments → 表线性膨胀、`vacuum` / 备份 / 慢查询全受影响。同时 plan 全文未涉及对象存储设计，是当前最大盲区。结合已有的 `dexie-export-import` 跨版本互通格式（`aiaw_user_db.json`，base64 内联，旧版自然识别），转向「导入导出 only」迁移路径在 UX 可控性 / 实现复杂度 / 回滚安全性三方面都更优——失败回退 = 用回旧版 URL，零数据风险。决策：双写窗口 + 客户端一次性 push 机制整体砍掉；对象存储从盲区升格为 Stage 4 硬前置。
+  - **变更**：
+    - 「现有用户数据迁移」整章删除「客户端驱动一次性 push」机制（迁移标记表 / `GET /api/v1/migrate/status` / 双写窗口决策 / 多设备 push 协调全部不再需要），整章重写为「老用户在旧版 ExportDataDialog 导出 `aiaw_user_db.json` → 在新版 ImportDataDialog 导入」单一路径；新版默认不挂 `dexie-cloud-addon`，老用户不动可继续用旧版直到主动迁移
+    - Stage 1.5 的 `users.linked_dexie_email` 列 + UNIQUE 约束 + `POST /api/v1/auth/link-dexie` endpoint + 前端首次登录调用逻辑 + `tests/api/test_auth.py::test_link_dexie_first_write_wins` 标记 deprecated（属于「双写窗口期把 backend 账号 ↔ Dexie email 对齐」的辅助机制，导入导出方案下不再需要）；已落地代码不立刻删，等 Stage 5 一起清，避免 in-flight Stage 2 Step 6 上线带飞
+    - 已知问题 #2 修复引入的 `unsyncedTables` 计算 + `src/data/server-tables.ts` 同样标记 deprecated，Stage 5 一起清；过渡期保留无副作用
+    - Stage 4 顶部新增「硬前置」段：① 大行传输协议改造（WS event 仅带 `{id, rev}` 通知，业务 row 走 REST 按需拉；`?since=` 加 `limit` + cursor 续拉，避免单响应几十 MB）；② 对象存储分流（B 方案——客户端附件 < 64KB inline 进 PG，≥ 64KB 走 multipart 上传 `/api/v1/blobs` 拿 ref，PG 行只存 `{type:'ref', url, sha256, size}`，客户端 IndexedDB 缓存仍可保留 Blob 让 UI 透明）；两条均为 messages / artifacts server.ts 落地前的硬前置，不可后置
+    - 「跨版本导入/导出兼容」段补「对象存储桥接」子段：导出时新版主动 fetch 所有 ref blob → 重新 base64 内联 → JSON 字节级对齐旧版格式；导入时新版检测 base64 blob → 按 64KB 阈值上传 S3 / 留 inline → 改写行字段。**对外格式纪律**：导出 JSON 永远 base64 内联，绝不出现 `{type:'ref', url}` 字段（避免旧版导入看到坏链接）
+    - Stage 5 简化：删去「拆掉双写窗口最后一块」表述（从未有过双写窗口）、删去「清理 UI 上的双入口回归单入口」过渡 UI（从未有过双入口）、删去 `LEGACY_DEXIE_CLOUD=true` 回滚 flag 设计（导入导出方案下回滚 = 用回旧版部署，addon 重挂场景不存在）；Stage 5 收窄为「卸载 `dexie-cloud-addon` + 一次性清理 deprecated 代码（~150 行）+ 验证 ImportDataDialog 在 addon 摘除后仍能读 `aiaw_user_db.json`」
+    - 端到端验证策略表 Stage 5 行的「全新设备首次登录 + 卸载重装」补一句「+ 旧版导出 → 新版导入往返字节一致（含对象存储桥接路径）」
+  - **影响范围**：
+    - 已落地代码浪费量化：`linked_dexie_email` 列 + endpoint + 前端调用 ≈ 90 行，`unsyncedTables` + `server-tables.ts` ≈ 40 行，`tests/api/test_auth.py::test_link_dexie_first_write_wins` ≈ 20 行；合计 ~150 行，Stage 5 阶段一次性删
+    - 已落地代码 95%+ 复用：Repository 抽象 / JWT 鉴权主体 / providers REST / broker / WS / SSE / poll / auto-router / 全套 spec 与脚手架在新方案下零修改
+    - Stage 2 Step 6 收尾路径不受影响，按原计划合 my-deploy（flag 默认关，对线上零感知）
+    - Stage 3 不再需要 per-table 迁移机制 ceremony，每张表节奏更轻：SQLModel + router + alembic + flag。老用户的旧表数据在新版里默认空，需要导入才出现
+    - Stage 4 工作量重新分布：新增对象存储 backend `/api/v1/blobs` + 客户端 multipart helper ≈ 1–2 周；大行协议改造 ≈ 3–5 天；ExportDataDialog / ImportDataDialog 桥接 ≈ 3–5 天。砍掉的「客户端驱动 push 机制 + 进度 UI + 断点续传 + 多设备协调」工作量 ≈ 2–3 周，净额持平偏简化
+    - 用户分群清晰：不愿动的老用户继续用旧版（旧 Dexie Cloud 部署不下线），愿意迁的主动走 export → import，不存在被动遭遇 bug 的中间态
+  - **维护后续**：本条修订记录落地后 plan 正文按上面 6 条同步修订；已落地代码的清理工作（~150 行）合并到 Stage 5 PR 一起做，单独提 PR 没必要；后续 Step 落地不再向 deprecated 段落填新内容
 - **2026-05-02 · Stage 2 / Step 5 落地**
   - **背景**：Step 4 完成后客户端只有 WS 一种 transport。Step 5 加 SSE / poll 降级路径 + auto 自动选档，让代理 / NAT / 公司网络拒 WS upgrade 时仍能走最低保证最终一致。spec 在 Phase 6 落地（5 个 pytest case + 4 个 playwright case），代码缺位时 case2 poll / case3 / case4 spec-first 红（5 个 SSE pytest 全 404）。
   - **变更**：
@@ -296,6 +336,15 @@ interface AuthSource {
 ---
 
 ### Stage 1.5 — 自家鉴权（多用户 Ready）
+
+> **⚠️ 部分内容已 deprecated（2026-05-02 · 迁移路径转向）**：本段中以下与「双写窗口 / Dexie 账号关联」相关的设计在导入导出 only 路径下不再需要，但已落地代码不立刻删，等 Stage 5 一起清：
+> - `users.linked_dexie_email` 列 + UNIQUE 约束 + alembic migration
+> - `POST /api/v1/auth/link-dexie` endpoint + `tests/api/test_auth.py::test_link_dexie_first_write_wins`
+> - 前端首次登录调 `link-dexie` 的逻辑
+> - 「与 Dexie Cloud 共存策略（双写窗口）」整段
+> - 「用户身份关联（为后续数据迁移铺路）」整段
+>
+> 鉴权主体（用户表 / refresh token / JWT 签验 / register / login / refresh / logout / me / `BackendAuthSource`）保持有效，是后续所有 stage 的基础。
 
 **目标**：上线一套自家管控的多用户鉴权，作为后续所有 `/api/v1/*` 端点的统一身份来源。Stage 5 不再需要做"切换鉴权"。
 
@@ -590,6 +639,8 @@ interface AuthSource {
 
 **目标**：先搬无 join、无级联的表。`reactives` 特殊：是 `persistentReactive('#user-data', …)` 的底层，需要 KV 形 endpoint，让 `persistent-reactive.ts` 透明走 `repos.reactives.observeOne(key)` / `put({key,value})`。
 
+**老用户旧数据怎么办**（2026-05-02 修订记录）：**不走 per-table 自动迁移**。新版默认不挂 `dexie-cloud-addon`，老用户在新版里旧表起步即空；要把旧数据带过来必须主动走「旧版 ExportDataDialog → 新版 ImportDataDialog」。具体细节见「现有用户数据迁移」段与「跨版本导入/导出兼容」段。本 stage 不需要任何「客户端驱动 push」/「迁移标记表」/「`/api/v1/migrate/status`」机制。
+
 **每张表节奏**：SQLModel + router + Alembic migration + 一个 PR + flag 翻一张。
 
 **验证**：每张表独立验证 — UI 增改删 → 第二 tab 实时更新 → 服务端行匹配 → IndexedDB 缓存被回填。跑一次 `ExportDataDialog` / `ImportDataDialog`，确认 `db.tables` 枚举仍能导出（缓存仍然完整）。
@@ -602,100 +653,426 @@ interface AuthSource {
 
 **目标**：搬级联删除集群（`stores/workspaces.ts` 里的 `db.transaction` 是最难的一处）。
 
-**后端**：`DELETE /api/v1/workspaces/:id?cascade=true` 在单个 Postgres 事务里完成级联；为 dialog 删除提供同款。`GET /api/v1/messages?dialogId=…&since=…` 让 `DialogView.vue` 的滚动加载继续可行。
+#### 硬前置（2026-05-02 新增）
+
+**messages / artifacts 走的不是 providers / assistants 那种小行 schema**——单条 message 可能携带几 MB 的 base64 attachment（受 `MAX_MESSAGE_FILE_SIZE_MB` 上限），单用户 messages 表行数轻易上万。沿用 Stage 1–3 的协议会在三处崩：① WS event 带完整 row → broker `maxsize=200` 队列在大行场景秒爆；② `?since=N` 全 row 返回 → 客户端 fetch 几十 MB 卡死；③ Postgres TEXT 列直接存 base64 → 表线性膨胀、`vacuum` / 备份 / 慢查询全受影响。messages / artifacts server.ts 落地前必须先做完下面两件事，不可后置。
+
+**前置 1：大行传输协议改造**
+
+- WS event payload 改为 `{table, op, id, rev}` only —— 不再带 `row` 字段。客户端拿到 event 后调 `GET /api/v1/<table>/<id>` 按需拉具体 row（命中 IndexedDB 缓存 + If-None-Match `rev` ETag 时 server 返 304）
+- `?since=N` 加 `?limit=200` + cursor 续拉：单次响应硬上限（如 1MB），返回 `{rows, next_cursor}`，客户端拿 `next_cursor` 续拉直到空
+- 仅 messages / artifacts 走新协议；providers / assistants 等小表保持原 envelope（避免无谓回归风险）。`src-backend/data/routers/<table>.py::_to_event` 与前端 `realtime.ts` dispatcher 加 per-table `payloadMode: 'inline' | 'notify-only'` 配置位
+- **通过判据**（待 spec 落地）：
+  - api: 单条 5MB attachment 的 message PUT 后 WS event 字节数 < 1KB；客户端用 event.id 调 GET 能拿回完整 row
+  - api: 单用户 1 万条 messages，`?since=0&limit=200` 第一次响应 < 1MB，`next_cursor` 非空；循环续拉总共 ≥ 50 次拉完
+  - spec: 双 tab 跨设备 message put → 另一 tab 在 500ms 内 UI 出现新行（含 attachment 渲染）
+  - spec: broker 1 个 user 100 条 5MB messages 连续 PUT，server RSS 涨幅 < 50MB（验证 notify-only 不让 broker 吞 row 字节）
+
+**前置 2：对象存储分流（B 方案）**
+
+- 阈值常量 `BLOB_INLINE_MAX_BYTES=65536`（64KB）。客户端 attachment 序列化时：
+  - `< 64KB` → 保持 base64 内联在 row 字段，与现状一致
+  - `≥ 64KB` → multipart POST `/api/v1/blobs` 上传，server 计算 sha256 + 写对象存储 → 返回 `{type:'ref', url, sha256, size, content_type}`，客户端把 row 里对应字段替换为该 ref 对象后再 PUT 到对应 endpoint
+- 后端 `/api/v1/blobs`：
+  - 接 multipart upload；按 `(user_id, sha256)` 去重（同一文件多用户互不可见，但单用户内幂等）
+  - 对象存储抽象 `BlobStore` 接口，先实现 `S3BlobStore`（兼容 R2 / MinIO / AWS S3），env 配置 `BLOB_STORE_KIND=s3` + `BLOB_STORE_BUCKET` + `BLOB_STORE_ENDPOINT` + `BLOB_STORE_ACCESS_KEY` + `BLOB_STORE_SECRET_KEY`；本地开发 / 测试默认 `BLOB_STORE_KIND=local-fs`（落到 `src-backend/.blob-store/<sha256>` 目录）
+  - 返回的 `url` 是 pre-signed GET URL，TTL 1h；客户端读 ref 时直 GET，不经 backend 回源
+  - DELETE row 时不立即 delete blob（多 row 可能引用同 sha256）；用周期 GC job 扫 `(blob, refcount)`，refcount=0 且超过 7 天再删
+- 客户端读路径：`<table>.server.ts` 拉到 row 后遇到 `{type:'ref', url}` 字段，下载 blob 写入 IndexedDB 缓存（保持现有 Blob 对象形态），UI 透明无感
+- 客户端 IndexedDB 仍可缓存 Blob（不强制 ref 化），让离线读路径不变
+- **通过判据**（待 spec 落地）：
+  - api: PUT 5MB attachment → server PG row 里 attachment 字段是 `{type:'ref', url, sha256, size}`，对象存储里 `<sha256>` 文件存在
+  - api: 同一 sha256 第二次上传去重（PG `blobs` 表行不增，对象存储不重复写）
+  - api: 64KB 边界 → < 64KB inline 进 PG，= 64KB 走对象存储
+  - spec: client 端 PUT message with 5MB attachment → 第二 tab 收到 event → GET row → 通过 ref URL 下载 blob → UI 渲染 attachment，端到端 < 5s
+  - spec: 客户端 IndexedDB 清空后刷新 → ref blob 重新从对象存储拉回 → UI 一致
+
+#### 主体迁移工作
+
+**后端**：`DELETE /api/v1/workspaces/:id?cascade=true` 在单个 Postgres 事务里完成级联；为 dialog 删除提供同款。`GET /api/v1/messages?dialogId=…&since=…&limit=200` 让 `DialogView.vue` 的滚动加载继续可行（注意：`since` + `limit` 走前置 1 的 cursor 协议）。
 
 **前端**：`runTx()` 对这些表走新的 `repos.batch(operations)` → `/api/v1/batch`；尚未迁移的表仍走 `db.transaction`。
 
-**验证**：删除一个含多 dialog/messages/artifacts 的工作区 → 服务端清空 → 清空 IndexedDB 后刷新仍正确。
+**验证**：删除一个含多 dialog/messages/artifacts 的工作区 → 服务端清空（含对象存储 ref 的 refcount 减 1）→ 清空 IndexedDB 后刷新仍正确。
 
-**回滚**：flag 翻回；id 稳定，级联幂等。
+**回滚**：flag 翻回；id 稳定，级联幂等。对象存储的孤儿 blob 留给周期 GC，不影响数据正确性。
 
 ---
 
-### Stage 5 — 摘除 `dexie-cloud-addon`
+### Stage 4.5 — 服务端 Import Job + 新设备首屏 bootstrap
 
-**目标**：拆掉双写窗口最后一块。鉴权早在 Stage 1.5 已经全部走 `BackendAuthSource`，本阶段只负责清理 dexie-cloud 残留。
+**目标**：把"现有用户数据迁移"从浏览器端密集型工作搬到 server 端。浏览器只负责把 `aiaw_user_db.json` 5MB 切片直传对象存储；其余阶段（解析 / 分表写入 / attachment 处理）由 backend 后台 worker 跑，用户上传完即可关 tab，状态通过 WS 推进度。同步加 `GET /api/v1/bootstrap` 解决新设备首次登录的渐进填充式空白问题。
+
+**前置**：Stage 4 硬前置已落地（对象存储 BlobStore + `/api/v1/blobs` + 客户端 multipart helper），messages / artifacts 表已切到 server 端。
+
+#### 架构总览
+
+```
+浏览器                                          backend                          对象存储
+───────                                        ─────────                        ─────────
+ImportDataDialog
+ ├ POST /api/v1/import/jobs                    创建 ImportJob 行
+ │   ◀── {job_id, multipart_upload_id} ──                                         │
+ ├ for each 5MB slice:                                                            │
+ │  POST /api/v1/import/jobs/{id}/parts/{n}                                       │
+ │   ◀── pre-signed PUT URL ──┐                                                   │
+ │                            └─── PUT slice ──────────────────────────────────► │
+ ├ POST /api/v1/import/jobs/{id}/complete       complete multipart                │
+ │                                              ───────────────► assemble ◀──────│
+ │                                              触发 asyncio worker
+ └ 关 tab 走人 / 或继续订阅状态
+                                                Phase A · ijson 流式 parse ◀─────│
+                                                Phase B · INSERT 结构表
+                                                Phase C · INSERT messages 文字
+                                                Phase D · 提取 attachment ────► │
+                                                每完成 phase publish WS event
+
+任意设备
+ realtime.subscribe('import_jobs', cb)
+   收到 phase change → 更新 banner
+   Phase B 完成 → workspaces 出现
+   Phase C 完成 → message 文字可读
+   Phase D 完成 → attachment 全齐
+```
+
+> **执行顺序**：Stage 4.5 内部分 8 个 Step。
+> **Step 1 → Step 2 → Step 3 → Step 4 → Step 5 → Step 6 → Step 7 → Step 8 → Stage 5**
+>
+> **上线策略**：与 Stage 1/2 同款"上线但不启用"。后端 ImportJob worker 由 `IMPORT_JOB_ENABLED` env flag 守卫；前端 ImportDataDialog 按钮可见性由 `IMPORT_JOB_ENABLED` 同名 env 控制。两边都关 → ImportDataDialog 隐藏 + worker 不启动；两边都开 → 完整迁移路径上线。
+>
+> **部署拓扑**：旧版（Dexie Cloud SaaS）独立实例不下线作为兜底；新版（自家 backend）独立实例承载全量 stage 1+ 功能；用户主动从旧版导出 → 在新版导入。一段时间后（建议 active 用户 ≥ 80% 迁完后）宣告 6 周下线窗，到期关闭旧版实例。
+
+#### Step 1 — ImportJob 模型 + 后端 worker 骨架 + Phase A 解析
+
+**做什么**：
+- `src-backend/data/models/import_job.py`：`ImportJob(id UUID, user_id FK, status enum['queued'|'uploading'|'assembling'|'parsing'|'phase_b'|'phase_c'|'phase_d'|'done'|'failed'|'cancelled'], multipart_upload_id, raw_object_key, total_bytes, processed_bytes, total_rows, processed_rows, total_blobs, processed_blobs, error_message, dead_letter JSONB, created_at, updated_at)`
+- alembic migration：建表 + partial unique index `(user_id) WHERE status IN ('queued','uploading','assembling','parsing','phase_b','phase_c','phase_d')` 保证每用户同时只 1 个 active job
+- `src-backend/data/import_worker.py`：asyncio worker 框架，按 status 状态机推进；FastAPI 进程启动时 `asyncio.create_task` 起 worker 主循环，启动时扫一次所有 status 非终态的 active job 续跑（崩溃恢复）
+- Phase A 实现：用 `ijson` 流式解析对象存储里的 raw JSON → 验证 dexie-export-import 格式 → 提取 schema metadata → 按表分流写到本地临时 NDJSON 文件（`/tmp/import-<job_id>/<table>.ndjson`，避免 PG TEMP TABLE 内存压力）→ 累计 total_rows / total_blobs 写回 ImportJob → 状态转 phase_b
+- 全部由 `IMPORT_JOB_ENABLED` env flag 守卫的 lazy import（与现有 `BACKEND_DATA_API_ENABLED` 同款）
+
+**通过判据**：
+- api: `tests/api/test_import_job.py::test_phase_a_extracts_table_row_counts`（fixture small：10 providers + 5 dialogs，验证 total_rows 准确）
+- api: `tests/api/test_import_job.py::test_phase_a_streaming_memory_under_200mb`（fixture huge：200MB JSON，pytest 跑前后 RSS 差 < 200MB，slow mark）
+- api: `tests/api/test_import_job.py::test_phase_a_invalid_json_marks_failed`（损坏 JSON → status='failed' + error_message 非空）
+- api: `tests/api/test_import_job.py::test_active_job_unique_constraint`（同 user 创建第二个 active job → IntegrityError）
+- api: `tests/api/test_import_job.py::test_worker_recovers_active_job_on_startup`（手动插一行 status='parsing' → 重启 worker → job 状态正常推进）
+
+#### Step 2 — S3 multipart 上传 5 个 endpoint
+
+**做什么**：
+- `src-backend/data/routers/imports.py`:
+  - `POST /api/v1/import/jobs` → 创建 ImportJob (status=uploading) + 调 `BlobStore.create_multipart_upload(imports/<user>/<job_id>.json)` → 返回 `{job_id, multipart_upload_id}`
+  - `POST /api/v1/import/jobs/{id}/parts/{n}` → 校验 job ownership + status=uploading → 返回 pre-signed PUT URL (TTL 1h)
+  - `POST /api/v1/import/jobs/{id}/complete` → body 接收 client 提供的 `[{part_number, etag}]` 列表 → 调 `BlobStore.complete_multipart_upload` → 状态 uploading → assembling → queued → 写 raw_object_key → notify worker
+  - `GET /api/v1/import/jobs/{id}` → 返回当前状态 + 进度（`{status, phase, processed_rows, total_rows, processed_blobs, total_blobs, error_message}`）
+  - `GET /api/v1/import/jobs?status=active` → 返回当前用户 active job（如果有），用于多设备登录时显示状态
+  - `DELETE /api/v1/import/jobs/{id}` → 调 `BlobStore.abort_multipart_upload` + 已写入的行按 `(user_id, imported_from_job_id=job_id)` 标记软删（行加 `imported_from_job_id` 列，导入时 worker 写入）→ 状态转 cancelled
+- `BlobStore` 接口扩展（Stage 4 硬前置规划过）补 4 个 multipart 方法：`create_multipart_upload` / `generate_part_url` / `complete_multipart_upload` / `abort_multipart_upload`，3 种实现（local-fs / minio / s3）按 env `BLOB_STORE_KIND` 选
+
+**通过判据**：
+- api: `tests/api/test_imports_router.py::test_create_job_returns_job_id_and_multipart_upload_id`
+- api: `tests/api/test_imports_router.py::test_part_url_is_presigned_with_short_ttl`（断言响应 URL 包含签名参数 + Expires 在 ±5min 范围内）
+- api: `tests/api/test_imports_router.py::test_complete_with_all_parts_triggers_worker`
+- api: `tests/api/test_imports_router.py::test_complete_with_missing_parts_returns_400`
+- api: `tests/api/test_imports_router.py::test_get_job_returns_status_and_progress`
+- api: `tests/api/test_imports_router.py::test_get_active_jobs_returns_in_progress_only`
+- api: `tests/api/test_imports_router.py::test_delete_active_job_aborts_multipart_and_soft_deletes_imported_rows`
+- api: `tests/api/test_imports_router.py::test_user_b_cannot_access_user_a_job_returns_404`
+- api: `tests/api/test_imports_router.py::test_part_endpoint_rejects_when_job_not_in_uploading_status`
+
+#### Step 3 — Phase B 结构表写入
+
+**做什么**：
+- `import_worker.py` 增 phase_b：从 Phase A 输出的 NDJSON 读小表（按依赖顺序：providers / assistants / plugins / reactives / avatarImages / workspaces / dialogs metadata），按表 `INSERT ... ON CONFLICT (id) DO UPDATE WHERE existing.updated_at < incoming.updated_at`（LWW）
+- 复用现有各 router 的 SQLModel + bulk insert helpers（避免业务逻辑分裂）
+- 每行写入时附 `imported_from_job_id=<job_id>` + `imported_at=now()` 两列（所有 server-routed 表 alembic 加这两列；Stage 1-4 已落地的表按需 backfill NULL）
+- 每张表完成 `broker.publish(user_id, {table:'import_jobs', op:'put', id:job_id, row:{...latest envelope}})`
+- 状态转 phase_c
+
+**通过判据**：
+- api: `tests/api/test_import_phase_b.py::test_writes_workspaces_with_original_uuid`（fixture 含 3 workspaces，导入后 PG 直查 UUID 一致）
+- api: `tests/api/test_import_phase_b.py::test_writes_all_structural_tables_in_dependency_order`
+- api: `tests/api/test_import_phase_b.py::test_lww_skips_older_incoming_when_existing_newer`（先 PUT 一个 newer workspace，再导入 older → 跳过）
+- api: `tests/api/test_import_phase_b.py::test_imported_rows_tagged_with_job_id_and_timestamp`
+- api: `tests/api/test_import_phase_b.py::test_publishes_progress_event_per_table`
+- api: `tests/api/test_import_phase_b.py::test_phase_b_done_triggers_phase_c`
+
+#### Step 4 — Phase C messages 文字写入
+
+**做什么**：
+- `import_worker.py` 增 phase_c：流式遍历 `messages.ndjson`，每 500 行一批 `INSERT ... ON CONFLICT DO UPDATE`；attachment 字段按原 base64 inline 存进 PG 的临时区域（messages 行加 `_pending_blob_extraction BOOLEAN DEFAULT FALSE` 列，导入时含 attachment 的行标 true）
+- 进度按行报：每 500 行 `broker.publish` 进度事件（节流，避免 WS 风暴）
+- FK 约束：messages 必须 dialog 已写入。Phase B 已写 dialogs metadata，正常情况无孤儿；FK 失败的 row 进 `import_jobs.dead_letter` JSONB 字段，Phase D 跑完后重试一次（一般是依赖顺序错配的小概率边界）
+- 状态转 phase_d
+
+**通过判据**：
+- api: `tests/api/test_import_phase_c.py::test_writes_message_text_in_batches_of_500`（fixture 1500 messages，验证 PG 行数 1500 + 进度事件 ≥ 3 次）
+- api: `tests/api/test_import_phase_c.py::test_marks_pending_blob_extraction_for_messages_with_attachment`
+- api: `tests/api/test_import_phase_c.py::test_orphan_message_without_dialog_lands_in_dead_letter`
+- api: `tests/api/test_import_phase_c.py::test_progress_event_emitted_per_batch`
+- api: `tests/api/test_import_phase_c.py::test_phase_c_done_triggers_phase_d`（slow mark）
+- api: `tests/api/test_import_phase_c.py::test_lww_message_text_skip_when_existing_newer`
+
+#### Step 5 — Phase D attachments → 对象存储
+
+**做什么**：
+- `import_worker.py` 增 phase_d：扫 `messages WHERE _pending_blob_extraction=TRUE AND user_id=?`，逐条提取 attachment base64 字段
+- 对每个 attachment：解码 base64 → 算字节大小 → 按 `BLOB_INLINE_MAX_BYTES=65536` (64KB) 阈值判断
+  - `< 64KB` → 保持 inline 在 PG row 字段（Stage 4 大行协议规定，messages 表小附件 inline 与 server-side 协议一致）
+  - `≥ 64KB` → 计算 sha256 → 调 `BlobStore.put(sha256, bytes)`（同 sha256 已存在则去重不二次写）→ 改写 row 的 attachment 字段为 `{type:'ref', url, sha256, size, content_type}`
+- 4 路 `asyncio.Semaphore` 并发 + 重试 3 次（指数退避 1s/2s/4s）
+- 单条失败超过重试上限进 `import_jobs.dead_letter`；不阻塞整体 phase
+- 进度按 attachment 报：每 10 个完成 `broker.publish` 一次进度
+- 全部完成清 `_pending_blob_extraction` 标志 → 状态转 done → 清 `/tmp/import-<job_id>/` + 对象存储里的 raw upload (TTL 7 天 lifecycle rule 兜底)
+
+**通过判据**：
+- api: `tests/api/test_import_phase_d.py::test_attachment_under_64kb_stays_inline_in_pg`
+- api: `tests/api/test_import_phase_d.py::test_attachment_over_64kb_uploaded_to_blob_store_and_row_rewritten`（验证 PG row 字段是 `{type:'ref',...}`，BlobStore 里 `<sha256>` 文件存在）
+- api: `tests/api/test_import_phase_d.py::test_same_sha256_reuses_existing_blob_no_double_upload`
+- api: `tests/api/test_import_phase_d.py::test_failed_attachment_after_3_retries_lands_in_dead_letter`（mock BlobStore.put 抛错）
+- api: `tests/api/test_import_phase_d.py::test_phase_d_done_marks_job_done_and_clears_temp_files`
+- api: `tests/api/test_import_phase_d.py::test_concurrent_uploads_capped_at_4`（mock BlobStore.put 加 sleep + counter，验证峰值并发 = 4，slow mark）
+
+#### Step 6 — WS 进度推送 + 状态持久化（已在 Step 1-5 内分散实现，本 Step 做集成验证）
+
+**做什么**：
+- `import_jobs` 注册为 server-routed table（添加到 `SERVER_CAPABLE_TABLES`，但只读不允许 client 直接 PUT；写路径只有 worker）
+- `_to_event` 与 `_to_row` 沿用现有 envelope 契约（`{id, version, updated_at, deleted, data: <ImportJobStatus>}`）
+- 客户端 `realtime.subscribe('import_jobs', cb)` 即可拿状态变更
+- 用户登录时一次 `GET /api/v1/import/jobs?status=active` 拉当前 active job（如果有）；之后增量靠 realtime
+- ImportJob row 的 PUT 仅由 worker 内部完成；任何 `PUT /api/v1/import_jobs/<id>` 来自客户端的写请求返回 405 Method Not Allowed
+
+**通过判据**：
+- api: `tests/api/test_import_realtime.py::test_phase_change_publishes_ws_event`
+- api: `tests/api/test_import_realtime.py::test_ws_event_envelope_matches_routed_table_contract`（断言 `e.row.data` 形如 `{status, phase, processed_rows, total_rows, ...}`）
+- api: `tests/api/test_import_realtime.py::test_user_b_does_not_receive_user_a_import_progress`
+- api: `tests/api/test_import_realtime.py::test_active_jobs_query_returns_in_progress_only`
+- api: `tests/api/test_import_realtime.py::test_client_put_to_import_jobs_returns_405`
+
+#### Step 7 — 前端 ImportDataDialog 重写 + 上传切片 helper
+
+**做什么**：
+- `src/data/import-client.ts` 新增（client 侧的 multipart 实现，零依赖，~150 行）：
+  - `createImportJob(file): Promise<{jobId, multipartUploadId}>`
+  - `uploadParts(file, jobId, opts): Promise<Array<{partNumber, etag}>>` —— 5MB `Blob.slice()` 切片，4 路 `Promise.all` 并发，单 part 失败重试 3 次（指数退避）；上传 cursor（已成功 part numbers）持久化到 `localStorage:import.<jobId>.parts`，断网恢复后查 `GET /api/v1/import/jobs/<id>` 验证 server 端记录，续传剩余 parts
+  - `completeImport(jobId, parts): Promise<void>`
+  - `cancelImport(jobId): Promise<void>`
+  - `subscribeImportStatus(jobId, cb): () => void` —— 包 `realtime.subscribe('import_jobs', ...)` 过滤 jobId
+- `src/components/ImportDataDialog.vue` 重写：
+  - 老逻辑（`dexie-export-import`.importInto + 然后 push）整段砍
+  - 新逻辑：选文件 → `createImportJob` → `uploadParts`（显进度条 + 估算剩余时间）→ `completeImport` → 关闭对话框，跳"迁移状态"小卡片
+  - 整个上传过程 file 不一次性进 ArrayBuffer，用 `Blob.slice().stream()` 流式喂 fetch（低端设备友好）
+- `src/pages/AccountPage.vue` 加"迁移状态"卡片：`subscribeImportStatus` 显示 phase + 进度 + 取消按钮 + 文案 "您可以关闭浏览器，处理完会通过通知告知"
+- 应用启动时：`useObservable(authSource.user)` 触发后调一次 `GET /api/v1/import/jobs?status=active`，有 active job 则自动挂 subscribe + 显示卡片（多设备一致性）
+
+**通过判据**：
+- spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_upload_then_close_tab_then_reopen_sees_progress`（profile import-job + fixture small：上传完后 `page.close()` → 重开 → AccountPage 显示卡片 + phase 推进）
+- spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_upload_resumes_after_simulated_network_drop`（用 `helpers/net.ts.setOffline` 中断 → 恢复后续传 + cursor 校验，slow mark）
+- spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_cancel_button_aborts_job_and_clears_state`
+- spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_phase_b_complete_makes_workspaces_visible`（fixture small + 等 phase_b 完成 → workspaces 列表非空）
+- spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_phase_c_complete_makes_message_text_readable`
+- spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_phase_d_complete_makes_attachment_renderable`（fixture medium：5 messages × 1MB attachment，phase_d 完成后 message 内 `<img>` 加载成功）
+
+#### Step 8 — `GET /api/v1/bootstrap` endpoint + 首屏路由 guard
+
+**做什么**：
+- 后端 `src-backend/data/routers/bootstrap.py`：`GET /api/v1/bootstrap`
+  - 一次返回所有小表全量 + messages 表的"最近 N 个 dialog 的最新 50 条"摘要
+  - 响应体：`{schema_version, workspaces:[...], dialogs:[...], providers:[...], assistants:[...], plugins:[...], reactives:[...], avatarImages:[...], messages_recent:[...]}`
+  - 单响应硬上限 1MB（实测一般用户 < 200KB）；messages_recent 超过则按 dialog 截断（反向时间排序，先保留最近活跃的 dialog 的 messages）
+  - response 加 `Cache-Control: private, max-age=10` 让客户端短期缓存避免重复请求
+- 前端 `src/router/index.ts` 加 router guard：登录后 `await GET /api/v1/bootstrap` → 写入 IndexedDB 缓存 → 放路由进 MainLayout
+- guard 失败回退：超时 2s 没返回 → 走老路径（IndexedDB 缓存 + 后台 fetch）→ banner 提示 "部分数据稍后加载"
+- 已有 active import job 时：`bootstrap` 仍返回当前 server 端可见的部分数据（Phase B 完成的 workspaces 等），与 import 进度不冲突
+
+**通过判据**：
+- api: `tests/api/test_bootstrap.py::test_returns_all_small_tables_in_one_response`
+- api: `tests/api/test_bootstrap.py::test_messages_recent_limited_to_50_per_dialog`
+- api: `tests/api/test_bootstrap.py::test_response_size_under_1mb_for_typical_user`（fixture 100 dialogs × 50 messages = 5000，验证响应体 < 1MB）
+- api: `tests/api/test_bootstrap.py::test_response_truncates_to_under_1mb_for_heavy_user`（fixture 1000 dialogs × 50 messages = 50000，验证截断逻辑生效）
+- api: `tests/api/test_bootstrap.py::test_account_isolation`
+- api: `tests/api/test_bootstrap.py::test_partial_data_during_active_import`（手动插 phase_b 完成的 workspaces + active job → bootstrap 正确返回 workspaces）
+- spec: `tests/e2e/stage4_5/step8-bootstrap.spec.ts::test_fresh_browser_login_no_blank_first_screen`（清空 IndexedDB → 登录 → 1.5s 内 workspaces 列表可见）
+- spec: `tests/e2e/stage4_5/step8-bootstrap.spec.ts::test_bootstrap_timeout_falls_back_to_progressive`（mock 后端 sleep 3s → 2s timeout → 走老路径 + banner 出现）
+
+#### Stage 4.5 出口判据
+
+- **fixture huge（200MB JSON 含 1 万 messages + 100 attachments × 平均 2MB）端到端跑通**：上传 + 关 tab + worker 跑完 + 重新登录 → 数据齐全
+  - spec: `tests/e2e/stage4_5/exit-criteria.spec.ts::test_huge_fixture_end_to_end` (slow + serial mark)
+- **浏览器活跃时间 < 10 分钟**（标准家庭带宽 50Mbps 模拟）—— 上线把关手测，结果记进度快照
+- **worker 单 job 服务端 RSS 增量 < 500MB** —— 上线把关手测，结果记进度快照
+- **新设备首次登录 < 1.5s 看到 workspaces 列表**（bootstrap 命中路径）
+  - 由 `step8-bootstrap.spec.ts::test_fresh_browser_login_no_blank_first_screen` 兜
+- **回归套件**：`pnpm test:api && pnpm test:e2e -g "stage4_5|stage4|stage2|stage1_5|smoke"` 一把全绿（含 import-job profile 全部新 case）
+
+**回滚**
+
+- env `IMPORT_JOB_ENABLED=false` 关闭 worker + 隐藏 ImportDataDialog 按钮 + bootstrap endpoint 仍可用（与 import 解耦）
+- 老用户暂时无法迁移但旧版仍可用作兜底
+- 已有 active jobs 在 worker 关闭后保持 status，重新开 flag 后自动续跑（Step 1 的崩溃恢复路径）
+- 极端情况：`DELETE /api/v1/import/jobs/<id>` 逐个清理 + 清空 `imports/<user>/*` 对象存储前缀
+
+**风险**
+
+- **worker 进程 crash 中断 in-flight job**：启动时扫描 active job 自动恢复（Step 1 实现）。**对应自动化**：`test_worker_recovers_active_job_on_startup`
+- **单实例部署 worker 阻塞其他请求**：asyncio + 流式 IO 不阻塞 event loop；Phase D 上传是 IO 密集而非 CPU 密集；4 路并发不至于让 event loop 饿死。**对应自动化**：上线把关阶段 soak 跑 1 个 200MB job + 并发 100 QPS 普通请求，观察 p95 不超 3x 基线（写进 `tests/scripts/soak-import.sh`，结果记进度快照）
+- **用户在 import 进行中创建新数据**：因为新版 UUID 都是新生成，老 import UUID 与新建 UUID 不冲突；若极小概率 UUID v4 撞库按 LWW 处理。**对应自动化**：`test_lww_skips_older_incoming_when_existing_newer` (Step 3)
+- **多设备同时尝试 import**：DB 唯一约束阻止第 2 个 job 创建，第 2 个设备 POST 拿到 409 + 当前 active job_id，UI 跳到现有 job 状态。**对应自动化**：`test_active_job_unique_constraint` (Step 1) + `test_get_active_jobs_returns_in_progress_only` (Step 2)
+- **对象存储 raw upload 累积成本**：`imports/` 前缀加 S3 lifecycle rule TTL 7 天自动清；worker 完成 / 失败 / 取消时主动 delete。**对应自动化**：`test_phase_d_done_marks_job_done_and_clears_temp_files` (Step 5) + `test_delete_active_job_aborts_multipart_and_soft_deletes_imported_rows` (Step 2)
+
+---
+
+### Stage 5 — 摘除 `dexie-cloud-addon` + 清理 deprecated 代码
+
+**前置**：Stage 4.5 已上线（`IMPORT_JOB_ENABLED` 已默认开），老用户有可用迁移路径（旧版导出 → 新版 ImportDataDialog）。在 Stage 4.5 缺位时直接进 Stage 5 会让老用户失去迁移路径，必须串行。
+
+**目标**：拆掉 dexie-cloud 残留 + 一次性清理 2026-05-02 修订记录里标记为 deprecated 的 ~150 行代码。鉴权早在 Stage 1.5 已经全部走 `BackendAuthSource`；导入导出 only 路径下从未存在过「双写窗口」/「双登录入口」，本阶段没有"过渡 UI 回归单入口"工作。
+
+**主体清理**
 
 - `src/utils/db.ts` 从 `addons` 摘掉 `dexieCloud`；所有表退化为本地缓存
 - `src/router/routes.ts` `/account` / `/model-pricing` 改按 `BACKEND_DATA_API_URL` 注册（如 Stage 1.5 已完成则只确认）
 - `package.json` 移除 `dexie-cloud-addon`
-- 后端补 `/api/v1/export` / `/api/v1/import`，让现有导出/导入 UI 继续工作（沿用 `dexie-export-import` 的格式约定）
-- 清理 UI 上的"Dexie 账号 / 本应用账号"双入口，回归单一登录入口
 
-**验证**：全新浏览器登录 → 服务端拉全数据；export → 清缓存 → import 往返；卸载 PWA → 重装 → 登录 → 数据回来。Tauri / Capacitor 构建产物里 grep 确认无 `dexie-cloud` 残留。
+**deprecated 代码一次性清理**（2026-05-02 修订记录 · 合计 ~150 行）
 
-**回滚**：保留一个版本同时挂载 dexieCloud（用环境变量 `LEGACY_DEXIE_CLOUD=true` 重新挂上 addon），鉴权层不动。
+- 删 `users.linked_dexie_email` 列 + UNIQUE 约束（写一份 alembic downgrade-safe 的 drop migration）
+- 删 `POST /api/v1/auth/link-dexie` endpoint + `tests/api/test_auth.py::test_link_dexie_first_write_wins`
+- 删前端首次登录调 `/auth/link-dexie` 的逻辑
+- 删 `src/utils/db.ts` 的 `unsyncedTables` 计算 + `src/data/server-tables.ts` 模块（dexie-cloud-addon 已摘，无 middleware 需要绕）
+- `BackendAuthSource` 内删去与 `linked_dexie_email` 相关的字段 / 调用
 
----
+**导入导出收尾**
 
-### 现有用户数据迁移（**硬要求：不丢一条数据**）
+- 验证 `ExportDataDialog` / `ImportDataDialog` 在 `dexie-cloud-addon` 摘除后仍能读写 `aiaw_user_db.json`（dexie-export-import 不依赖 addon，理论上没问题，但要 e2e 真跑过）
+- 验证「跨版本导入/导出兼容」段定义的对象存储桥接（导出时 fetch ref → 转 base64；导入时按阈值上传 / 留 inline）端到端正确
 
-**起点的三种用户**
-1. 仅本地用户（`DexieDBURL` 空）：数据只在 IndexedDB
-2. Dexie Cloud 用户：IndexedDB 与 Dexie Cloud 各持一份（最终一致）
-3. **Stage 1.5 之后**注册的全新 backend-first 用户：本地无历史数据，迁移机制对其是 noop（首次 list 即跳过 push，直接走「server → 本地缓存」）
+**验证**
 
-**迁移机制 — 客户端驱动一次性 push（推荐）**
+- 全新浏览器登录 → 应用是空账号（无任何旧数据自动出现），与 2026-05-02 修订记录定义一致
+- 旧版部署导出 `aiaw_user_db.json` → 新版 import → 数据完整 + attachment 走对象存储桥接路径
+- 新版导出 `aiaw_user_db.json` → 旧版部署 import → 数据完整（验证「对外格式纪律」：导出文件无 `{type:'ref', url}` 字段）
+- 卸载 PWA → 重装 → 登录 → 数据从 server 拉回
+- Tauri / Capacitor 构建产物里 grep 确认无 `dexie-cloud` 残留
 
-> **接入时机**：迁移机制从 **Stage 3 起**接入（叶子表迁移开始）。Stage 1 的 `providers` 表**不接迁移机制**——数据量小（单用户通常 < 20 行），用户重新填一次即可，避免在迁移机制本身没成熟时把唯一已上线的表搞坏。
-
-每张表在 **Stage 3+** 启用 server 实现时，`Repository.server` 在首次构造时执行一次性引导：
-
-```
-1. 读迁移标记（存在 reactives 表 / LocalStorage 的 `data.migration.<table>` key）
-2. 若未迁移：
-   a. 若有 Dexie Cloud 挂载：await db.cloud.sync() / 等 syncState === 'in-sync'，
-      确保 IndexedDB 是 Dexie Cloud 最新副本
-   b. 检查 server 端 GET /api/v1/migrate/status，若该用户已被其他设备迁移过 → 直接跳过 push
-   c. 否则：分批 PUT /api/v1/<table>/bulk（每批 200-500 行），所有 ID 沿用客户端 UUID，幂等
-   d. 全部成功后写本地 + server 端迁移标记
-3. 已迁移：跳过，进入正常读写
-```
-
-**关键属性**
-- ID 不变，PUT 天然幂等：失败重跑安全
-- 多设备：第二台开机时 server 已有数据 → 跳过 push，直接走「server → 本地缓存」回灌
-- 大表分批（`messages` / `artifacts` 可能上万行）+ 进度条 UI
-- 失败重试：失败批次保留在本地 `outbox` 表，下次开机继续，不阻塞首屏
-- **双写窗口**：Stage 1–4 期间客户端**继续保留 dexie-cloud-addon 挂载**；新后端就算迁移崩了，本地 + Dexie Cloud 上的原数据完全不动，flag 一关即回旧逻辑
-- Dexie Cloud unmount 推迟到 Stage 5，给迁移留至少 1–2 个版本的双写窗口
-- 冲突策略：行级 `updatedAt` LWW；首次 push 时 server 表空，无冲突
-
-**验证迁移本身**
-- 后端加 `GET /api/v1/migrate/status` 返回每张表 `(server_count, last_migrated_at, client_count_reported)`
-- 客户端在 Settings 加「同步状态」面板：本地 vs server 行数对比 + 重新触发迁移按钮
-- 灰度先选「读多写少 + 行数小」表（providers 优先），早期问题暴露成本低
+**回滚**：用回旧版部署即可（旧版 Dexie Cloud 不下线作为兜底）。无需保留「同时挂载 dexieCloud + `LEGACY_DEXIE_CLOUD=true` flag」机制——导入导出方案下没有用户处于「数据已迁到 backend 但需要回 Dexie Cloud」的中间态。
 
 ---
 
-### 跨版本导入/导出兼容（**硬要求：与旧版格式完全互通**）
+### 现有用户数据迁移（**导入导出 only · 2026-05-02 整章重写**）
+
+> **整章重写说明**：原方案「客户端驱动一次性 push」已废弃，详见 2026-05-02 顶部修订记录条目。本章现行设计 = **「老用户走 ExportDataDialog → 新版 ImportDataDialog」单一路径**，不存在自动后台迁移、不存在双写窗口、不存在迁移标记表、不存在 `/api/v1/migrate/status` endpoint。
+
+**起点的三种用户 + 各自路径**
+
+1. **仅本地用户（`DexieDBURL` 空）**：数据只在 IndexedDB → 进新版前先在旧版用 ExportDataDialog 下载 `aiaw_user_db.json` → 在新版 ImportDataDialog 导入
+2. **Dexie Cloud 用户**：IndexedDB 与 Dexie Cloud 各持一份（最终一致）→ 在旧版（任意已 sync 的设备）导出 `aiaw_user_db.json` → 在新版导入
+3. **新版直接注册的 backend-first 用户**：本地无历史数据 → 不走任何迁移路径，直接使用
+
+**核心设计纪律**
+
+- **新版默认不挂 `dexie-cloud-addon`**（Stage 5 完成后包内零残留）；老用户登录新版看到的是空账号，不会自动出现旧数据
+- **旧版部署不下线**：愿意迁的用户主动迁；不愿动的继续用旧版 + Dexie Cloud，体验与今天完全一致
+- **失败回退路径**：用户在新版 import 失败 → 关闭 tab → 用回旧版 URL → 旧版本地 + Dexie Cloud 数据完整无损（旧版根本不知道新版存在）；这是导入导出 only 方案最大的安全保证
+- **不存在「半迁移」中间态**：要么全 import 成功要么没 import；多设备迁移在新版 = 第一台 import 之后第二台登录直接走「server → 本地缓存」回灌（与 Stage 5 的「全新浏览器首次登录」走同一条路径）
+
+**导入导出本身的实现细节** → 见下一章「跨版本导入/导出兼容」段（含对象存储桥接）。
+
+**新版"空账号 → 首次填充"的 UX**
+
+- 老用户首次登录新版看到空 workspaces，AccountPage 显示横幅"想从旧版迁移数据？这里是导入入口"+ 链接到 ImportDataDialog
+- 横幅在用户成功 import 一次后或主动 dismiss 后不再显示（`users` 表加 `import_hint_dismissed_at TIMESTAMP NULL`，由 `PATCH /api/v1/auth/me` 写入；Stage 4.5 Step 7 落地时一起加）
+- 新注册用户（无旧版账号）的横幅默认 dismiss
+
+**实现层 = Stage 4.5「服务端 Import Job + 新设备首屏 bootstrap」**
+
+详见上文 Stage 4.5 段。核心思路：浏览器只负责文件分块直传对象存储，其余阶段由后端 worker 跑，用户上传完即可关 tab。下面是 200MB 用户的真实体感时序：
+
+| 阶段 | 谁在跑 | 用户视角 | 200MB 用户耗时估 | 关键节点 |
+|---|---|---|---|---|
+| a. 文件选择 | 浏览器 | 选 `aiaw_user_db.json` | <1s | — |
+| b. 上传（5MB 切片 → 对象存储） | 浏览器 | 进度条 "87/270 MB" | 3–10min | 浏览器必须在线 |
+| c. 排队 | backend | "上传完成，已开始处理。**您可以关闭页面**" | <1s | 🟢 **此刻可关 tab** |
+| d. (可选) 用户关闭浏览器 | — | — | — | — |
+| e. Phase A 解析（流式 ijson） | backend worker | 状态卡片 "解析中" | 30s–2min | — |
+| f. Phase B 写结构表 | backend worker | "写入 workspaces..." | 5–30s | — |
+| g. Phase C 写 messages 文字 | backend worker | "对话历史 3,421 / 12,580" | 1–5min | 🟢 **此后任意设备登录可看到全部 workspaces / dialogs / message 文字** |
+| h. Phase D 处理附件 | backend worker | "附件 47 / 312" | 5–30min | 🟢 不阻塞使用 |
+| i. 完成 | backend | "迁移完成"通知 | — | — |
+
+**「卡住」时间从 30-60 分钟降到 3-10 分钟**——只有上传阶段需要浏览器在线；最慢的附件处理完全在 server 跑，跟用户的设备性能 / 是否在线无关。
+
+**多设备协调**
+
+- DB 唯一约束保证每用户同一时刻只有 1 个 active job（Stage 4.5 Step 1 的 partial unique index）
+- 第二个设备打开 ImportDataDialog → `POST /api/v1/import/jobs` 拿到 409 + 现有 active job_id → UI 直接跳到现有 job 的状态卡片
+- 任何设备登录后 `GET /api/v1/import/jobs?status=active` 拉当前 job 状态 + `realtime.subscribe('import_jobs', ...)` 接增量；**用户切设备完全无感**
+
+**失败回退**
+
+- import 中途任何步骤失败 → `import_jobs.status='failed'` + `error_message` 非空 → AccountPage 显示"重试"按钮（DELETE 旧 job + 重新上传）
+- 整个迁移失败 / 用户不满意 → 用回旧版 URL → 旧版本地 + Dexie Cloud 数据完整无损（旧版根本不知道新版存在）；这是导入导出 only 方案最大的安全保证
+
+---
+
+### 跨版本导入/导出兼容（**硬要求：与旧版格式完全互通 · 唯一迁移路径**）
 
 旧版用 `dexie-export-import` 库：
 - `ExportDataDialog.vue:65` — `exportDB(db, options)` 产出 `aiaw_user_db.json`
 - `ImportDataDialog.vue:84` — `importInto(db, file, opts)` 反向
 
-**该格式是 Dexie 官方定义**（schema 元数据 + 各表行数组），不是 AIaW 私有格式。新版本必须保持同一格式可双向读写。
+**该格式是 Dexie 官方定义**（schema 元数据 + 各表行数组，blob 字段 base64 内联），不是 AIaW 私有格式。新版本必须保持同一格式可双向读写。**导入导出 only 路径下，本章定义的格式互通是「现有用户数据迁移」唯一通道**——见上一章重写。
 
-**实现策略**
+**两个方向的实现策略不对称**：export 仍由客户端跑（用户主动行为，数据流向反过来，server-side 化收益不抵复杂度）；import 由 Stage 4.5 server-side worker 跑（详见 Stage 4.5 段）。
 
-新版的导出按钮：
+#### Export — 客户端流程（保持 dexie-export-import 主体）
+
+新版的导出按钮（`ExportDataDialog.vue`）：
+
 1. **先把 server 端权威数据全量回灌本地缓存**（多设备 / 清过缓存的客户端 server 比本地多）
-   - 调 `repos.<table>.list()` for all tables（带 `since=0` 走全量）
+   - 调 `repos.<table>.list()` for all tables（带 `since=0` 走全量；messages / artifacts 走 Stage 4 硬前置定义的 `?since=0&limit=200` cursor 续拉）
    - 写到 `db.<table>`（缓存）
-2. 调 `exportDB(db, options)` —— 与旧版**字节级一致**
-3. 文件名仍为 `aiaw_user_db.json`
+2. **对象存储桥接（导出方向）**：扫描所有缓存行的 attachment 字段，遇到 `{type:'ref', url, sha256, size}` → 后台 fetch blob（4 路并发，从对象存储 pre-signed URL 直拉）→ base64 编码回内联到 row 字段；进度对用户可见（"正在打包附件 X / Y"）
+3. 调 `exportDB(db, options)` —— 与旧版**字节级一致**，输出 base64 内联格式
+4. 文件名仍为 `aiaw_user_db.json`
 
-新版的导入按钮：
-1. `importInto(db, file, opts)` —— 与旧版完全一致，先把数据写入 IndexedDB（缓存）
-2. 导入完成后：在 `Repository` 层触发一次"缓存 → server"双向 push（同上面的迁移机制，复用 `bulk PUT` endpoint）
-3. 这样：旧版导出文件 → 新版导入 → 自动同步上 server；新版导出文件 → 旧版导入 → 旧版正常读写（旧版不知道 server 存在，但本地数据完整）
+#### Import — server-side 流程（Stage 4.5 实现）
+
+**新版 import 不再写客户端 IndexedDB**，整个 import 由 backend worker 完成：
+
+1. 浏览器 5MB 切片直传对象存储（`POST /api/v1/import/jobs/<id>/parts/<n>` 拿 pre-signed URL）→ 不经过 backend 带宽
+2. 上传完成 `POST /api/v1/import/jobs/<id>/complete` → backend worker 启动
+3. Worker 在 server 端解析 JSON → 按表 INSERT 到 PG → attachment 按 64KB 阈值分流到对象存储 / inline → 改写 row 字段
+4. 写入触发现有 realtime broker → 客户端 IndexedDB 通过 WS event 自然填充（与正常 LLM 对话写入走完全同一条路径）
+5. 用户上传完即可关 tab，最痛的解析 + attachment 处理 100% 在 server 跑
+
+**为什么不在客户端 import**（与原方案对比）：
+
+- 原方案：浏览器 parse 270MB JSON → `importInto(db)` 写本地 IndexedDB → 再循环 PUT 到 backend → 再 multipart 上传 attachment。每一步都吃浏览器内存 / CPU / 上行带宽 / tab 在线。
+- 新方案：浏览器只跑 5MB 切片上传循环，其余 server 端跑。低端设备（如 2GB RAM Android / 老笔记本）也能跑。
+
+**幂等与续传**：worker 写入用 `INSERT ON CONFLICT (id) DO UPDATE WHERE existing.updated_at < incoming.updated_at`（LWW）；上传切片由 S3 multipart 协议天然支持续传（client 记 part numbers，断网恢复后查 server 已收到的 parts，传剩余）。
+
+#### 对外格式纪律（2026-05-02 · 强约束）
+
+- **导出 JSON 中绝不出现 `{type:'ref', url}` 字段**——所有 attachment 必须以 base64 内联形式出现。否则旧版 import 拿到 ref 对象，要么报错要么静默存为坏链接，互通破坏。
+- **新版独有的元数据字段**（如 `blob_sha256` / `blob_size`）要么不进入导出文件，要么用旧版能容忍的扩展字段约定（Dexie 容忍未知字段读取，但 dexie-cloud 的 `owner` / `realmId` 字段在新版 import 时应忽略而非报错）
+- 此纪律由 `tests/e2e/stage5/export-format-discipline.spec.ts` 强制（Stage 5 落地时新增）：扫描新版 export 输出的 JSON，断言无 `"type":"ref"` 子串；同时跑「新版导出 → 旧版导入 → 数据 hash 一致」往返
 
 **前提**：新版的 `db.ts` schema 必须**保持兼容旧版**（同表名、同主键、同索引）。Stage 5 删除 `dexie-cloud-addon` 但 IndexedDB schema 不变，`exportDB`/`importInto` 仍能互通。
 
-**验证**
-- E2E：旧版导出 → 新版导入 → 数据完全一致（包括 `owner` / `realmId` 字段，新版应忽略而非报错）
-- E2E：新版导出 → 旧版导入 → 数据完全一致（旧版只看 IndexedDB，看不到 server 但本地是全的）
-- 单元：保留 `dexie-export-import` 依赖；保留 `ExportDataDialog.vue` / `ImportDataDialog.vue` 的现有 UI 与 API；只在 export 前加一步 server 拉取、import 后加一步 server push
+#### 验证
+
+- E2E：旧版导出 → 新版 server-side import → 数据完全一致（含 `owner` / `realmId` 字段忽略；含 `messages.attachments` 大 blob 走对象存储路径）
+  - 由 Stage 4.5 Step 7 的 `tests/e2e/stage4_5/step7-import-flow.spec.ts` 系列覆盖
+- E2E：200MB 量级 fixture 的旧版导出文件 → 新版 server-side import 完整跑完
+  - 由 Stage 4.5 出口判据的 `tests/e2e/stage4_5/exit-criteria.spec.ts::test_huge_fixture_end_to_end` 覆盖
+- E2E：新版导出 → 旧版导入 → 数据完全一致（验证 ref → base64 还原；验证 export 客户端流程）
+  - 由 `tests/e2e/stage5/export-format-discipline.spec.ts` 覆盖
+- E2E：「对外格式纪律」—— 新版 export JSON grep 不出 `"type":"ref"` 子串
+  - 同上 spec
+- 单元：保留 `dexie-export-import` 依赖（仅 export 路径用，import 路径不再用）；`ExportDataDialog.vue` 在原 `exportDB(db)` 调用前加 server 拉取 + ref→base64 还原步骤；`ImportDataDialog.vue` 整个 import 路径由 Stage 4.5 重写
 
 ---
 
@@ -706,7 +1083,14 @@ interface AuthSource {
 - **离线写**：Stage 5 前离线写仍由 dexie-cloud-addon 兜底；Stage 5 起新增 `outbox` 表，`RemoteSyncSource` 在重连时 flush。
 - **观测**：`Repository` 接口层加 `data.repo.<table>.<op>` 计数器，灰度期可对比新旧实现错误率。
 - **i18n / UI 状态条**：Stage 2 起补一个全局 `syncState` 暴露（`'idle' | 'syncing' | 'offline' | 'error'`），写进 `MainLayout` 顶栏，提前在迁移期就给用户可视化反馈。
-- **后端模块条件挂载**：`src-backend/data/auth.py` 等模块在 import 期间会读 `JWT_SECRET` 并 fail-fast；`src-backend/app.py` 通过 `BACKEND_DATA_API_ENABLED` flag **延迟 import** data 路由（lazy import 在挂载函数内），避免单环境 misconfig 把 CORS 代理 / 文档解析 / SPA 静态等无关功能一起带崩。新增 backend 子模块（如 Stage 2 的 `realtime.py`）时同样应在 flag 守卫内 import，并把所需 env 加入挂载函数的 fail-fast 校验列表。
+- **后端模块条件挂载**：`src-backend/data/auth.py` 等模块在 import 期间会读 `JWT_SECRET` 并 fail-fast；`src-backend/app.py` 通过 `BACKEND_DATA_API_ENABLED` flag **延迟 import** data 路由（lazy import 在挂载函数内），避免单环境 misconfig 把 CORS 代理 / 文档解析 / SPA 静态等无关功能一起带崩。新增 backend 子模块（如 Stage 2 的 `realtime.py`、Stage 4 的 `blob_store.py`、Stage 4.5 的 `import_worker.py`）时同样应在 flag 守卫内 import，并把所需 env 加入挂载函数的 fail-fast 校验列表。
+- **测试基础设施增量**（与 test-infrastructure plan Phase 7+ 同步）：
+  - **Docker Compose**：`tests/docker-compose.test.yml` 加 MinIO 服务（端口 9100，`MINIO_ROOT_USER=test` / `MINIO_ROOT_PASSWORD=test`），作为 BlobStore 的 S3 后端。`pnpm test:up` / `test:down` 同步起停。dev 环境不需要——dev 默认 `BLOB_STORE_KIND=local-fs` 落到 `src-backend/.blob-store/` 目录。
+  - **新 profile**：`import-job` → 9015 → `tests/env/.env.test.import-job`（启用 `IMPORT_JOB_ENABLED=true` + `BLOB_STORE_KIND=s3` + `BLOB_STORE_ENDPOINT=http://localhost:9100` + `BLOB_STORE_BUCKET=aiaw-test`）；`playwright.config.ts` 加 project；`tests/scripts/run-playwright.sh` 加 build-profile 步骤；`tests/scripts/backend-start.sh` 的 `CORS_ALLOW_ORIGINS` 扩 9015。
+  - **新 helper**：`tests/e2e/helpers/import-job.ts`，封装：`createImportJob(authToken, file)` / `uploadAllParts(authToken, jobId, file, opts?)` / `completeImport(authToken, jobId, parts)` / `waitForImportPhase(authToken, jobId, phase, timeoutMs)` / `subscribeImportEvents(page, jobId)`。在 `tests/README.md` §helper ↔ plan 词汇表追加 5 行。
+  - **新 fixture**：`tests/api/fixtures/dexie_export.py`，导出 4 档 `aiaw_user_db.json`：`small`（10 providers + 5 dialogs + 0 attachments）/ `medium`（100 dialogs + 1000 messages + 10 × 1MB attachments）/ `large`（500 dialogs + 10000 messages + 50 × 2MB attachments）/ `huge`（1000 dialogs + 50000 messages + 100 × 2MB attachments，~200MB，slow mark 专用）。
+  - **新 backend env**（Stage 4.5）：`IMPORT_JOB_ENABLED` / `BLOB_STORE_KIND` / `BLOB_STORE_BUCKET` / `BLOB_STORE_ENDPOINT` / `BLOB_STORE_ACCESS_KEY` / `BLOB_STORE_SECRET_KEY` / `BLOB_STORE_PRESIGN_TTL_SECONDS=3600` / `BLOB_INLINE_MAX_BYTES=65536` / `IMPORT_WORKER_CONCURRENCY=4` / `IMPORT_RAW_RETENTION_DAYS=7`。
+  - **新前端 env**（Stage 4.5）：`IMPORT_JOB_ENABLED`（控制 ImportDataDialog 入口可见性，与后端同名 flag 配套）。my-deploy 默认全不开。
 
 ---
 
@@ -729,6 +1113,18 @@ interface AuthSource {
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/routers/auth.py`（Stage 1.5 新增：register/login/refresh/logout/me/link-dexie）
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src/data/auth.ts`（Stage 0 新增 `AuthSource`，Stage 1.5 加 `BackendAuthSource`）
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src/data/http.ts`（Stage 1 新增：从 `AuthSource` 取 token）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/blob_store.py`（Stage 4 硬前置新增：BlobStore 接口 + LocalFS / S3 / MinIO 实现）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/routers/blobs.py`（Stage 4 硬前置新增：`/api/v1/blobs` multipart endpoint）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/models/import_job.py`（Stage 4.5 新增）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/import_worker.py`（Stage 4.5 新增：asyncio worker，4 phase）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/routers/imports.py`（Stage 4.5 新增：5 个 endpoint）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/routers/bootstrap.py`（Stage 4.5 新增：首屏一次性返回小表全量）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src/data/import-client.ts`（Stage 4.5 新增：multipart 上传 + 状态订阅）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src/components/ImportDataDialog.vue`（Stage 4.5 重写：走 server-side import job）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src/components/ExportDataDialog.vue`（Stage 4.5 增强：export 前 ref → base64 桥接）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/tests/e2e/helpers/import-job.ts`（Stage 4.5 新增 helper）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/tests/api/fixtures/dexie_export.py`（Stage 4.5 新增 fixture）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/tests/docker-compose.test.yml`（Stage 4.5 加 MinIO 服务）
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/package.json`（最终阶段移除 `dexie-cloud-addon`）
 
 ---
@@ -743,8 +1139,8 @@ interface AuthSource {
 | 2 | 双 tab 实时联动 | < 500ms 收到事件；断网降级到 poll 仍最终一致 |
 | 3 | 逐叶子表 PR + 导出/导入往返 | 每张表独立可灰度可回滚 |
 | 4 | 级联删除 + 大量消息加载 | 服务端单事务级联，DialogView 滚动加载性能不退化 |
-| 5 | 全新设备首次登录 + 卸载重装 | 服务端为唯一真源；包内无 `dexie-cloud-addon` |
-| 全程 | **旧版导出 → 新版导入 → 旧版导入** 数据闭环 | `aiaw_user_db.json` 字节级互通，无字段丢失 |
-| 全程 | 多设备开机迁移 | 第二台不重复 push；server 与本地行数一致 |
+| 5 | 全新设备首次登录 + 卸载重装 + **旧版导出 → 新版导入往返字节一致**（含对象存储桥接路径） | 服务端为唯一真源；包内无 `dexie-cloud-addon`；ref blob 透明还原 |
+| 全程 | **旧版导出 → 新版导入 → 旧版导入** 数据闭环 | `aiaw_user_db.json` 字节级互通，无字段丢失；新版 export JSON grep 无 `"type":"ref"` |
+| 全程 | 多设备开机首次登录 | 第二台直接走「server → 本地缓存」回灌（无 push 机制，无标记表） |
 
 每阶段均能合并到 master、独立部署、按 flag 灰度，验证失败时仅通过环境变量回退即可，无需代码 revert。
