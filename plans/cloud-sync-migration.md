@@ -48,6 +48,13 @@
   - **变更**：Stage 2 前 3 个 Step 的代码已全部合并到 `feature/change-cloud-sync-claude` 分支（尚未合 my-deploy）；plan 文件本身从 `~/.claude/plans/` 复制到仓库 `plans/cloud-sync-migration.md`，CLAUDE.md 加「长期迁移工作流」段并入库（详见进度快照 2026-05-02）。
   - **影响范围**：plan 维护规则正式生效——动态进度（当前 Step、commit hash、未解决问题）一律写本文件，不写 CLAUDE.md；任何改动需配套通过判据，每个 Step 完成后必须更新「进度快照」段；方案有调整必须先在「修订记录」追加条目再改正文。
   - **后续维护**：本文件即权威版；`~/.claude/plans/1-ethereal-lollipop.md` 仅给 Claude Code `/plan` 命令读，按需手动 `cp` 仓库版同步。
+- **2026-05-02 · Stage 2 Step 5/6 通过判据回填脚手架引用 + 一致性修订**
+  - **背景**：Phase 6（test-infrastructure plan）落地后已建立「每条通过判据 → 一条 spec/api 引用」的硬性约定；Stage 2 Step 4 已遵守，但 Step 5（SSE/poll 降级）与 Step 6（Stage 2 收官）原文写于 Phase 6 之前，3 / 6 条判据均无 spec/api 行；且 Step 5 引用的 `realtime-sse` / `realtime-poll` / `realtime-auto` profile 在当前 `playwright.config.ts` 中不存在，Step 6 列出的 6 个场景与 Step 1/3/4 已落 spec 大量重叠却未声明 reuse。
+  - **变更**：
+    - Step 5「做什么」段补「脚手架增量」小节（3 个新 profile + 9012/9013/9014 端口 + env 文件 + helper `blockSSE` 增量 + `CORS_ALLOW_ORIGINS` 扩端口 + `window.aiawRealtime.transport` 暴露），3 条「通过判据」每条补 `- spec:` / `- api:` 行，对应 `tests/e2e/stage2/step5-transport-degradation.spec.ts` 4 case 与 `tests/api/test_realtime_sse.py` 5 case
+    - Step 6 重写为「回归判据（reuse 既有 spec / api，不重写）」+「上线把关判据（脚手架不覆盖，必须手测 + 写进度快照）」+「Stage 2 出口判据」三段：回归 5 类全部 reuse Step 1-5 已落 spec 路径；bundle 体积 / RSS soak / p95 延迟标注为非自动化、明确手测交付物（KB / MB / ms 数写进进度快照）；删去模糊措辞「6 场景全过 + 后端无内存泄漏（连续运行 1h 看 RSS 平稳）」改为可执行清单
+    - 风险段每条补「对应自动化」一行，明确哪条由 spec 兜、哪条由 soak 兜、哪条暂无脚手架覆盖
+  - **影响范围**：仅 plan 文档；不影响代码。Step 5 落地 PR 应同时新增 `playwright.config.ts` projects / `tests/env/.env.test.realtime-{sse,poll,auto}` / 上述 spec 文件，与 plan 此处描述一致；Step 6 落地 PR 不引入新 spec、只新增 `tests/scripts/soak.sh` 与一次性手测交付。test-infrastructure plan 无需同步更新——Phase 6 守则已涵盖「Step 落地同 PR 落 spec」。
 - **进度快照（2026-05-02）**
   - **Stage 2 / Step 1**（后端 broker + WS `/api/v1/stream`）✅ commit `e6c5335`
   - **Stage 2 / Step 2**（前端 `SyncSource` 接口 + `DexieSyncSource` 重构）✅ commit `7755de7`
@@ -469,34 +476,80 @@ interface AuthSource {
 - 后端：`GET /api/v1/stream/sse?since=<rev>&tables=providers`
   - 标准 `text/event-stream`；`id:` 字段用全局 rev；EventSource 自动用 `Last-Event-ID` 重连
   - 鉴权：EventSource 不支持自定义 header → 用 `event-source-polyfill` 走 `Authorization` header
+  - 路由按 `_enable_backend_data_api()` flag 守卫 lazy import（与 `realtime.py` 同款），无 flag 部署不应在 import 期触达
 - 前端：
   - `SseSyncSource` —— 包 EventSource(polyfill)
   - `PollSyncSource` —— `setInterval` 调 Stage 1 已有的 `GET /api/v1/providers?since=<rev>`，5s 一次
   - `auto` 模式：先试 WS，连不上 / 连上立刻被代理 close 时降到 SSE，SSE 也挂时降到 poll
+  - 当前实际生效的 transport 通过 `window.aiawRealtime.transport`（取值 `'ws' | 'sse' | 'poll'`）暴露，复用 `src/boot/expose-debug.ts` 已有的 `EXPOSE_DB=true` 守卫与现有 `window.aiawRealtime.subscribe` 同一钩子点，供 e2e 验证 auto 真正降到了哪一档
+
+**脚手架增量**（与 plan 维护规则同步在 Step 5 落地 PR 内一并加进 `playwright.config.ts` / `tests/env/` / `tests/scripts/`）
+- 3 个新 profile + 端口 + env 文件：
+  - `realtime-sse` → 9012 → `tests/env/.env.test.realtime-sse`（`REALTIME_TRANSPORT=sse`，其余 flag 同 `realtime-ws`）
+  - `realtime-poll` → 9013 → `tests/env/.env.test.realtime-poll`（`REALTIME_TRANSPORT=poll`）
+  - `realtime-auto` → 9014 → `tests/env/.env.test.realtime-auto`（`REALTIME_TRANSPORT=auto`）
+- helper 增量：`tests/e2e/helpers/net.ts` 新增 `blockSSE(context)` 一行 `route('**/api/v1/stream/sse**', r => r.abort())`；其余 spec 复用现有 `blockWS` / `dumpTable` / `expectRowSync` / `backend.putProvider` / `openContextsForUsers`，不新增其他 helper
+- `tests/scripts/backend-start.sh` 的 `CORS_ALLOW_ORIGINS` 扩到 9012 / 9013 / 9014（`localhost` + `127.0.0.1` 各一份），与 9007/9008/9009 同款写法
+- 新建 e2e spec：`tests/e2e/stage2/step5-transport-degradation.spec.ts`
+- 新建 pytest spec：`tests/api/test_realtime_sse.py`
+- `tests/README.md` §helper ↔ plan 词汇表追加 `blockSSE` 一行；§已知预期红段在 spec-first 提交时短暂登记 case1-4 的红信号，Step 5 代码落地后清空
 
 **通过判据**
 - `REALTIME_TRANSPORT=sse` → 双 tab 联动正常（延迟略高于 WS，可接受）
-- `REALTIME_TRANSPORT=poll` → 双 tab 5s 内最终一致
-- 在 nginx 前面挡掉 WS 升级 + `REALTIME_TRANSPORT=auto` → 自动降到 SSE，仍正常工作
+  - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case1 sse double-tab`
+  - api: `tests/api/test_realtime_sse.py::test_sse_replay_then_live`
+  - api: `tests/api/test_realtime_sse.py::test_sse_account_isolation`
+- `REALTIME_TRANSPORT=poll` → 双 tab 5s 内最终一致（`test.slow()`）
+  - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case2 poll eventual within 5s`
+- `REALTIME_TRANSPORT=auto` 在拦掉 WS upgrade 时自动降到 SSE，再拦掉 SSE 自动降到 poll，端到端联动仍最终一致；transport 实际档位通过 `window.aiawRealtime.transport` 校验
+  - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case3 auto falls back to sse when ws blocked`
+  - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case4 auto falls back to poll when sse blocked`（`test.slow()`）
+- SSE 鉴权与 `Last-Event-ID` 续传兜底（pytest，零前端依赖）：
+  - api: `tests/api/test_realtime_sse.py::test_sse_without_token_rejected`
+  - api: `tests/api/test_realtime_sse.py::test_sse_with_invalid_token_rejected`
+  - api: `tests/api/test_realtime_sse.py::test_sse_last_event_id_resumes_from_rev`
+
+**与 Step 6 关系**：Step 5 落地后，「降级闭环」类判据归属本 Step 的 spec；Step 6 仅 reuse 复跑 + 软性上线把关，不再重新定义降级判据。
 
 #### Step 6 — 端到端验证 + 上线（Stage 2 收官）
 
-**6 个场景**
-1. **WS 双 tab 联动**：A 改 → B 在 500ms 内更新（前 95 百分位）
-2. **重连补漏**：kill WS 连接 → A 改 3 次 → B 自动重连 → 3 次变更全到
-3. **账号隔离**：A 账号 PUT，B 账号 WS 不应收到（直接看 server 日志确认 publish 不跨 user_id）
-4. **token 过期**：access token TTL 调成 60s，挂着 WS 等 70s → 看到自动 refresh + 重连
-5. **降级闭环**：`REALTIME_TRANSPORT=auto` + 手动挡 WS → 走 SSE；再挡 SSE → 走 poll；最终一致
-6. **flag 默认关字节级一致**：`REALTIME_TRANSPORT` 不设 → 行为与 Stage 1 收尾时完全一致
+> Step 6 不引入新功能，只做 Stage 2 整体回归 + 非脚手架可覆盖的「软性」上线把关 + 翻 Stage 2 上线 flag。所有「协议 / 实时通道 / 降级」类判据已在 Step 1-5 的 spec / api 里沉淀，本 Step 仅 reuse 复跑、不重写。
 
-**Stage 2 出口判据**：6 场景全过 + bundle 体积变化可接受（WS / SSE 客户端约 +10KB）+ 后端无内存泄漏（连续运行 1h 看 RSS 平稳）→ 合并到 my-deploy 上线。
+**回归判据（reuse 既有 spec / api，不重写）**
+1. **WS 双 tab 联动**
+   - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case1 ws double-tab`
+2. **重连补漏 / token 过期 / server 4001**
+   - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case2 ws reconnect catch-up`
+   - spec: `tests/e2e/stage2/step3-realtime-recovery.spec.ts::scenarioB ws auto-reconnect after offline window`
+   - spec: `tests/e2e/stage2/step3-realtime-recovery.spec.ts::scenarioC client recovers from server-side 4001 close`
+3. **账号隔离（broker 不跨 user_id）**
+   - api: `tests/api/test_realtime_ws.py::test_ws_account_isolation`
+   - api: `tests/api/test_realtime_sse.py::test_sse_account_isolation`
+4. **降级闭环（SSE / poll / auto）**
+   - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case1 sse double-tab`
+   - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case2 poll eventual within 5s`
+   - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case3 auto falls back to sse when ws blocked`
+   - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case4 auto falls back to poll when sse blocked`
+5. **`REALTIME_TRANSPORT` 空时退化与 flag 全关字节级一致**
+   - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case3 providers-rest no-realtime`
+   - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case4 baseline byte-identical`
+
+**上线把关判据（脚手架不覆盖，本 Step 必须手测 + 把结果数字写进进度快照）**
+- **bundle 体积变化**：分别用 `pnpm test:build --profile=baseline` 与 `pnpm test:build --profile=realtime-ws`（均强制 cache miss，可改一字符 env 触发）→ diff 两份 `tests/.builds/<profile>/<key>/assets/*.js` 的总大小，差值在 ~+10 KB ± 5 KB 内（含 EventSource polyfill）即视为可接受；记入快照「bundle KB 数」字段
+- **后端无内存泄漏**：`pnpm test:backend:start` 起 9011 → 跑本 Step 新增的 `tests/scripts/soak.sh`（循环 PUT + 多 WS 订阅 1h，幂等可中断）→ 期间每 5 min 抓一次 `ps -o rss= -p <pid>`，结束时与启动 5 min 后基线相比涨幅 < 30 MB；记入快照「RSS 起止 MB 数」字段
+- **延迟 p95**：暂不进自动化（`helpers/sync.ts.expectRowSync` 当前只 poll 不出分布）；本 Step 用浏览器 DevTools 手测 100 次 PUT，目测 95% 在 500 ms 内即可；记入快照「p95 ms 数」字段。Stage 3+ 若需要硬性 SLA，再扩 helper 收集 percentile
+
+**Stage 2 出口判据**
+- 「回归判据」5 类全部 reuse 复跑全绿（含 Step 5 新增的 SSE / poll / auto case）：`pnpm test:api && pnpm test:e2e -g "stage2|stage1_5|smoke"` 一把全绿
+- 「上线把关判据」3 条手测结果（bundle KB / RSS MB / p95 ms 三个具体数）写进 plan 进度快照
+- 走「上线但不启用」策略：合并到 my-deploy 时 `REALTIME_TRANSPORT` 默认空 → 行为字节级等同 Stage 1 收尾；按需在 Northflank 控制台开 flag 灰度
 
 **回滚**：`REALTIME_TRANSPORT=` 空（关闭实时通道，退回 Stage 1 行为）；如有更严重问题，从 `BACKEND_DATA_TABLES` 摘掉 providers 退回 Stage 0 行为。
 
 **风险**
-- **重连风暴**：100 个 tab 同时重连撞 server。**缓解**：客户端指数退避 + 抖动；server 端连接数硬限制（`MAX_WS_PER_USER=20`），超过直接 reject
-- **漏事件**：server 重启 / 长时断网期间事件丢失。**缓解**：每个 event 带 `rev`，客户端记 `lastRev`，重连发 `since=<lastRev>` 让 server SQL 回放
-- **慢客户端拖垮 server**：订阅队列堆积。**缓解**：`maxsize=200` + 满了 close 客户端，让它走重连补漏
+- **重连风暴**：100 个 tab 同时重连撞 server。**缓解**：客户端指数退避 + 抖动；server 端连接数硬限制（`MAX_WS_PER_USER=20`），超过直接 reject。**对应自动化**：暂无（hard limit 触发态在 e2e 模拟成本高），靠「上线把关判据」soak 阶段的多 WS 订阅压力 + Step 1 `test_ws_account_isolation` 反向证明 broker 不会跨 user_id 串
+- **漏事件**：server 重启 / 长时断网期间事件丢失。**缓解**：每个 event 带 `rev`，客户端记 `lastRev`，重连发 `since=<lastRev>` 让 server SQL 回放。**对应自动化**：`step4 case2 ws reconnect catch-up` + `step3 scenarioB ws auto-reconnect after offline window`
+- **慢客户端拖垮 server**：订阅队列堆积。**缓解**：`maxsize=200` + 满了 close 客户端，让它走重连补漏。**对应自动化**：暂无（200 条事件灌入实测成本高），靠「上线把关判据」1h soak 的 RSS 涨幅曲线反向兜
 
 ---
 
