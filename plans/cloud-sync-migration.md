@@ -16,6 +16,25 @@
 
 > **术语说明**：plan 中"批次" / "批次-Xx"指**一组原子的、可整体回滚的提交集合**——本仓库是单人 + AI 开发，没有 GitHub PR 流程，"批次"对应"一次落地的 commit 序列"，不暗示 review / merge 流程。批次代号仍按字母分组方便引用（如 `批次-3a` / `批次-4b`）。
 
+- **2026-05-03 · plan 自洽刷新 + lazy 路径补齐 + 流式节流前置 + outbox 落 Stage**
+  - **背景**：用户复盘三大产品需求时复核 plan——① 登录后立刻看到 workspaces / 点 dialog 立刻看到对话/消息（**服务端优先 / 即点即看**）；② 流式输出能跨 tab / 跨设备实时同步；③ 所有增删改正确同步（含离线场景）。逐条核 plan 后发现：
+    1. **plan 内部不自洽**：line 236 旧总策略段写「IndexedDB 角色降级。Stage 0–4 仍是首屏读源，Stage 5 起退化为缓存 + 离线 outbox」，按字面读 Stage 5 才退化；但 Stage 4.5 Step 8 (line 1051+) 已规划 `GET /api/v1/bootstrap` 解决"首登 1.5s 内看到 workspaces"，4.9 (line 1117) 写「IndexedDB 缓存机制保留作为离线 / 弱网下的本地缓存层，server 是权威」。两处描述矛盾，line 236 是 stale 旧文字
+    2. **lazy 路径未规划**：当前所有 server-routed 表的 `pull()` 都是「全 user 单表 since=N 全量增量」（参考 `items.server.ts::pull` / `dialogs.server.ts::pull`），后端 `list_<table>` endpoint 也只接 `?since=N`，**不支持作用域过滤**（`?workspaceId=` / `?dialogId=`）。bootstrap 只解决"首登小表全量"，不解决"打开某个 dialog 时只拉这个 dialog 的 items / messages / artifacts"。一个常用用户单 user items 上千、messages 上万是常态，按现有 pull 模式打开任何 dialog 都会全表拉一遍 → 跟旧 Dexie Cloud 全量拉本质相同
+    3. **流式节流策略未定**：plan line 813 (4e) 判据写「200 次 PUT 模拟 token 流 → 第二 tab 无丢帧无倒退」，但**没定义客户端节流机制**。token 流 10-30 Hz × 完整 envelope HTTP PUT × broker `maxsize=200` close-on-overflow，长回复会撑爆队列
+    4. **outbox 没真实 Stage**：line 236 提"Stage 5 起退化为缓存 + 离线 outbox"，但 Stage 5 段 (line 1150-1171) 实际只有"导入导出端到端验证"，无 outbox 实现条目。Stage 4.9 也只说"IndexedDB 缓存保留"——缓存 ≠ outbox（缓存解决"读"的离线，outbox 解决"写"的离线）
+  - **未来约束**：
+    - **新增「硬前置 3：作用域过滤 + scoped pull」**（详见 Stage 4 硬前置段）：`list_<table>` endpoint 加 `?workspaceId=X` / `?dialogId=Y` 过滤参数；前端 `<table>.server.ts` 引入 scoped pull——`observeFind(spec)` 把 `spec.where.workspaceId` / `spec.where.dialogId` 解析为 server query，scope 内独立维护 `lastVersion` cache（`Map<scopeKey, number>`），不再触发全表 pull。**4d artifacts / 4e messages 落地必须自带 scoped pull**；同时 retrofit 4a/4b/4c 已落地的 dialogs / items（不动 workspaces，因为 workspaces 本身是顶层 scope）。bootstrap 仍保留作为「首登小表 + 最近 50 条 message」的零等待路径
+    - **4e 流式节流策略前置敲定**：客户端 `repos.messages.put()` / `update()` 在流式上下文（`isStreaming=true` 标志位）下走 batch flush——**200ms 时间窗 + 满 1KB 文本 + sentence boundary** 三触发取最先；非流式 PUT 立刻 flush。flush 时 PUT 当前累积的完整 message envelope，server WS 推 inline envelope。判据：单 dialog 5min 流式回复（生成 ~3000 字）期间 broker 入队 ≤ 25 events（200ms × 5min/200ms = 1500 上限，sentence 触发实际更少），第二 tab UI 渲染抖动肉眼不可感
+    - **新增 Stage 4.7「离线 outbox」**（详见下方新 Stage 段）：在 4.5 与 4.9 之间，引入 IDB outbox 表 + 重连 flush + LWW 冲突解决；Stage 4.9 前置加「Stage 4.7 outbox 已落地 + 稳定运行 ≥ 3 天」。原 line 236 "Stage 5 起... outbox" 措辞作废
+    - **line 236 旧总策略文字刷新**：改为「Stage 0–4.4 IndexedDB 仍是首屏读源；Stage 4.5 起 bootstrap 接管首登路径；Stage 4.7 起加离线 outbox；Stage 4.9 起 IndexedDB 完全降级为缓存层（server 是权威，缓存仅服务读路径离线 / 弱网）」
+    - **进度快照「下一步」从 4d 改为「硬前置 3 + 4c retrofit」一批**：4d / 4e 都依赖硬前置 3，必须先落
+    - **Stage 4.5 Step 8 bootstrap response 不含 items / artifacts**：明确 bootstrap 只塞「workspaces / dialogs / providers / assistants / installedPlugins / reactives / avatarImages / messages_recent (per-dialog 最近 50 条)」；items / artifacts 走硬前置 3 scoped pull，按 dialog / workspace 范围 lazy 拉。这与现有 line 1056 描述一致，本次只是显式声明"items / artifacts 不进 bootstrap 是有意为之、不是漏写"
+  - **避坑**：
+    - 硬前置 3 不要拆成"先后端 endpoint 加参数、再前端改 pull"两批落地——retrofit 已落地表（dialogs / items）的 server.ts 同时改 + spec 同时新加，否则中间态 server 已支持过滤但前端还在全表拉，等于白上线
+    - 流式节流的 200ms 时间窗实现要在 `composables/call-api.ts` / `utils/middlewares.ts`（流式 token 入口）做 batch，不是在 `messages.server.ts::putOne` 做——后者粒度太细看不到流式上下文。具体钩点 4e 落地时确定，本修订只敲定策略
+    - 离线 outbox 不要复用 dexie 的 `db.transaction` 事务模型——4.9 之后 dexie repo 实现已删，outbox 表只是 IDB schema，操作走 `db.outbox.put / delete`，flush 逻辑跑在 `realtime` 重连回调里
+    - bootstrap response 不含 items / artifacts 这点要在 `tests/api/test_bootstrap.py::test_returns_all_small_tables_in_one_response` 显式断言（response 字段 set 不含 `items` / `artifacts`），否则未来误加进去会撑爆 1MB 上限
+
 - **2026-05-03 · 4c items 重新归类为「依赖硬前置 2 的附件载体表」**
   - **背景**：上一轮规划 4c 把 items 当"独立简单叶子表"，schema 决策段写为「`type` 联合；`dialogId` 可为 null（工作区级 item vs 对话级 item）」，并在 line 38 依赖排序中把 items 与 dialogs 并列为"可并行的简单表"。复盘发现两处错：① **代码事实**：`StoredItem` 形态是 `{id, dialogId:string(必填), type:'text'|'file'|'quote', references:number, contentBuffer?:ArrayBuffer, mimeType?, name?, contentText?}`，`dialogId` 必填不可 null；`contentBuffer` 是用户上传的真附件 bytes（`DialogView.vue::949` 的 `repos.items.bulkPut(items)` 就是处理用户拖文件 / 上传图片 / 引用大段文字的入口，`type:'file'` 的 contentBuffer 可达 5MB+）。② **未来一致性**：plan 4e messages 端到端判据写"5MB attachment 端到端 → ref URL 下载 blob"，实际数据流走 items（message 只持 `StoredItemId[]`），所以**items 必须支持 blob ref 才能让 4e 跑通**，否则 4e 落地时回头改 items 污染历史
   - **未来约束**：
@@ -139,15 +158,17 @@
   - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/workspaces` 401、`/api/v1/dialogs` 401、`/api/v1/items` 401、`/api/v1/auth/register` 422
   - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages + workspaces + dialogs + items 跨设备同步可用；workspace 删除时 dialogs + items 走 server 端真二级级联（同事务 tombstone + 各发 WS event，共用 cascade_version）；items.contentBuffer ≥ 64KB 自动走对象存储 ref + 跨 tab `materializeAttachment` 字节级一致；其他 2 张表（messages / artifacts）仍只在本地 IndexedDB，workspace 删除时由前端 `stores/workspaces.ts::deleteItem` 顺序 await 清；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
 
-### 下一步：开 Stage 4 主体批次-4d（`artifacts`）
+### 下一步：硬前置 3（作用域过滤 + scoped pull）+ 4a/4b/4c retrofit
 
-批次-4c items 落地后，按依赖顺序进入 4d artifacts（依赖硬前置 2 对象存储 + 硬前置 1 cursor 分页 ✅）→ 4e messages（依赖硬前置 1+2，inline envelope 流式同步，最难）。4d artifacts 与 items 形态接近——也是 `id-PK + workspaceId/dialogId 双 FK + 大 content 字段走 blob ref`。可基于 items.server.ts 模板复制，但 schema 决策不同：artifacts 的内容字段是字符串（不是 ArrayBuffer），`level 0 inline 兜底` + level≥1 走 ref。`workspaces.delete(?cascade=true)` 现已 server-side 真级联到 dialogs + items；4d/4e 落地时按相同模板把 artifacts / messages 各自的 update-tombstone 链路加进 `routers/workspaces.py::delete_workspace` 的 cascade 分支即可。
+按 2026-05-03 修订记录，4d / 4e 落地前必须先做硬前置 3：① 后端 `list_workspaces` / `list_dialogs` / `list_items` 加 `?workspaceId=` / `?dialogId=` 过滤参数（与硬前置 1 cursor 协议正交，可 `?dialogId=Y&since=N&limit=200` 组合）；② 前端 `<table>.server.ts` 引入 scoped pull——`observeFind(spec)` 把 `spec.where.workspaceId` / `spec.where.dialogId` 解析为 server query，scope 内独立维护 `Map<scopeKey, lastVersion>` cache；③ retrofit 已落地的 dialogs / items（不含 workspaces，workspaces 本身就是顶层 scope）。硬前置 3 是「服务端优先 / 即点即看」三需求第一条的核心兑现路径，比 4d artifacts 优先级更高。落地后再按依赖顺序：4d artifacts（依赖硬前置 2 + 3）→ 4e messages（依赖硬前置 1+2+3，含流式节流策略）。
 
 ### 未启动（按依赖顺序）
 
-- **Stage 4 主体** 批次-4d `artifacts` → 批次-4e `messages` ⏳
+- **Stage 4 硬前置 3** 作用域过滤 + scoped pull + 4a/4b/4c retrofit ⏳ ← **下一步**，4d/4e 强依赖
+- **Stage 4 主体** 批次-4d `artifacts` → 批次-4e `messages`（含流式节流 200ms+1KB+sentence 三触发）⏳
 - **Stage 4.5** 服务端 Import Job + bootstrap ⏳ ← **可让老用户用的物理分水岭**
-- **Stage 4.9** flag 路由层 + dexie 实现一次性下架 ⏳ ← 需 Stage 4.5 端到端验收通过 + 稳定运行 1 周
+- **Stage 4.7** 离线 outbox（IDB outbox 表 + 重连 flush + LWW）⏳ ← 4.9 前置
+- **Stage 4.9** flag 路由层 + dexie 实现一次性下架 ⏳ ← 需 Stage 4.5 端到端验收通过 + 4.7 稳定运行 ≥ 3 天
 - **Stage 5** 端到端验证（旧版 export → 新版 import 字节级互通 + 卸载重装 + 跨平台真机） ⏳
 
 ---
@@ -233,7 +254,7 @@ UI 组件 ──→ Pinia store / composable ──→ db.<table>.add/put/update
 - **抽象一次，替换多次。** 仅 Stage 0 触达全部 32 个调用点，引入 `Repository` 接口；后续阶段只换实现。
 - **特性开关并存。** 前端：`BACKEND_DATA_API_URL` + `BACKEND_DATA_TABLES`（CSV，逐表灰度）+ `BACKEND_AUTH`；后端：`BACKEND_DATA_API_ENABLED`（条件挂载 data API 路由）。`DexieDBURL` 空时仍纯本地，新旧并行。
 - **ID 不变。** 沿用客户端生成的 UUID (`genId()`)，同一 id 在两端都是权威，回滚不丢数据。
-- **IndexedDB 角色降级。** Stage 0–4 仍是首屏读源，Stage 5 起退化为缓存 + 离线 outbox。
+- **IndexedDB 角色降级。** Stage 0–4.4 仍是首屏读源；Stage 4.5 起 `GET /api/v1/bootstrap` 接管首登路径（小表全量 + 最近 50 条 message/dialog）；items / artifacts / messages 历史走硬前置 3 scoped pull 按 dialog/workspace 范围 lazy 拉；Stage 4.7 起加离线 outbox（解决"写"的离线）；Stage 4.9 起 IndexedDB 完全降级为缓存层（server 是权威，IDB 仅服务读路径的离线 / 弱网）。详见 2026-05-03「plan 自洽刷新 + lazy 路径补齐」修订记录。
 
 ### Stage 0 — 引入 Repository / Auth 抽象层（纯重构，行为不变）
 
@@ -423,7 +444,7 @@ interface AuthSource {
 - **多路复用**：单 WS / 多表订阅 / 客户端 refcount。参考 GraphQL Subscriptions、Supabase Realtime。
 - **鉴权**：JWT 走 `Sec-WebSocket-Protocol` 子协议传递，避免 query string 进网关日志。
 - **心跳**：Server 每 25s 主动 ping，10s 内无 pong 关连接（RFC 6455 Ping/Pong）。
-- **断线补漏**：Outbox 表推迟到 Stage 3 引入；Stage 2 单表（providers）场景下，重连发 `since=<lastRev>` → server 直接 `SELECT * FROM providers WHERE user_id=? AND version > ?` 回放。
+- **断线补漏**：Outbox 表延后到 Stage 4.7 引入（2026-05-03 修订，原写"Stage 3 引入"已作废）；Stage 2-4 单表场景下，重连发 `since=<lastRev>` → server 直接 `SELECT * FROM <table> WHERE user_id=? AND version > ?` 回放，覆盖"读"补漏；"写"补漏走 Stage 4.7 outbox。
 - **背压**：订阅队列 `maxsize=200`，满了直接 close 慢客户端，让它走重连补漏路径，避免 OOM。
 - **降级**：WS → SSE → poll。**poll 直接复用 Stage 1 已有的 `GET /api/v1/providers?since=<rev>`，不新增端点**。
 - **token 过期**：server 侧跟踪 JWT `exp`，到期主动 close（code 4001）→ 客户端 refresh → 重连。
@@ -771,6 +792,44 @@ interface AuthSource {
   - 周期 GC job：扫 `blobs LEFT JOIN blob_refs` 找无 ref 行 + 超 7 天 → 删 BlobStore bytes + DELETE blob 行（FK CASCADE 自动清 blob_refs）。当前 row delete 时不立即 delete blob bytes 这点需 Stage 4 主体批次 messages / artifacts row-CRUD 接好 blob_refs 增减后才能跑通——本批次只把 schema + endpoint 落地，GC 留待后续
   - Stage 4.5 ImportJob 多部分上传协议：`BlobStore.create_multipart_upload` / `generate_part_url` / `complete_multipart_upload` / `abort_multipart_upload` 4 个方法；本批次只暴露单 POST 上传，多部分留 4.5
 
+**前置 3：作用域过滤 + scoped pull（2026-05-03 新增）**
+
+> 2026-05-03 新增。当前所有 server-routed 表的 `pull()` 都是「全 user 单表 since=N 全量增量」，后端 list endpoint 也只接 `?since=N`。这等于"打开任意 dialog 都全表拉一次 items / messages / artifacts"，跟旧 Dexie Cloud 全量拉本质相同，违背"服务端优先 / 即点即看"需求。本前置补齐 lazy 路径，**4d / 4e 强依赖，必须在它们之前落地**；同时 retrofit 已落地的 dialogs / items（不含 workspaces，workspaces 本身就是顶层 scope）。
+
+- **后端**：list endpoint 加可选 query 参数（与硬前置 1 cursor 协议正交，可 `?dialogId=Y&since=N&limit=200` 组合）：
+  - `GET /api/v1/dialogs?workspaceId=X&since=N` — `routers/dialogs.py::list_dialogs` 加 `workspace_id: Optional[str] = None` 参数 + `WHERE workspace_id = X` 子句
+  - `GET /api/v1/items?dialogId=Y&since=N` — `routers/items.py::list_items` 加 `dialog_id: Optional[str] = None` 参数 + `WHERE dialog_id = Y` 子句
+  - `GET /api/v1/artifacts?workspaceId=X&since=N&limit=200`（4d 落地时）+ `?dialogId=Y` (artifacts 也可绑 dialog) — 同模板
+  - `GET /api/v1/messages?dialogId=Y&since=N&limit=200`（4e 落地时）— 必须按 dialog 过滤（messages 只 dialog scope，无 workspace scope；要查 workspace 全量靠多次 dialog scope 调用拼）
+  - 不带 scope 参数时维持现状（全 user 单表 since 增量），保持向后兼容
+- **前端**：`<table>.server.ts` 引入 scoped pull 基础设施：
+  - 新增 `src/data/repositories/scoped-pull.ts` helper：`createScopedPull<TRow>(opts: { tableName, scopeFields, fetchFn })` 返回 `{ pullScope(scopeKey, scopeQuery): Promise<void>, lastVersionFor(scopeKey): number, applyEvent(e) }`，内部 `Map<scopeKey, { lastVersion: number, inflight?: Promise<void> }>`
+  - `<table>.server.ts::observeFind(spec)`: 解析 `spec.where.workspaceId` / `spec.where.dialogId` 为 scopeKey（如 `dialog:abc123`）→ 调 `pullScope(scopeKey, { dialogId: 'abc123' })` → 再返回 cache.observeFind(spec)。scopeKey 维度的 `lastVersion` 缓存避免重复拉
+  - `<table>.server.ts::observeList()` 仍走全表 pull（用作 listing all workspaces / all dialogs of a user 等罕见路径，访问频率低）
+  - `<table>.server.ts::find/findFirst/findKeys/count(spec)`: 同样走 scope-aware pull
+  - realtime apply 链路按现状（WS event 不带 scope filter，client 收到所有 user-scoped events，applyEvent 时按 row.workspaceId / row.dialogId 自动归到对应 scopeKey 的 lastVersion）
+- **bootstrap 配合**：Stage 4.5 Step 8 bootstrap response 不含 items / artifacts（明确写进 `test_returns_all_small_tables_in_one_response` 断言 set），让 lazy 路径成为唯一拉取通道
+- **回归保证**：retrofit 4a/4b/4c 时不能破坏现有全表 pull 路径（部分 store 仍用 `repos.<table>.list()` 全量），保持 list/find 的 scope-less fallback 行为
+- **通过判据**：
+  - api: `tests/api/test_dialogs.py::test_list_with_workspace_id_filters_to_scope`（建 ws1 / ws2 各 5 dialog → `?workspaceId=ws1` 仅返 5 条）
+  - api: `tests/api/test_items.py::test_list_with_dialog_id_filters_to_scope`（同模板）
+  - api: `tests/api/test_dialogs.py::test_workspace_id_combined_with_since_and_limit`（三参数组合，next_cursor 正确）
+  - api: `tests/api/test_dialogs.py::test_workspace_id_account_isolation`（user A 用 user B 的 workspaceId → 仅返自己的，跨 user 静默过滤而非 403）
+  - api: `tests/api/test_dialogs.py::test_no_scope_param_returns_full_user_table`（向后兼容判据）
+  - spec: `tests/e2e/stage4_pre/scoped-pull.spec.ts::dialog opens with empty IDB cache → only target dialog items appear`（清空 `db.items` → 打开 dialog X → Network 面板有且仅有 `?dialogId=X` 请求 → 其他 dialog 的 items 不出现在 IDB）
+  - spec: `tests/e2e/stage4_pre/scoped-pull.spec.ts::switching dialogs hits scoped endpoint per dialog`（连开 3 个 dialog → 3 次 `?dialogId=` 请求，无全表 fetch）
+  - spec: `tests/e2e/stage4_pre/scoped-pull.spec.ts::scoped lastVersion cache prevents redundant fetch`（同 dialog 反复 mount/unmount 组件 → 仅首次有 fetch）
+  - spec: `tests/e2e/stage4_pre/scoped-pull.spec.ts::cross-dialog realtime event applies to correct scope cache`（A tab dialog X 写 item → B tab dialog Y open → realtime event 不污染 Y scope 的 lastVersion）
+  - **故障注入**（必须真跑红一次再绿）：scoped-pull.ts 把 `pullScope` 改为永远拉全表（去掉 scopeQuery 参数）→ spec1 红、stdout 报"expected 1 fetch matching ?dialogId=, got 0 (or got fetch without query)"，恢复后绿
+- **避坑**：
+  - **不要拆两批落地**（先后端再前端）：中间态 server 已支持过滤但前端还在全表拉，等于白上线。同批次落 backend + frontend + retrofit + spec
+  - scopeKey 必须包含表名前缀（如 `dialog:abc` vs `workspace:abc`）避免不同表 scope 撞 key
+  - retrofit 时 `<table>.server.ts` 模块级 `let lastVersion = 0` 单例**保留作为全表 pull 的 lastVersion**（list/全量回灌路径仍用），scoped 路径走独立 `Map`，两套互不干扰
+  - bootstrap response 字段 set 加进 `tests/api/test_bootstrap.py::test_returns_all_small_tables_in_one_response` 断言时显式写"items" / "artifacts" 不在 set，防未来误加
+  - scoped pull 必须在 `observeFind` mount 时主动调一次（不能等 spec.where 变化才 pull），否则首次渲染看不到数据
+  - 4e messages 落地时 `?dialogId=` 是 mandatory（不带就 422 reject），因为全表 messages 拉无意义且会撑爆响应；artifacts / items / dialogs 的 scope 参数仍是 optional 保持兼容
+- **批次组织**：硬前置 3 单独一批（commit 命名 `云同步重构stage4-硬前置3: 作用域过滤 + scoped pull + 4a/4b/4c retrofit`），不与 4d 合批，便于单独 bisect
+
 #### 主体迁移工作
 
 **后端**：`DELETE /api/v1/workspaces/:id?cascade=true` 在单个 Postgres 事务里完成级联；为 dialog 删除提供同款。`GET /api/v1/messages?dialogId=…&since=…&limit=200` 让 `DialogView.vue` 的滚动加载继续可行（注意：`since` + `limit` 走前置 1 的 cursor 协议）。
@@ -804,13 +863,16 @@ interface AuthSource {
   - **测试**：`tests/e2e/stage4/items-realtime.spec.ts` ~5 case：① ws 双 tab 小 inline item put / update / delete realtime 同步（与 dialogs case1 同模板）；② ws 双 tab 100KB ref attachment：A 写入 → blob-client 走 ref → B realtime 收到 → `materializeAttachment` 还原 → contentBuffer bytes 字节级一致；③ workspace delete cascade：A 删 workspace → B 收到一组 dialogs + items tombstone events → IndexedDB 清空；④ providers-rest profile 无 realtime 刷新仍同步；⑤ baseline profile 走 dexie（4.9 删除）。**故障注入**（必须真跑红一次再绿）：跑 case2 时把 `items.server.ts` 的 `materializeAttachment` 注掉一次，验证 stdout 报"contentBuffer bytes mismatch / B got undefined while A had ArrayBuffer(102400)"；恢复后绿
   - **避坑**：见 2026-05-03 修订记录尾的避坑段（不要拷 avatarImages 模板 / 不要在 PG 拆 attachment 列 / `serializeAttachment` 是 async 走网络 / `materializeAttachment` 失败容忍 / cascade 共用 cascade_version）
 
-- **批次-4d · `artifacts`**（依赖 Stage 4 硬前置 2 对象存储 + cursor 分页）
+- **批次-4d · `artifacts`**（依赖 Stage 4 硬前置 2 对象存储 + 硬前置 1 cursor 分页 + 硬前置 3 scoped pull）
   - schema 决策：内容字段大小阈值 → ≥ 64KB 走对象存储 ref；`workspaceId` / `dialogId` 双 FK
-  - 测试：`tests/api/test_artifacts.py` ~10 case（CRUD + 大行 ref 序列化 + 64KB 边界 + 同 sha256 去重 + level 0 inline 兜底 + cursor 分页）；`tests/e2e/stage4/artifacts-large.spec.ts` ~4 case（UI 创建 5MB artifact → ref 上对象存储 → 第二 tab 渲染 + 清缓存重拉，**走 inline envelope 流式同步，不走 notify-only**）
+  - lazy 路径：`artifacts.server.ts` 必须自带 scoped pull（`?workspaceId=X` / `?dialogId=Y`），不允许全表 pull 触发场景（除非用户主动调 `repos.artifacts.list()`，仍兼容）
+  - 测试：`tests/api/test_artifacts.py` ~10 case（CRUD + 大行 ref 序列化 + 64KB 边界 + 同 sha256 去重 + level 0 inline 兜底 + cursor 分页 + workspaceId/dialogId scope 过滤）；`tests/e2e/stage4/artifacts-large.spec.ts` ~5 case（UI 创建 5MB artifact → ref 上对象存储 → 第二 tab 渲染 + 清缓存重拉，**走 inline envelope 流式同步，不走 notify-only**；新增 case：打开 workspace X → 仅 X 的 artifacts 进 IDB，其他 workspace 的不出现）
 
-- **批次-4e · `messages`**（最难，最后做，依赖 Stage 4 硬前置 1 cursor 分页 + 硬前置 2 对象存储）
+- **批次-4e · `messages`**（最难，最后做，依赖 Stage 4 硬前置 1 cursor 分页 + 硬前置 2 对象存储 + 硬前置 3 scoped pull + 流式节流）
   - schema 决策：attachment 字段 `{type:'inline', data:base64}` vs `{type:'ref', url, sha256, size, content_type}`；message 顺序保证（rev / created_at / explicit `order` 字段）；`dialogId` FK；DialogView 的滚动加载靠 cursor + `?since` 双语义 ↔ "拉旧" vs "拉新"
-  - 测试：`tests/api/test_messages.py` ~15 case（CRUD + cursor 分页 + ref 序列化 + 跨 dialog 隔离 + soft-delete 后顺序保持）；`tests/e2e/stage4/messages-attachment.spec.ts` ~6 case（5MB attachment 端到端 + 第二 tab < 500ms 同步 + 清缓存重拉 + DialogView 滚动加载历史 + 离线发送队列 + **流式 PUT 200 次模拟 token 流 → 第二 tab inline envelope 下无丢帧无倒退**）；soak.sh 重跑验证 messages PUT 高频场景下 RSS 仍 < 100MB drift / p95 < 500ms（含 inline envelope 大行 broker 队列兜底监控）
+  - lazy 路径：`messages.server.ts` 的 `?dialogId=` 是 **mandatory**（不带 422 reject，全表 messages 拉无意义且撑爆响应）；首屏靠 bootstrap response 里的 `messages_recent` 直接渲染，滚动加载用 `?dialogId=Y&since=N&limit=200` cursor 续拉
+  - **流式节流策略（2026-05-03 修订）**：流式 token 入口（`composables/call-api.ts` / `utils/middlewares.ts` 的 streaming 分支）用 batch flush 包 `repos.messages.update()`，**200ms 时间窗 + 满 1KB 文本累积 + sentence boundary（。？！. ? ! 换行）三触发取最先**；非流式 PUT 立刻 flush；flush 时 PUT 当前累积的完整 message envelope（不是 delta）。流式结束时（`done` event）强制 flush 一次。具体钩点 4e 落地批次内确定（候选位置：`call-api.ts::streamingHandler` 的 onChunk 回调外包一层 batch wrapper），本修订只敲定策略
+  - 测试：`tests/api/test_messages.py` ~16 case（CRUD + cursor 分页 + ref 序列化 + 跨 dialog 隔离 + soft-delete 后顺序保持 + `?dialogId=` mandatory 校验 422）；`tests/e2e/stage4/messages-attachment.spec.ts` ~7 case（5MB attachment 端到端 + 第二 tab < 500ms 同步 + 清缓存重拉 + DialogView 滚动加载历史 + 离线发送队列 + **流式 PUT 200 次模拟 token 流 → 第二 tab inline envelope 下无丢帧无倒退** + **流式节流真测：5min 流式回复 ~3000 字期间 `wsEvents` 累计 ≤ 25 条 events**）；soak.sh 重跑验证 messages PUT 高频场景下 RSS 仍 < 100MB drift / p95 < 500ms（含 inline envelope 大行 broker 队列兜底监控）
 
 #### 每个批次必须包含
 
@@ -1054,6 +1116,7 @@ ImportDataDialog
 - 后端 `src-backend/data/routers/bootstrap.py`：`GET /api/v1/bootstrap`
   - 一次返回所有小表全量 + messages 表的"最近 N 个 dialog 的最新 50 条"摘要
   - 响应体：`{schema_version, workspaces:[...], dialogs:[...], providers:[...], assistants:[...], plugins:[...], reactives:[...], avatarImages:[...], messages_recent:[...]}`
+  - **明确不含 `items` / `artifacts`**（2026-05-03 修订）：这两张表走硬前置 3 scoped pull，按 dialog/workspace 范围 lazy 拉，不放进 bootstrap 否则会撑爆 1MB 上限。`test_returns_all_small_tables_in_one_response` 必须显式断言 response 字段 set 不含 `items` / `artifacts`，防未来误加
   - 单响应硬上限 1MB（实测一般用户 < 200KB）；messages_recent 超过则按 dialog 截断（反向时间排序，先保留最近活跃的 dialog 的 messages）
   - response 加 `Cache-Control: private, max-age=10` 让客户端短期缓存避免重复请求
 - 前端 `src/router/index.ts` 加 router guard：登录后 `await GET /api/v1/bootstrap` → 写入 IndexedDB 缓存 → 放路由进 MainLayout
@@ -1097,6 +1160,58 @@ ImportDataDialog
 
 ---
 
+### Stage 4.7 — 离线 outbox（写路径离线兜底）
+
+> **2026-05-03 修订引入**。Stage 4.5 bootstrap 解决「读」的离线（IDB 缓存让用户在弱网/离线下仍能浏览历史）；Stage 4.7 解决「写」的离线——用户在弱网/离线下点删除/编辑/发消息，HTTP PUT 失败必须缓存到本地 outbox，下次重连自动 flush，而不是直接抛 error 丢操作。这是新版 SaaS 必备的 UX 保证，也是 Stage 4.9 删 dexie 实现的硬前置（dexie 实现在的时候本地 IDB 写还能兜，删了之后必须靠 outbox）。
+
+**前置**：Stage 4.5 + 硬前置 3 已落地。Stage 4.5 不强制走完真实端到端验收；4.7 与 4.5 验收并行推进。
+
+**目标**：所有 server-routed 表的写操作（`put` / `update` / `delete` / `bulkPut` / `bulkDelete` / `deleteWhere` / `modifyWhere` / `modifyAll`）在网络失败 / 401 refresh 失败 / 超时场景下自动入 outbox 队列；网络恢复 + auth 可用后自动 flush，UI 透明无感。
+
+**做什么**
+
+- **新增 IDB 表**：`db.ts` 加 `outbox` 表 schema：`{ id: auto-uuid PK, table: string, op: 'put'|'delete', target_id: string, payload: JSONB, attempts: number, created_at: number, last_error?: string }`。schema 升 v7，加 `db.version(7).stores({ ..., outbox: 'id, table, created_at' })`
+- **后端 capability hint endpoint**（可选）：`GET /api/v1/health` response 加 `{ ok, db, server_time }`，前端用 `server_time` 与本地时间偏移补偿做 LWW 时间戳，避免本地时钟漂移导致 outbox flush 时全失败
+- **前端新增** `src/data/outbox.ts`：
+  - `enqueue(op: { table, op, targetId, payload })` — IDB 写一行 + emit `outbox:size-changed` 事件让 UI 显示"X 条待同步"角标
+  - `flush()` — 按 created_at 顺序逐条 flush，单条失败按指数退避（base 1s, max 60s, max attempts 10）；超过 attempts 上限的条目标记 `last_error` 为 user-actionable（UI 弹"3 条变更同步失败，[查看] [全部丢弃]"）
+  - 重连钩子：`realtime.ts` 在 WS reconnect 成功后触发 `outbox.flush()`；`auth.backend.ts::tryRefresh` 成功后也触发一次
+  - 浏览器 `online` 事件 + 5min 周期 timer 兜底（pwa 后台 tab 不收 online 事件的场景）
+- **`<table>.server.ts` 改造**：`putOne` / `deleteOne` 在 `http.put` / `http.delete` 抛网络错误（HttpError.isNetwork = true）或 5xx 时调 `outbox.enqueue(...)`；同时本地 IDB 缓存先 put（乐观更新），让 UI 立刻看到变化；flush 时按相同 envelope 重发，server LWW 处理冲突（`updated_at` 旧的被覆盖即丢弃）
+- **冲突解决**：完全走 server 端 LWW（`updated_at` 大者胜）；client 端 outbox 不做冲突检测——重发时 server 比对 row.version，若 server 已有更新版本，outbox 这条 PUT 被静默丢弃（server 200 + 返当前权威 row，client outbox 删除该条）
+- **UI 集成**：`MainLayout.vue` 顶栏加同步状态指示器：`outbox.size === 0` 显示绿点 / `> 0` 显示橙点 + 数字 + 点击展开列表 / `flush 失败 attempts > 5` 显示红点 + 用户操作选项
+
+**通过判据**
+
+- api: `tests/api/test_health.py::test_health_returns_server_time`
+- api: 后端无新 endpoint，所有 outbox 行为是前端兜底
+- spec: `tests/e2e/stage4_7/outbox.spec.ts::offline_put_enqueues_and_optimistic_renders`（mock 网络 down → put → IDB 立刻有 row + outbox 表有一条 + UI 显示新数据 + 同步指示器变橙）
+- spec: `tests/e2e/stage4_7/outbox.spec.ts::reconnect_triggers_flush`（mock down → 多次 put → mock up → 自动 flush → outbox 清空 + server 收到全部 row + 同步指示器变绿）
+- spec: `tests/e2e/stage4_7/outbox.spec.ts::flush_respects_order`（offline 时 put A → put A 改名 → put B → online → server 收到顺序 [A, A', B]，最终 server 状态 = A' + B）
+- spec: `tests/e2e/stage4_7/outbox.spec.ts::lww_silently_drops_stale`（A tab offline put 旧 version → B tab online put 新 version → A tab online → A 的 outbox 条目 server 返回当前 row（version 更高）→ A outbox 删除该条 + IDB 接收 server 权威 row）
+- spec: `tests/e2e/stage4_7/outbox.spec.ts::max_attempts_exhausted_user_actionable`（mock 持续 500 → attempts 到 10 → UI 弹"X 条同步失败"+ 用户可"重试" / "丢弃"）
+- spec: `tests/e2e/stage4_7/outbox.spec.ts::cross_tab_outbox_dedup`（A tab put → B tab 同时 put 同 id 不同字段 → 两 tab 都 enqueue → 都 flush → server LWW 二选一 + 两 tab 收 realtime event 收敛）
+- **故障注入**（必须真跑红一次再绿）：把 outbox.flush 临时改为 no-op → spec1 的 reconnect 后 outbox 清空判据红、stdout 报"outbox.size still 3 after reconnect"，恢复后绿
+
+**回滚**
+
+- `OUTBOX_ENABLED=false` env flag 关闭 outbox（写失败仍抛 error，回到 4.7 之前行为）；用作秒级 disable 应急开关
+- IDB outbox 表保留（不破坏数据），关 flag 后老条目静默不 flush，重新开启后续推
+
+**避坑**
+
+- outbox row payload 是序列化后的 wire envelope（含 attachment ref），不要存 ArrayBuffer / Blob 直接进 IDB outbox 表（会撑爆 quota）；blob 在入 outbox 前已通过 `serializeAttachment` 转 ref，bytes 已落到 BlobStore（在线时已上传成功的场景）或本地 IDB Blob 缓存（离线场景，重连后 outbox flush 前先 retry blob upload）
+- **离线 blob upload**：离线时 `serializeAttachment` 大于 64KB 的路径会 throw（putBlob 网络失败），需要在 outbox 之外维护一个 `blob_outbox` 表存 `{ sha256 PK, bytes Blob, content_type, mime, size, attempts }`；outbox flush 时先 flush blob_outbox（按 ref 依赖图拓扑顺序），所有 ref 上线后再 flush row outbox
+- 浏览器 quota 限制：outbox + blob_outbox 总占用超过 quota 50% 时拒绝新 enqueue + UI 强提示"本地存储即将满，请连网"
+- realtime apply 路径（WS event 到达 → put IDB）**不**走 outbox，是从 server 单向流入；outbox 只覆盖 client → server 写路径
+- `bulkPut` / `bulkDelete` 入 outbox 时按单条拆开 enqueue（不要存数组 payload），避免单 large bulk 失败后整批重发
+
+**批次状态**
+
+- 批次-4.7：⏳ 未开 · 依赖 Stage 4.5 落地 + 硬前置 3 落地
+
+---
+
 ### Stage 4.9 — flag 路由层 + dexie 实现一次性下架
 
 > **2026-05-02 方向调整修订引入**。本 Stage 是为了让代码库回归"只有一种实现"的清爽态——Stage 1 起为"上线但不启用"灰度设计的双实现 + flag 路由层在 new-deploy 上线后已是 dead weight，但保留到 Stage 4.5 作为应急 disable 单表的开关。
@@ -1104,6 +1219,8 @@ ImportDataDialog
 **前置（必须满足才能开 Stage 4.9）**：
 
 - Stage 4.5 已上线，`IMPORT_JOB_ENABLED` 默认开
+- Stage 4.7 离线 outbox 已上线，`OUTBOX_ENABLED` 默认开，稳定运行 ≥ 3 天无 outbox 数据丢失事件（dexie 实现删除后，outbox 是写路径离线兜底的唯一通道，必须先验证）
+- 硬前置 3 scoped pull 已上线（4d/4e 强依赖）
 - **真实端到端验收已通过**：用户在 my-deploy 上 ExportDataDialog 导出真实数据 → 在 new-deploy 上 ImportDataDialog 导入 → 全部数据核对正确（详见「上线节奏与人工端到端测试分工」段 / Stage 4.5 分水岭验收清单）
 - new-deploy 上线全档稳定运行 ≥ 1 周，无单表 disable 应急事件
 
@@ -1292,7 +1409,7 @@ ImportDataDialog
 
 - **Schema 真源迁移**：从 Stage 1 起以后端 Alembic 迁移为权威；客户端 `db.ts` 的 schema 在 Stage 5 后**仍保持与旧版兼容**（同表名 / 同主键 / 同索引），让 `dexie-export-import` 跨版本继续可用。
 - **现存 reading hooks**：`db.ts` 里的几个 `db.<table>.hook('reading', ...)` v1.4/v1.8 兼容迁移逻辑，在 Stage 4.5 ImportJob worker 流式解析旧版 `aiaw_user_db.json` 时需要同等地把老 schema 行归一化到新格式后再写 PG，避免老 row 直接落库导致 schema 错位。new-deploy 后端不服务老客户端（老客户端连 my-deploy），所以读序列化器只在 import 路径上需要这套兼容。
-- **离线写**：Stage 2.5 已摘 `dexie-cloud-addon`，原"addon 兜底离线写"路径已不存在。当前阶段 server-routed 表的离线写靠 IndexedDB 缓存层吸收（写本地成功 + server PUT 失败时静默；重连后无自动 flush，需用户操作触发或刷新页面）；Stage 5 引入 `outbox` 表 + `RemoteSyncSource` 重连 flush 后才有强幂等离线写保证。
+- **离线写**：Stage 2.5 已摘 `dexie-cloud-addon`，原"addon 兜底离线写"路径已不存在。当前阶段 server-routed 表的离线写靠 IndexedDB 缓存层吸收（写本地成功 + server PUT 失败时静默；重连后无自动 flush，需用户操作触发或刷新页面）；**Stage 4.7 引入 `outbox` 表 + 重连自动 flush + LWW** 后才有强幂等离线写保证（2026-05-03 修订，原写"Stage 5 引入"已作废）。
 - **观测**：`Repository` 接口层加 `data.repo.<table>.<op>` 计数器，灰度期可对比新旧实现错误率。
 - **i18n / UI 状态条**：Stage 2 起补一个全局 `syncState` 暴露（`'idle' | 'syncing' | 'offline' | 'error'`），写进 `MainLayout` 顶栏，提前在迁移期就给用户可视化反馈。
 - **后端模块条件挂载**：`src-backend/data/auth.py` 等模块在 import 期间会读 `JWT_SECRET` 并 fail-fast；`src-backend/app.py` 通过 `BACKEND_DATA_API_ENABLED` flag **延迟 import** data 路由（lazy import 在挂载函数内），避免单环境 misconfig 把 CORS 代理 / 文档解析 / SPA 静态等无关功能一起带崩。新增 backend 子模块（如 Stage 2 的 `realtime.py`、Stage 4 的 `blob_store.py`、Stage 4.5 的 `import_worker.py`）时同样应在 flag 守卫内 import，并把所需 env 加入挂载函数的 fail-fast 校验列表。
