@@ -19,7 +19,13 @@ export default configure((ctx) => {
       'i18n',
       'unocss',
       'global-components',
-      'backend-auth'
+      'backend-auth',
+      // Test-only debug surface: exposes window.__db__ / __authSource__ for e2e.
+      // Always listed; the boot body itself no-ops unless EXPOSE_DB === 'true'
+      // at build time (vite inlines process.env.EXPOSE_DB so the early-return
+      // becomes dead code in non-test bundles). Dockerfile asserts EXPOSE_DB
+      // is not 'true' for prod images as a hard guard.
+      'expose-debug'
     ],
 
     // https://v2.quasar.dev/quasar-cli-vite/quasar-config-js#css

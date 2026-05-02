@@ -12,6 +12,12 @@
 
 ## 修订记录
 
+- **2026-05-02 · Phase 4 落地阶段微调**
+  - **背景**：Phase 4 实现 `expose-debug` boot 时，原 plan 写 quasar.config.js 受 `process.env.EXPOSE_DB === 'true'` 条件挂载，实测发现 dotenv 加载顺序不保证在 config-load 前，会让 baseline build 不含 `__db__` 而 smoke 等 ready 超时；providers smoke 又揭示 server repo 的 `observeList` 不会自动触发 pull、`db.providers` 主键为 `id` 时 `data` 必须含 `id` 否则 client put 抛 DataError。
+  - **决策 1**：`expose-debug` boot 始终列在 quasar.config.js boot 数组里，但运行时由 `String(process.env.EXPOSE_DB) !== 'true'` 早 return（vite 构建期内联 + dead code elimination 让 prod bundle 不含 expose 路径），Dockerfile 加 grep 守卫主动 fail prod 镜像里 `EXPOSE_DB=true` 泄漏的情况。
+  - **决策 2**：`expose-debug` 同时挂 `window.__repos__ = repos`，让 e2e 可以显式触发 server repo pull —— `observeList` 仅 ride on Dexie liveQuery，不调用 `list()` 不会拉 server。
+  - **影响范围**：仅 Phase 4 内部交付（boot 文件、quasar.config.js boot 列表、Dockerfile assert、smoke spec 写法）；不影响后续 Phase 设计。
+
 - **2026-05-02 · plan 初稿入库**
   - **背景**：Stage 2 Step 4 即将动工，若仍走手测验收，「双 tab + 切网络」类判据将无法被 Claude Code 自动跑。利用 Step 4 开工前先把脚手架做掉，作为 Step 4 验收的实际工具。
   - **决策 1**：两层测试架构（pytest 后端 + Playwright 端到端）。舍弃 Vitest 单元层——本项目 bug 几乎全是「多端协作 / 时序 / 网络 / 缓存层与 server 层不一致」型，纯单元覆盖不到，性价比低。等 Stage 5 摘 dexie-cloud 后再补几个核心 repository 的 Vitest。
@@ -44,8 +50,19 @@
     - 判据真跑：`pnpm test:api`（含 slow） 33 passed 49s（plan 预算 < 60s）；`-m "not slow"` 32 passed 13s
     - 故障注入红测：① providers.py list_providers 去掉 `Provider.user_id == user_id` → `test_account_isolation` 红 + stdout 直接出 `B leaked A row: [{...}]` 含具体 dict（plan 判据 #2 ✅）。② stream.py `HEARTBEAT_INTERVAL` 25→100 → `test_ws_heartbeat_timeout_closes_connection` 红（slow mark 内 30s 等不到 ping）（plan 判据 #3 ✅，证明 case 不依赖具体 sleep 实现）。两次注入后均已恢复并验证 33/33 仍绿
     - 备注：psycopg 改宽到 `>=3.2.10`（python 3.14 wheel 起 3.2.10）；运行时 1500+ 行 DeprecationWarning 全是 pytest-asyncio 0.24 自身用 `asyncio.get_event_loop_policy`，3.16 才删，暂忍
-  - Phase 4-7 未启动
-  - 下一步：Phase 4（Playwright 脚手架 + 核心 helper + smoke spec），Phase 6 同步把 cloud-sync plan 已完成 Step 的「通过判据」段末尾补 `api: tests/api/<file>::<test>` 引用
+  - Phase 4 Playwright 脚手架 + 核心 helper + smoke spec ✅
+    - 依赖：`@playwright/test` 1.59 / `pg` 8.20 / `@types/pg` 8.20（dev）；`pnpm test:e2e:install` 装 chromium-headless-shell
+    - 调试钩子：`src/boot/expose-debug.ts` 受 `EXPOSE_DB=true` 守卫挂 `window.__db__` / `__authSource__` / `__dexieAuthSource__` / `__repos__` / `__exposeDebugReady__`；boot 永远列在 `quasar.config.js` 里，运行时空守卫 + 构建期 vite 内联 + Dockerfile 的 `grep ^EXPOSE_DB[[:space:]]*=[[:space:]]*true .env.local` 主动 fail 三层兜底
+    - `playwright.config.ts`：3 projects（baseline / providers-rest / realtime-ws）→ 端口 9007/9008/9009，每 project 独立 webServer 跑 `serve-build.mjs --dir=$E2E_BUILD_DIR_<PROFILE>`；reporter = list + json (`tests/.results/e2e.json`) + html (`tests/.results/e2e-html`)；trace=on-first-retry / screenshot=only-on-failure / video=retain-on-failure；workers=1 共用单 backend
+    - `tests/scripts/run-playwright.sh`：幂等起 docker + backend (9011 健康检查 200 复用) → 串行 build 全 3 profile（cache hit 各 ~0.4s）→ 把 build dir 注入 `E2E_BUILD_DIR_*` env → exec `playwright test`；串行 build 是因 `quasar build` 写共用 `dist/spa` + 换 `.env.local`，并行会互踩
+    - `tests/scripts/backend-start.sh` 把 `CORS_ALLOW_ORIGINS` 扩到 9007/9008/9009 三端口（`localhost` + `127.0.0.1` 各一份）
+    - helpers（10 份）：`env.ts` 端口 / 后端 URL 常量；`auth.ts` `registerViaApi` / `loginApi` / `injectAuth`(addInitScript 写 `aiaw.backendAuth.refresh`+`...user`) / `loginViaApi` / `loginViaUI`（label-based selector） / `logoutViaStorage`；`tabs.ts` `openTabsForUser` / `openContextsForUsers`；`db.ts` `exposeReady`(等 `__exposeDebugReady__`) / `dumpTable` / `maxVersion` / `clearAll` / `putRow` / `getRow`；`backend.ts` `backendClient(token)` REST 薄封 + `putProvider` / `listProviders` / `deleteProvider`；`pg.ts` lazy `pgPool` + `pgQuery` / `expectRowExists` / `countByUser`（带 `^[a-z_][a-z0-9_]*$` 表名守卫）；`ws.ts` `captureWs(page)` 累积所有 framereceived，提供 `waitForFrame` / `expectFrame`；`net.ts` `setOffline` / `blockWS`(route abort ws://+wss://) / `blockHost`；`sync.ts` `expectRowSync(pageA,pageB,table,id,{withinMs:1500})` poll dumpTable + `waitForVersion`；`io.ts` `exportData(page)` 抓 download saveAs `tests/.results/export-*` + `importData(page,filePath)` setInputFiles
+    - `tests/e2e/smoke.spec.ts`：3 case 各按 `testInfo.project.name` 跳：① baseline app boot + `__db__.workspaces.toArray()` 是数组 + 0 backend 请求；② providers-rest 注册 + backend.putProvider + injectAuth + 等 `currentToken()` 真值 + 显式 `__repos__.providers.list()` 触发 pull + `__db__.providers` 含写入 id；③ realtime-ws 仅验 build 加载 + `__db__` 暴露
+    - 判据真跑：① `pnpm test:e2e --project=baseline -g smoke` cache hit 路径 3.5s wall（plan 预算 < 30s ✅）；② `pnpm test:e2e -g smoke` 全 3 profile 5.2s 测试 + ~6.8s wall（3 passed / 6 skipped）；③ 注入 `routers/auth.py::register` 直 `raise HTTPException(500, 'INJECTED-FOR-PHASE4-CRITERION-2')` → providers-rest smoke 红 + stdout 直出 `Error: Expected status 200 from /api/v1/auth/register, got 500: {"detail":"INJECTED-FOR-PHASE4-CRITERION-2"}` 含具体 path + status + body（plan 判据 #2 ✅），注入恢复后 3/3 重绿
+    - 关键避坑：① `process.env.EXPOSE_DB === 'true'` 在 quasar.config.js 配置期不可靠（dotenv 加载顺序），改为 boot 永远列入 + 运行时 `String(process.env.EXPOSE_DB) !== 'true'` 早 return（vite 构建期内联做 dead code elimination，prod bundle 不含 expose 路径）；② providers store 的 `observeList` 仅是 Dexie liveQuery，不会触发 backend pull，smoke 必须显式调 `__repos__.providers.list()` 才能让 server 写的 row 进 cache；③ `db.providers` schema 主键是 `id`，PUT body 的 `data` 必须含 `id` 字段，否则 client 端 `db.providers.put(row.data)` 抛 `DataError: 'IDBObjectStore' key path did not yield a value`；④ helpers 走 `eslint plugin/promise/param-names`：`new Promise(r => ...)` 必须命名 `resolve`，否则 vite-plugin-checker 把 build 干红
+    - 备注：playwright.config 的 webServer 用 `url: http://.../index.html` 而非 `port`（`port` 模式 GET / 在 SPA fallback 之前可能 404）；`--project=baseline` 跑时仍会启动其余 2 个 sirv（sub-100ms 起开销可忽略）；helpers 全用 `(window as any).__db__` 弱类型避免在 src 之外维护 declare global
+  - Phase 5-7 未启动
+  - 下一步：Phase 5（Stage 2 Step 4 验收 spec：双 tab WS 实时联动 / 离线 30s 重连补漏 / providers-rest 退化 / baseline 字节级一致）；Phase 6 反向回填把 cloud-sync plan 已完成 Step 的「通过判据」段末尾补 `api: tests/api/<file>::<test>` / `spec: tests/e2e/<file>::<test>` 引用
 
 ---
 

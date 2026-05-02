@@ -4,6 +4,13 @@ WORKDIR /app
 COPY . .
 COPY .env.docker .env.local
 RUN apk --no-cache add --virtual .builds-deps build-base python3
+# Hard guard: prod builds must NOT carry the EXPOSE_DB=true debug surface
+# (boot/expose-debug.ts would mount window.__db__ / window.__authSource__).
+# If anyone leaks EXPOSE_DB=true into .env.docker, fail the build loudly.
+RUN if grep -E '^EXPOSE_DB[[:space:]]*=[[:space:]]*true' .env.local >/dev/null 2>&1; then \
+      echo "ERROR: EXPOSE_DB=true present in .env.docker — refusing to build prod image" >&2; \
+      exit 1; \
+    fi
 RUN npm install -g pnpm
 RUN pnpm install && pnpm build -m pwa
 
