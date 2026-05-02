@@ -22,4 +22,8 @@ COPY --from=builder /app/dist/pwa ./static
 RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 9010
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "9010"]
+# 启动时若 BACKEND_DATA_API_ENABLED=true 先跑 alembic upgrade head（幂等），
+# 否则跳过——my-deploy 这类不开 backend data API 的部署没有 DATABASE_URL，
+# 不能误跑 alembic。exec 让 uvicorn 替换 shell 进程，确保容器收到的 SIGTERM
+# 能传到 uvicorn 触发优雅停机。
+CMD ["sh", "-c", "if [ \"$BACKEND_DATA_API_ENABLED\" = \"true\" ]; then alembic upgrade head; fi && exec uvicorn app:app --host 0.0.0.0 --port 9010"]
