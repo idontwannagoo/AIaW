@@ -12,6 +12,23 @@
 
 ## 修订记录
 
+- **2026-05-02 · new-deploy Northflank 实例上线 + 三档 backend flag 全开**
+  - **背景**：Stage 2.5 代码清理落地后按 plan 进度快照「下一步」清单逐项推进部署侧工作。期间 plan 因为节奏紧没有同步追加修订记录，事后核对发现：commit `6465f12`（开第 1 档）→ `22b4391`（修 `http.ts:26` 的 `!BackendApiBaseURL` 空字符串问题，发现 `BACKEND_DATA_API_URL` 不支持留空，必须填具体公网域名）→ `103afad`（Dockerfile 加 alembic upgrade head 启动钩子，避免每次 release 手跑迁移）→ `3bbba98`（第 2+3 档同时开）→ `7abaa87`（DEXIE_DB_URL 留空）→ `748f0a0`（前端清理）→ `a251997`（后端清理 + plan 同步）这一连串 commit 已经把 Stage 1+1.5+2+2.5 完整态推到生产，但 plan 进度快照「下一步」仍写「在 Northflank 新建第二个服务...开 backend flag」，与现实脱节。本次补这条修订记录 + 进度快照对齐
+  - **变更**：
+    - Northflank 服务 2 已建，公网域名 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run`，绑 `new-deploy` 分支自动构建 + 自部署 Postgres 实例
+    - 前端 `.env.docker` 三档 flag 全开（构建期内联）：`BACKEND_DATA_API_URL=https://p01--new-aiaw--hqdb2bsvdnbt.code.run` / `BACKEND_AUTH=true` / `BACKEND_DATA_TABLES=providers` / `REALTIME_TRANSPORT=auto`；`DEXIE_DB_URL=` 留空（new-deploy 不连原 Dexie SaaS）
+    - 后端 Northflank 控制台 env：`BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=true`（注意：这些是 runtime env，**绝不**写进 `.env.docker`，否则会泄露到前端 JS bundle）
+    - Dockerfile 第二阶段加 `alembic upgrade head` 启动钩子（commit `103afad`），release 时自动应用 migration，无需手跑
+    - 进度快照新增本条对应条目；「下一步」从「新建实例 + 开 flag」更新为「开 Stage 3 第一张叶子表（建议 `reactives` 起步）」
+  - **影响范围**：
+    - 实测验证：`/api/v1/health` → `{status:"ok",db:"ok"}`；`/api/v1/auth/me` → 401；`/api/v1/providers` → 401；`/api/v1/auth/register` → 422（密码强度规则起效）。完整链路 Stage 1+1.5+2+2.5 全部生效
+    - my-deploy 实例完全不受影响，老用户路径继续按 Stage 0 baseline 跑
+    - 部署侧工作 closed，Stage 3 可以正式开工。Stage 3 第一张表落地 PR 应同时验证：① 该表 CSV 加进 `.env.docker` 的 `BACKEND_DATA_TABLES`；② 后端新 router 在 `BACKEND_DATA_API_ENABLED` flag 守卫的 lazy import 列表里（参考 `app.py::_enable_backend_data_api`）；③ alembic migration 跑过；④ `pnpm test:api` + `pnpm test:e2e` 全绿
+  - **避坑（部署期踩过 + 修了的）**：
+    - ① **`BACKEND_DATA_API_URL` 不支持留空**：`src/data/http.ts:26` 的 gate 是 `if (!BackendApiBaseURL) throw`，留空（空字符串）会让任何 fetch 在 buildUrl 阶段 throw，UI 全炸。第 1 档开启 PR 第一版用空字符串 + AccountPage 走 BackendLoginDialog 组合，浏览器 Console 立刻报错。修为强制要求填具体公网域名（commit `22b4391`）。Northflank 单容器架构下填 service 自己的公网域名即可；以后绑自定义域名时同步改 `.env.docker` 再 push 触发重 build
+    - ② **Dockerfile 漏 alembic 启动钩子**：第一次 release 后 `/api/v1/health` 返 `{db:"error"}`，因为 PG 是空库 + migration 没跑。临时手 exec 容器跑 `alembic upgrade head` 救场后补 commit `103afad` 把钩子加进 Dockerfile 第二阶段 entrypoint。教训：alembic 不会自动跑、Northflank 不会自动跑，必须显式写进 image 启动流程
+    - ③ **plan 进度快照与实际部署节奏漂移**：Stage 2.5 落地后 6 个 commit 一气呵成把部署推到生产，期间 plan 没追加修订记录、进度快照「下一步」也没更新。下次类似的连续部署节奏要在每个里程碑（如「服务可达」「全档 flag 开启」）至少补一条快照行，避免事后追溯成本
+
 - **2026-05-02 · Stage 2.5 落地：摘双登录 UI + dexie-cloud-addon + Stage 5 deprecated 清理整体前置**
   - **背景**：2026-05-02 部署分支拓扑硬切完成、new-deploy 第 1+2+3 档 flag 全开后，复盘发现 plan 与代码两条线不再一致：plan 文档已经把「导入导出 only」+「新版默认不挂 dexie-cloud-addon」+「Stage 5 才清 ~150 行 deprecated 代码」写得很清楚（2026-05-02 转向修订记录），但 new-deploy 上线时仍然按旧 Stage 1.5「双写窗口」设计走 —— `.env.docker` 里 `DEXIE_DB_URL=https://znm3rqzc8.dexie.cloud` 把 new-deploy 接到原 Dexie SaaS、AccountPage 仍展示「登录原 Dexie 账号」入口、login-dialogs.ts 仍并行绑定双 source、`linked_dexie_email` 列 + `link-dexie` endpoint + 首次登录调用钩子全部仍在。这些遗留对「新版空库 + 用户主动 export → import」的方向纯属误导：用户在新版登原 Dexie 账号根本读不到任何后端表，dexie-cloud-addon 还在挂载意味着新用户首屏多一份对外 SaaS 依赖。同时把 ~150 行清理推迟到 Stage 5 也无技术必要 —— Stage 2 已收官、in-flight 风险消失，可以现在就清。
     - 第一次降险动作（env 改空）暴露了第二个问题：`MainLayout.vue` 的登录按钮 gate 是 `v-if="DexieDBURL"`，env 留空后登录按钮整个消失。说明双登录设计在路由 / layout / composables 多个层面都假设 `DexieDBURL` 是「是否启用账号系统」的代理变量，方向转向后必须把 gate 全部换成 `BackendAuth`。
@@ -213,7 +230,8 @@
     - **Stage 2 出口**：三条出口判据全部达成（回归全绿 + 三组数字达标 + flag 默认空仍字节级等同 Stage 1）
   - **部署分支拓扑硬切（B 方案 reset）**✅ — 详见修订记录 2026-05-02 · 部署分支拓扑硬切。my-deploy 退到 `2b26349` 干净 baseline（仅 Stage 0 抽象层 + Dexie 路径 bug fix）；`new-deploy` 拉自 `5c689ab` 承载 Stage 1+ 全套；`backup/my-deploy-pre-reset` 远端永久保留作为逃生通道。CLAUDE.md 新增「部署分支拓扑」段固化分支角色 / 工作流契约 / Northflank 约束 / 老用户迁移路径 / reset SOP，所有未来工作以此为准
   - **Stage 2.5 摘双登录 UI + dexie-cloud-addon 前置清理** ✅ — 详见修订记录 2026-05-02 · Stage 2.5 落地。env commit `7abaa87`（DEXIE_DB_URL 留空）+ 前端清理 commit `748f0a0`（删 auth.dexie.ts / server-tables.ts / db.cloud.configure / 双登录 UI / linkedDexieEmail 字段链 / dexie-cloud-addon 包）+ 后端清理 commit（drop linked_dexie_email migration + endpoint + test）一并合 new-deploy。`pnpm test:api` 38 → 37 全绿；`pnpm test:e2e` 17 / 102 全绿（85 skipped 是 profile gate，与 Stage 2 收官基线一致）。Stage 5 因此收窄为「导入导出端到端验证」单条
-  - 下一步：在 Northflank 新建第二个服务指向 `new-deploy` 分支 + 独立 Postgres + 独立域名；按 plan 灰度顺序逐档开 backend flag（`BACKEND_DATA_API_ENABLED` → `BACKEND_AUTH` + `BACKEND_DATA_API_URL` → `BACKEND_DATA_TABLES=providers` → `REALTIME_TRANSPORT=auto`）。所有 Stage 3+ 代码改动 / spec / plan 修订仅合到 `new-deploy`，不再触碰 my-deploy。Stage 4.5 修订记录已废弃 per-table 自动迁移机制 ceremony，Stage 3 节奏聚焦每张叶子表 SQLModel + router + alembic + flag
+  - **new-deploy Northflank 实例上线 + 全档 backend flag 开启** ✅ — Northflank 第二服务 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run` 已建并指向 `new-deploy` 分支。前端 `.env.docker` 三档 flag 全开（commit 区间 `6465f12..3bbba98`，配合 `22b4391` 修复 `BACKEND_DATA_API_URL` 不支持留空 + `103afad` Dockerfile 加 alembic 启动钩子）：第 1 档 `BACKEND_AUTH=true` + `BACKEND_DATA_API_URL=<self>`；第 2 档 `BACKEND_DATA_TABLES=providers`；第 3 档 `REALTIME_TRANSPORT=auto`。后端 Northflank 控制台 env 已配 `BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=true`。实测 `/api/v1/health` 返 `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/auth/register` 422（密码强度规则起效），全套 Stage 1 + 1.5 + 2 + 2.5 全部生效
+  - 下一步：开 **Stage 3** 第一张叶子表（候选优先级：`reactives` ＞ `installedPluginsV2` ＞ `assistants` ＞ `avatarImages`，`reactives` 最先因为 `persistent-reactive.ts` 的底层基础设施依赖它，落地后能给后续表做 KV 路径模板）。每张表节奏：SQLModel + router + alembic + `<table>.server.ts` + `BACKEND_DATA_TABLES` CSV 加表名 + 同 PR 落 spec/api 通过判据。所有 Stage 3+ 代码改动 / spec / plan 修订仅合到 `new-deploy`，不再触碰 my-deploy
 
 ---
 
