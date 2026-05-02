@@ -16,6 +16,20 @@
 
 > **术语说明**：plan 中"批次" / "批次-Xx"指**一组原子的、可整体回滚的提交集合**——本仓库是单人 + AI 开发，没有 GitHub PR 流程，"批次"对应"一次落地的 commit 序列"，不暗示 review / merge 流程。批次代号仍按字母分组方便引用（如 `批次-3a` / `批次-4b`）。
 
+- **2026-05-02 · 硬前置 1 收窄：保留 inline envelope 流式同步 + cursor 分页（砍掉 notify-only 协议）**
+  - **背景**：硬前置 1 原设计含两块——① WS / SSE event 改 notify-only（去 `row` 字段，客户端 GET row 按需拉）+ ② `?since=N` 加 cursor 续拉。实施一半发现 ① 当前朴素实现对**流式云同步**场景**零正收益、负 RTT**：bytes-on-wire 仍是 O(N²)（GET 拉的也是当前累积 row），多 N 个 RTT + N 次 PG 查询。要让 notify-only 真省带宽必须配合客户端 event coalesce/dedup + 服务端 ETag/304，~200–300 行额外异步逻辑。broker 队列内存优势（10MB → 20KB / 活跃 sub）只有大规模 SaaS 才兑现，本项目（个人 / 小规模独立部署）触不到。同时 notify-only 引入「event 到了 row 没到」中间态 + race condition + 404-as-tombstone 启发式，让多 tab / 跨设备流式同步在弱网下反而 UX 变差（断断续续 / 偶尔倒退 / 帧缺失）。
+  - **未来约束**：
+    - **硬前置 1 收窄为「仅 cursor 分页」**：保留 `?since=N&limit=200&next_cursor=…` 续拉协议（`pagination.py` + `providers.py` 改动）；删除 notify-only 协议设计 + per-table payload-mode 配置位 + 客户端 fetchAndDispatch 路径 + `_test/payload-mode` admin endpoint + `BACKEND_TEST_HOOKS_ENABLED` env
+    - **流式云同步走 inline envelope**：所有表（含 messages / artifacts）的 WS / SSE event 始终 `{table, op, id, rev, row}` 完整 envelope；客户端直接 put row 入 IndexedDB，没有 row-fetch 中间态。**等同 Stage 1–3 现有协议直接复用到 messages / artifacts**，没有"大表协议 / 小表协议"之分
+    - **broker 队列内存兜底**：依赖硬前置 2（attachment 走 ref，单 row ≤ ~200KB）+ broker 现有 `maxsize=200` close-on-overflow 机制（Stage 2 设计）即可；soak.sh 继续跑「100 条大 message 连续 PUT，server RSS 涨幅 < 50MB」做规模兜底监控
+    - **批次-4d artifacts / 批次-4e messages 判据调整**：删除「WS event 字节 < 1KB」「客户端用 event.id 调 GET 拿回完整 row」类 notify-only 判据；保留「`?since=0&limit=200` 第一次响应 < 1MB / 续拉 ≥ 50 次」类 cursor 判据；新增「跨 tab 流式 PUT 200 次（模拟 token 流）→ 第二 tab UI 无丢帧 / 无倒退」类 inline 流式同步判据
+    - **未来真到规模瓶颈再补 notify-only**：cursor 基础设施已到位，client-side coalesce + ETag/304 可独立加层，不影响现有 API 设计
+  - **避坑**：
+    - **不要顺手删 `pagination.py` / `test_pagination.py`**：cursor 是 messages / artifacts 必需的初始拉取分页机制，与 notify-only 完全解耦，删了等于批次-4e 还要重写
+    - **删 notify-only 时连带删 `BACKEND_TEST_HOOKS_ENABLED` env + `_test/payload-mode` admin endpoint + `notify-only-dispatcher.spec.ts` + `test_payload_mode.py`**；但 `tests/api/conftest.py` 的 payload-mode reset 是为 admin endpoint 服务的，连带删
+    - **不要回退 broker 现有 close-on-overflow**：那是 Stage 2 已有的、与 notify-only 无关的兜底机制
+    - **inline 流式同步的 broker 内存可观察性**：messages / artifacts 落地后 soak.sh 的「100 条大 message 连续 PUT」结果是早期信号 —— 涨幅明显超出 50MB 时说明硬前置 2 阈值（64KB）需要调低，或真到了该补 notify-only 的规模
+
 - **2026-05-02 · 方向调整：砍 flag 灰度机制 + 折中 批次拆分 + 引入「分水岭」端到端测试分工**
   - **背景**：new-deploy 是空库新实例 + my-deploy 是天然回滚通道（用户回退 = 用回 my-deploy URL），原 plan「flag 默认关 + 字节级一致 + dexie 双实现 + 上线但不启用」整套机制（为"无感灰度"设计）在新方向下是 dead weight。同时复盘「逐表分批」真实价值不在灰度而在「切碎不可逆 schema 决策 + alembic 颗粒度 + bisect 定位 + TDD 反馈环」，可按表组 schema 决策大小折中拆分。
   - **未来约束**：
@@ -62,7 +76,7 @@
   - **未来约束**：
     - 「现有用户数据迁移」单一路径 = 老用户在 my-deploy ExportDataDialog 导出 → 在 new-deploy ImportDataDialog 导入；不存在自动后台迁移、不存在双写窗口、不存在迁移标记表、不存在 `/api/v1/migrate/status` endpoint
     - new-deploy 默认不挂 `dexie-cloud-addon`；老用户登录新版看到的是空账号；不愿迁的继续用 my-deploy
-    - **Stage 4 硬前置 1（messages / artifacts 落地前不可后置）**：WS event payload 改为 `{table, op, id, rev}` only，业务 row 走 REST 按需拉；`?since=N` 加 `limit` + cursor 续拉
+    - **Stage 4 硬前置 1（messages / artifacts 落地前不可后置）**：原设计含 ① notify-only WS 协议（去 `row` 字段）+ ② cursor 分页（`?since=N&limit=200&next_cursor=…`）。**2026-05-02 收窄**为「仅 cursor 分页」，notify-only 部分整体放弃；流式云同步走 inline envelope。详见顶部修订记录「硬前置 1 收窄」条
     - **Stage 4 硬前置 2（同上）**：对象存储分流，阈值 64KB；< 64KB inline 进 PG，≥ 64KB 走 multipart `/api/v1/blobs` 拿 ref；PG 行只存 `{type:'ref', url, sha256, size}`
     - **对外格式纪律**：导出 JSON 永远 base64 内联，**绝不**出现 `{type:'ref', url}` 字段；导出时新版 fetch 所有 ref blob → 重新 base64 内联，与旧版导出字节级互通
     - 失败回退路径 = 用回 my-deploy URL；旧版本地 + Dexie Cloud 数据完整无损（旧版根本不知道新版存在）
@@ -91,6 +105,7 @@
 - **Stage 3 / 批次-3a** ✅ `reactives` KV 表迁到 backend：复合主键 `(user_id, key)` + envelope `{key, version, updated_at, deleted, data}` + alembic migration `d6a3f8c91e22` + WS / SSE 加 reactives 白名单 + 前端 `reactives.server.ts` 路由 + `BACKEND_DATA_TABLES=providers,reactives`。`persistent-reactive.ts` 透明走 server，跨 tab 实时同步可用
 - **Stage 3 / 批次-3b** ✅ `assistants` (id-PK) + `installedPlugins` (KV-PK like reactives, 但 `data` 是整行) + `avatarImages` (id-PK + ArrayBuffer↔base64 wire) 三张叶子表迁到 backend：alembic migration `e4b2c5f9d017` + 3 个 router + WS / SSE 加 3 张表白名单 + 3 个 `<table>.server.ts` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages`
 - **Stage 4 硬前置 2** ✅ 对象存储 BlobStore + `/api/v1/blobs` endpoint：`blobs` 表 (sha256 PK + size + content_type + storage_key) + `blob_refs` 表 ((user_id, sha256) 复合 PK + last_seen_at) + alembic migration `f1a3b8c5d4e2`；`BlobStore` 抽象接口 + `LocalFsBlobStore` 默认实现（src-backend/.blob-store 分片路径 `<sha[:2]>/<rest>`）+ `S3BlobStore` 骨架 (boto3 lazy import)；HMAC-SHA256(JWT_SECRET, `sha\|exp`) 签名 URL TTL 1h；POST 上传 + GET metadata + HEAD + GET `/{sha}/data?exp=&sig=` presign + DELETE per-user ref；前端 `src/data/blob-client.ts`（`putBlob` / `fetchBlob` / `serializeAttachment` / `materializeAttachment` + `BLOB_INLINE_MAX_BYTES=64KB`）
+- **Stage 4 硬前置 1** ✅（仅 cursor 分页）`src-backend/data/pagination.py`（`CursorPage` envelope + `normalize_limit` + `build_page` + `CURSOR_MAX_LIMIT=1000`）+ `routers/providers.py` 的 list endpoint 加 `?limit=N` opt-in（不带 limit 维持 `list[Row]` 向后兼容，带 limit 升格为 `{rows, next_cursor}` envelope）+ `tests/api/test_pagination.py`（无 limit / 带 limit / 满页 next_cursor / 边界 / `limit<=0` 拒 / `>CURSOR_MAX_LIMIT` clamp / 续拉到 null 等多 case）。原设计中的 notify-only WS 协议 / per-table payload-mode / fetchAndDispatch 等整体放弃，详见 2026-05-02「硬前置 1 收窄」修订记录。流式云同步走 inline envelope，所有表（含 messages / artifacts）共用 Stage 1–3 现有协议
 - **测试脚手架** ✅ pytest（`tests/api/`，96 case 全绿 ~74s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，63 passed / 224 skipped + 1 pre-existing flake `scenarioB ws auto-reconnect` ~4.7 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
 
 ### 部署状态
@@ -103,13 +118,12 @@
   - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/auth/register` 422
   - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages 跨设备同步可用（reactives 跨 tab 由 persistent-reactive 透传到 user-data / user-perfs / plugins store）；其他 5 张表（workspaces / dialogs / messages / artifacts / items）仍只在本地 IndexedDB；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
 
-### 下一步：开 Stage 4 硬前置 1（大行 WS 协议改造）
+### 下一步：开 Stage 4 主体批次-4a（`workspaces`）
 
-Stage 3 + 硬前置 2 已完成。剩 Stage 4 硬前置 1：WS event payload 改 `{table, op, id, rev}` only（不带完整 row，避免 broker 队列在 messages / artifacts 大行场景爆）+ `?since=N` 加 `limit` + cursor 续拉。仅 messages / artifacts 走新协议；providers / assistants 等小表保持原 envelope。完成后开 Stage 4 主体批次。
+Stage 3 + 硬前置 1（仅 cursor 分页）+ 硬前置 2 全部完成，可以正式进入 Stage 4 主体批次。按依赖顺序：批次-4a `workspaces` 先做（建立级联事务设计基线）→ 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages`。
 
 ### 未启动（按依赖顺序）
 
-- **Stage 4 硬前置 1**（大行 WS 协议改造） ⏳
 - **Stage 4 主体** 批次-4a `workspaces` → 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages` ⏳
 - **Stage 4.5** 服务端 Import Job + bootstrap ⏳ ← **可让老用户用的物理分水岭**
 - **Stage 4.9** flag 路由层 + dexie 实现一次性下架 ⏳ ← 需 Stage 4.5 端到端验收通过 + 稳定运行 1 周
@@ -661,20 +675,33 @@ interface AuthSource {
 
 **目标**：搬级联删除集群（`stores/workspaces.ts` 里的 `db.transaction` 是最难的一处）。
 
-#### 硬前置（2026-05-02 新增）
+#### 硬前置（2026-05-02 新增 / 2026-05-02 收窄）
 
-**messages / artifacts 走的不是 providers / assistants 那种小行 schema**——单条 message 可能携带几 MB 的 base64 attachment（受 `MAX_MESSAGE_FILE_SIZE_MB` 上限），单用户 messages 表行数轻易上万。沿用 Stage 1–3 的协议会在三处崩：① WS event 带完整 row → broker `maxsize=200` 队列在大行场景秒爆；② `?since=N` 全 row 返回 → 客户端 fetch 几十 MB 卡死；③ Postgres TEXT 列直接存 base64 → 表线性膨胀、`vacuum` / 备份 / 慢查询全受影响。messages / artifacts server.ts 落地前必须先做完下面两件事，不可后置。
+**messages / artifacts 走的不是 providers / assistants 那种小行 schema**——单条 message 可能携带几 MB 的 base64 attachment（受 `MAX_MESSAGE_FILE_SIZE_MB` 上限），单用户 messages 表行数轻易上万。沿用 Stage 1–3 的协议会在三处崩：① WS event 带完整 row → 单条 5MB attachment 把 broker `maxsize=200` 队列内存撑爆；② `?since=N` 全 row 返回 → 客户端 fetch 几十 MB 卡死；③ Postgres TEXT 列直接存 base64 → 表线性膨胀、`vacuum` / 备份 / 慢查询全受影响。messages / artifacts server.ts 落地前必须先做完下面两件事，不可后置。
 
-**前置 1：大行传输协议改造**
+**前置 1：cursor 分页（list endpoint 续拉协议）**
 
-- WS event payload 改为 `{table, op, id, rev}` only —— 不再带 `row` 字段。客户端拿到 event 后调 `GET /api/v1/<table>/<id>` 按需拉具体 row（命中 IndexedDB 缓存 + If-None-Match `rev` ETag 时 server 返 304）
-- `?since=N` 加 `?limit=200` + cursor 续拉：单次响应硬上限（如 1MB），返回 `{rows, next_cursor}`，客户端拿 `next_cursor` 续拉直到空
-- 仅 messages / artifacts 走新协议；providers / assistants 等小表保持原 envelope（避免无谓回归风险）。`src-backend/data/routers/<table>.py::_to_event` 与前端 `realtime.ts` dispatcher 加 per-table `payloadMode: 'inline' | 'notify-only'` 配置位
-- **通过判据**（待 spec 落地）：
-  - api: 单条 5MB attachment 的 message PUT 后 WS event 字节数 < 1KB；客户端用 event.id 调 GET 能拿回完整 row
-  - api: 单用户 1 万条 messages，`?since=0&limit=200` 第一次响应 < 1MB，`next_cursor` 非空；循环续拉总共 ≥ 50 次拉完
-  - spec: 双 tab 跨设备 message put → 另一 tab 在 500ms 内 UI 出现新行（含 attachment 渲染）
-  - spec: broker 1 个 user 100 条 5MB messages 连续 PUT，server RSS 涨幅 < 50MB（验证 notify-only 不让 broker 吞 row 字节）
+> 2026-05-02 收窄：原设计含 notify-only WS 协议 + cursor 分页两块；实施一半发现 notify-only 朴素实现对流式同步零正收益负 RTT，且引入弱网 race condition 让 UX 变差。决策放弃 notify-only，硬前置 1 收窄为「仅 cursor 分页」。详见顶部 2026-05-02 修订记录「硬前置 1 收窄」条。
+
+- list endpoint（已迁表 + 未来 Stage 4 主体批次新加表）支持 `?since=N&limit=200`，响应从 `list[Row]` 升格为 `{rows, next_cursor}` envelope；客户端拿 `next_cursor` 续拉直到为 null。**无 `limit` 参数时维持 bare list**（向后兼容 Stage 1–3 小表 list 调用 + Stage 1.5 鉴权链路）
+- 单次响应硬上限：行数 `CURSOR_MAX_LIMIT=1000` 兜底（按行数限制，前提是硬前置 2 已把 attachment 拆出去后单 row ≤ ~200KB）；如 messages 长回复实测单次响应仍偏大，后续按字节限制再调
+- **流式 WS / SSE event 维持 inline envelope**（带完整 row）：所有表共用 Stage 1–3 已有的 envelope 协议，没有大表 / 小表协议之分，没有 row-fetch 中间态 / race condition / 404-as-tombstone 启发式
+- broker 队列内存兜底依赖：硬前置 2（attachment 走 ref，单 row ≤ ~200KB）+ broker 现有 `maxsize=200` close-on-overflow（Stage 2 设计）。messages / artifacts 落地后用 soak.sh 真测「100 条大 row 连续 PUT，server RSS 涨幅 < 50MB」做规模兜底监控
+- **通过判据**：
+  - api: 不带 `limit` → 响应 `list[Row]`（向后兼容判据）—— `tests/api/test_pagination.py::test_no_limit_returns_bare_list_back_compat` ✅
+  - api: 带 `?limit=N` → 响应 `{rows, next_cursor}` envelope；3 行 + `limit=10` 时 `next_cursor=null` —— `tests/api/test_pagination.py::test_with_limit_returns_envelope` ✅
+  - api: 满页时 `next_cursor` 是最后一行的 `version`；空续拉返回 `next_cursor=null` —— `tests/api/test_pagination.py` 多 case ✅
+  - api: `limit <= 0` 拒绝 400 + `limit > CURSOR_MAX_LIMIT` 静默 clamp —— `tests/api/test_pagination.py` 已含 ✅
+  - api（messages 落地时新加）: 单用户 1 万条 messages，`?since=0&limit=200` 第一次响应 < 1MB，`next_cursor` 非空；循环续拉 ≥ 50 次拉完
+  - spec（messages 落地时新加）: 双 tab 跨设备 PUT 200 次模拟流式 token 流 → 第二 tab 在 inline envelope 协议下 UI 无丢帧 / 无倒退；首屏 cursor 续拉到 `next_cursor=null`
+- **删除的设计（2026-05-02 收窄）**：
+  - ~~WS event payload 改 `{table, op, id, rev}` only~~（notify-only 协议）
+  - ~~客户端 GET row 按需拉 + If-None-Match ETag / 304~~
+  - ~~per-table `payloadMode: 'inline' | 'notify-only'` 配置位~~
+  - ~~`src-backend/data/payload_mode.py` + `routers/testing.py` + `_test/payload-mode` admin endpoint~~
+  - ~~`src/data/realtime-rest.ts` + WS / SSE dispatcher 的 fetchAndDispatch 路径~~
+  - ~~`tests/e2e/stage4_pre/notify-only-dispatcher.spec.ts` + `tests/api/test_payload_mode.py`~~
+  - ~~`BACKEND_TEST_HOOKS_ENABLED` env + `apply_mode` 包裹~~
 
 **前置 2：对象存储分流（B 方案）**
 
@@ -746,13 +773,13 @@ interface AuthSource {
   - schema 决策：`type` 联合（不同 type 不同 payload 形态）；`dialogId` 可为 null（工作区级 item vs 对话级 item）
   - 测试：`tests/api/test_items.py` ~6 case；`tests/e2e/stage4/items-realtime.spec.ts` ~3 case
 
-- **批次-4d · `artifacts`**（依赖 Stage 4 硬前置 2 对象存储 + 大行协议）
+- **批次-4d · `artifacts`**（依赖 Stage 4 硬前置 2 对象存储 + cursor 分页）
   - schema 决策：内容字段大小阈值 → ≥ 64KB 走对象存储 ref；`workspaceId` / `dialogId` 双 FK
-  - 测试：`tests/api/test_artifacts.py` ~10 case（CRUD + 大行 ref 协议 + 64KB 边界 + 同 sha256 去重 + level 0 inline 兜底）；`tests/e2e/stage4/artifacts-large.spec.ts` ~4 case（UI 创建 5MB artifact → ref 上对象存储 → 第二 tab 渲染 + 清缓存重拉）
+  - 测试：`tests/api/test_artifacts.py` ~10 case（CRUD + 大行 ref 序列化 + 64KB 边界 + 同 sha256 去重 + level 0 inline 兜底 + cursor 分页）；`tests/e2e/stage4/artifacts-large.spec.ts` ~4 case（UI 创建 5MB artifact → ref 上对象存储 → 第二 tab 渲染 + 清缓存重拉，**走 inline envelope 流式同步，不走 notify-only**）
 
-- **批次-4e · `messages`**（最难，最后做，依赖 Stage 4 硬前置 1+2 全部就绪 + cursor 分页）
+- **批次-4e · `messages`**（最难，最后做，依赖 Stage 4 硬前置 1 cursor 分页 + 硬前置 2 对象存储）
   - schema 决策：attachment 字段 `{type:'inline', data:base64}` vs `{type:'ref', url, sha256, size, content_type}`；message 顺序保证（rev / created_at / explicit `order` 字段）；`dialogId` FK；DialogView 的滚动加载靠 cursor + `?since` 双语义 ↔ "拉旧" vs "拉新"
-  - 测试：`tests/api/test_messages.py` ~15 case（CRUD + cursor 分页 + 大行 ref 协议 + 跨 dialog 隔离 + soft-delete 后顺序保持）；`tests/e2e/stage4/messages-attachment.spec.ts` ~6 case（5MB attachment 端到端 + 第二 tab < 500ms 同步 + 清缓存重拉 + DialogView 滚动加载历史 + 离线发送队列）；soak.sh 重跑（按 plan Stage 2 / Step 6 已建脚手架）验证 messages PUT 高频场景下 RSS 仍 < 100MB drift / p95 < 500ms
+  - 测试：`tests/api/test_messages.py` ~15 case（CRUD + cursor 分页 + ref 序列化 + 跨 dialog 隔离 + soft-delete 后顺序保持）；`tests/e2e/stage4/messages-attachment.spec.ts` ~6 case（5MB attachment 端到端 + 第二 tab < 500ms 同步 + 清缓存重拉 + DialogView 滚动加载历史 + 离线发送队列 + **流式 PUT 200 次模拟 token 流 → 第二 tab inline envelope 下无丢帧无倒退**）；soak.sh 重跑验证 messages PUT 高频场景下 RSS 仍 < 100MB drift / p95 < 500ms（含 inline envelope 大行 broker 队列兜底监控）
 
 #### 每个批次必须包含
 
@@ -780,8 +807,8 @@ interface AuthSource {
 - 批次-4a (`workspaces`)：⏳ 未开
 - 批次-4b (`dialogs`)：⏳ 未开
 - 批次-4c (`items`)：⏳ 未开
-- 批次-4d (`artifacts`)：⏳ 未开 · 依赖 Stage 4 硬前置 2 对象存储完成
-- 批次-4e (`messages`)：⏳ 未开 · 依赖 Stage 4 硬前置 1+2 全部完成
+- 批次-4d (`artifacts`)：⏳ 未开 · 依赖 Stage 4 硬前置 2 对象存储完成 + 硬前置 1 cursor 分页落地
+- 批次-4e (`messages`)：⏳ 未开 · 依赖 Stage 4 硬前置 1 cursor 分页 + 硬前置 2 对象存储全部完成
 
 ---
 
@@ -907,7 +934,7 @@ ImportDataDialog
 **做什么**：
 - `import_worker.py` 增 phase_d：扫 `messages WHERE _pending_blob_extraction=TRUE AND user_id=?`，逐条提取 attachment base64 字段
 - 对每个 attachment：解码 base64 → 算字节大小 → 按 `BLOB_INLINE_MAX_BYTES=65536` (64KB) 阈值判断
-  - `< 64KB` → 保持 inline 在 PG row 字段（Stage 4 大行协议规定，messages 表小附件 inline 与 server-side 协议一致）
+  - `< 64KB` → 保持 inline 在 PG row 字段（与硬前置 2 客户端 `serializeAttachment` 阈值规则一致：messages 表小附件 inline，避免无谓 blob store 一次往返）
   - `≥ 64KB` → 计算 sha256 → 调 `BlobStore.put(sha256, bytes)`（同 sha256 已存在则去重不二次写）→ 改写 row 的 attachment 字段为 `{type:'ref', url, sha256, size, content_type}`
 - 4 路 `asyncio.Semaphore` 并发 + 重试 3 次（指数退避 1s/2s/4s）
 - 单条失败超过重试上限进 `import_jobs.dead_letter`；不阻塞整体 phase
@@ -1235,8 +1262,9 @@ ImportDataDialog
 - 后端 API 行为：CRUD / 鉴权 / 跨账号隔离 / soft-delete / cursor 分页 / `?since` 增量
 - 实时通道：WS / SSE / poll / auto 四档 transport 切换 + 离线重连 + token refresh + Last-Event-ID 续拉
 - 跨 tab 同步：Playwright multi-context 模拟多设备
-- 大行协议（Stage 4 硬前置 1）：5MB attachment WS event 字节数 < 1KB；客户端 GET row 命中
+- cursor 分页（Stage 4 硬前置 1）：`?since=N&limit=200&next_cursor=…` 续拉协议；不带 limit 维持向后兼容；满页时 `next_cursor` 为最后一行 `version`
 - 对象存储分流（Stage 4 硬前置 2）：64KB 边界 inline / ref；同 sha256 去重
+- 流式云同步（inline envelope，2026-05-02 收窄后所有表共用）：跨 tab 流式 PUT 200 次模拟 token 流 → 第二 tab UI 无丢帧 / 无倒退
 - 级联事务（Stage 4 主体）：删工作区 → 子 dialogs / messages / artifacts 实时清空 + server 行清空
 - ImportJob（Stage 4.5）：4 档 fixture 全跑通 + 多设备 409 + WS 进度推送 + Phase A-D worker 状态 + 失败回退
 - 性能基线：bundle 体积 + RSS soak（10 min / 1h）+ p95 延迟（soak.sh）
@@ -1291,8 +1319,9 @@ ImportDataDialog
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/routers/auth.py`（Stage 1.5 新增：register/login/refresh/logout/me）
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src/data/auth.ts`（Stage 0 新增 `AuthSource`，Stage 1.5 加 `BackendAuthSource`）
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src/data/http.ts`（Stage 1 新增：从 `AuthSource` 取 token）
-- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/blob_store.py`（Stage 4 硬前置新增：BlobStore 接口 + LocalFS / S3 / MinIO 实现）
-- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/routers/blobs.py`（Stage 4 硬前置新增：`/api/v1/blobs` multipart endpoint）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/blob_store.py`（Stage 4 硬前置 2 新增：BlobStore 接口 + LocalFS / S3 / MinIO 实现）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/routers/blobs.py`（Stage 4 硬前置 2 新增：`/api/v1/blobs` multipart endpoint）
+- `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/pagination.py`（Stage 4 硬前置 1 新增：cursor 分页 helpers — `CursorPage` envelope + `normalize_limit` + `build_page` + `CURSOR_MAX_LIMIT=1000`）
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/models/import_job.py`（Stage 4.5 新增）
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/import_worker.py`（Stage 4.5 新增：asyncio worker，4 phase）
 - `/Users/artemis/Documents/Resourse/GitProjects/my-aiaw-deployment/src-backend/data/routers/imports.py`（Stage 4.5 新增：5 个 endpoint）

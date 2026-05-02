@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -12,6 +12,7 @@ from ..auth import current_user
 from ..db import get_session
 from ..models.provider import Provider
 from ..models.user import User
+from ..pagination import CursorPage, build_page, normalize_limit
 
 router = APIRouter(prefix='/api/v1/providers', tags=['providers'])
 
@@ -56,19 +57,26 @@ def _to_event(p: Provider) -> dict[str, Any]:
     }
 
 
-@router.get('', response_model=list[ProviderRow])
+@router.get('', response_model=Union[list[ProviderRow], CursorPage[ProviderRow]])
 async def list_providers(
     since: int = 0,
+    limit: Optional[int] = None,
     user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ):
+    fetch_limit = normalize_limit(limit)
     stmt = (
         select(Provider)
         .where(Provider.user_id == user_id, Provider.version > since)
         .order_by(Provider.version)
     )
+    if fetch_limit is not None:
+        stmt = stmt.limit(fetch_limit)
     result = await session.execute(stmt)
-    return [_to_row(p) for p in result.scalars()]
+    rows = [_to_row(p) for p in result.scalars()]
+    if fetch_limit is None:
+        return rows
+    return build_page(rows, fetch_limit)
 
 
 @router.get('/{provider_id}', response_model=ProviderRow)
