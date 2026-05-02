@@ -205,12 +205,19 @@ interface AuthSource {
 **做什么**：`docker-compose.yml`（Postgres 16 容器映射到 host:5433）；`src-backend/data/db.py`（SQLAlchemy 异步 engine + session）；`app.py` 加 `/api/v1/health`；`alembic init`。
 
 **通过判据**：`curl /api/v1/health` 返回 `{status:"ok", db:"ok"}`；`docker compose exec postgres psql ...` 能连。
+- api: `tests/api/test_health.py::test_health_returns_ok`
 
 #### Step 2 — `providers` 表 + 基础 CRUD（**先不带鉴权**）✅ commit `62318f6`
 
 **做什么**：`models/provider.py`（含 `version` / `updated_at` / `deleted_at`）；首个 alembic migration（建表 + `global_change_seq` SEQUENCE）；`routers/providers.py` 提供 GET/PUT/DELETE /api/v1/providers[/:id] + `?since=`；`user_id` 暂以 `DEV_USER_ID` 环境变量占位。
 
 **通过判据**（纯 curl，零前端依赖）：6 场景全过 — PUT 新增 / list / get / PUT 更新 bumps version / `?since=N` 过滤 / soft-delete 后 list 仍能拿到 tombstone；Postgres 直查行存在。
+- api: `tests/api/test_providers.py::test_put_creates_and_list_returns_it`（PUT 新增 + list + Postgres 直查）
+- api: `tests/api/test_providers.py::test_get_returns_single_row`（GET）
+- api: `tests/api/test_providers.py::test_put_update_bumps_version`（PUT 更新 bumps version）
+- api: `tests/api/test_providers.py::test_since_filter_drops_older_revisions`（`?since=N` 严格大于）
+- api: `tests/api/test_providers.py::test_soft_delete_yields_tombstone_in_list`（DELETE → tombstone）
+- api: `tests/api/test_providers.py::test_unauth_request_rejected`（鉴权后兜底 401）
 
 #### ~~Step 3 — JWKS 桥接鉴权~~（已废弃 → Stage 1.5）
 
@@ -301,6 +308,16 @@ interface AuthSource {
 3. access token 故意过期 → 客户端自动 refresh → 不需要重新输密码
 4. logout 后 refresh → 401（吊销生效）
 
+- api: `tests/api/test_auth.py::test_register_returns_distinct_user_ids`（场景 1）
+- api: `tests/api/test_auth.py::test_register_duplicate_email_returns_409`、`::test_password_min_length_enforced`（场景 1 边界）
+- api: `tests/api/test_auth.py::test_login_returns_token_pair`、`::test_login_with_wrong_password_returns_401`、`::test_login_unknown_email_returns_401`（场景 1/3 前置）
+- api: `tests/api/test_auth.py::test_a_token_cannot_read_b_data` + `tests/api/test_providers.py::test_account_isolation`（场景 2）
+- api: `tests/api/test_auth.py::test_expired_access_token_yields_401`、`::test_refresh_issues_fresh_pair_and_revokes_old`（场景 3）
+- api: `tests/api/test_auth.py::test_logout_revokes_refresh_token`、`::test_logout_unknown_refresh_is_idempotent`（场景 4）
+- api: `tests/api/test_auth.py::test_me_without_token_returns_401`、`::test_me_with_garbage_token_returns_401`（unauth 兜底）
+- api: `tests/api/test_auth.py::test_link_dexie_first_write_wins`（link-dexie first-write-wins，对应「用户身份关联」段安全模型）
+- spec: `tests/e2e/stage1_5/auth-ui.spec.ts`（providers-rest profile 走 BackendLoginDialog UI 完整链路：注册 → currentToken 起效 + AccountPage 显示用户 → AccountPage 退登 → currentToken 清空；及刷新 boot 路径）
+
 **回滚**：env `BACKEND_AUTH=false` 立即回到 Stage 0 行为；后端的 `users` 表和 endpoints 留着，不影响。
 
 **风险**
@@ -353,6 +370,14 @@ interface AuthSource {
 3. 客户端发 `{type:'subscribe', table:'providers', since:0}` → 收到全部历史 + `replay-done` → 之后再 PUT → 收到 live 事件
 4. 故意让客户端不发 pong → 35s 内被 close
 
+- api: `tests/api/test_realtime_ws.py::test_ws_without_subprotocol_is_rejected`、`::test_ws_with_invalid_token_is_rejected`、`::test_ws_accepts_valid_token`（WS 鉴权）
+- api: `tests/api/test_realtime_ws.py::test_ws_unknown_table_returns_error_frame`（未知表降级 error 帧而非 close）
+- api: `tests/api/test_realtime_ws.py::test_ws_two_subscribers_same_user_both_receive`（场景 1 双订阅 fan-out）
+- api: `tests/api/test_realtime_ws.py::test_ws_account_isolation`（场景 2 跨账号隔离）
+- api: `tests/api/test_realtime_ws.py::test_ws_replay_emits_existing_rows_then_replay_done`、`::test_ws_replay_done_then_live_event`、`::test_ws_live_delete_event_is_tombstone`（场景 3 replay → live + delete tombstone）
+- api: `tests/api/test_realtime_ws.py::test_ws_unsubscribe_stops_events`（unsubscribe）
+- api: `tests/api/test_realtime_ws.py::test_ws_heartbeat_timeout_closes_connection`（场景 4 心跳超时，slow mark）
+
 #### Step 2 — 前端：`SyncSource` 接口 + `DexieSyncSource`（纯重构）
 
 **做什么**
@@ -392,8 +417,9 @@ interface AuthSource {
 **当前状态（2026-05-02）**
 - 代码：commit `aa0f25b`（`src/data/realtime-ws.ts` + `src/data/index.ts` 导出）；副 commit `e73e52e`（AccountPage 退出登录级联）
 - 场景 A ✅ **通过**：Console 订阅后能收到 event（WS 握手、`bearer.<token>` 子协议鉴权、`since=<lastRev>` SQL replay、event 派发到 listener 全部 OK）。`'idle'` 边界 bug 已由「已知问题 #1」修复消除（见下方）。
-- 场景 B ❓ **未独立测试（按用户决策跳过）**：浏览器手测路径，本次会话权衡成本后跳过；fix #1 后理论路径完整，等 Step 4 接 repo 后随业务回归覆盖。
-- 场景 C ❓ **未独立测试（同上）**。
+- 场景 B ✅ **由 Phase 6 自动化覆盖**：`tests/e2e/stage2/step3-realtime-recovery.spec.ts::scenarioB ws auto-reconnect after offline window`，realtime-ws profile 走 `window.aiawRealtime.subscribe` + `setOffline` 闭环验证 backend 写入在重连后由 SQL replay 追上。
+- 场景 C ✅ **由 Phase 6 自动化覆盖**：`tests/e2e/stage2/step3-realtime-recovery.spec.ts::scenarioC client recovers from server-side 4001 close`，模拟 server 4001 触发 client 走 `tryRefresh` → 重连 → 后续 backend put 仍能进 listener。
+- spec: `tests/e2e/stage2/step3-realtime-recovery.spec.ts`
 
 **已知问题**
 1. ~~**`RealtimeConn` 进入 `'idle'` 后无自动恢复**~~ ✅ **已修复**
@@ -430,6 +456,11 @@ interface AuthSource {
 - A 创建 / 修改 / 删除 provider → B 在 500ms 内 UI 更新（不刷新页面）
 - B 离线 30s 期间 A 改 3 次 → B 网络恢复 → 重连 → 3 次变更追上 → UI 一致
 - `REALTIME_TRANSPORT` 改空 / poll → 退化到 Stage 1 行为，A 改后 B 必须刷新
+
+- spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case1 ws double-tab`（实时联动）
+- spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case2 ws reconnect catch-up`（30s 离线追平）
+- spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case3 providers-rest no-realtime`（无 WS 退化）
+- spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case4 baseline byte-identical`（flag 全关零 9011 / 零 ws）
 
 #### Step 5 — 降级路径（SSE + poll）
 

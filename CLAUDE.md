@@ -29,16 +29,48 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 
 ## 测试体系（静态规则）
 
-测试体系的动态进度与 Phase 拆分见 `plans/test-infrastructure.md`。本段仅列不随进度变化的稳定规则：
+测试体系的动态进度与 Phase 拆分见 `plans/test-infrastructure.md`；**操作手册（怎么跑、加 spec 配方、helper 对照表、调试排查、守则）见 `tests/README.md`**——做任何测试相关操作前必须先 Read。本段仅列不随进度变化的稳定规则：
+
+### 架构与环境
 
 - **两层架构**：后端走 pytest（`tests/api/`），端到端走 Playwright（`tests/e2e/`）。不引入 Vitest 单元层（投资回报低，本项目 bug 几乎全是多端协作 / 时序 / 网络型）。
-- **环境完全隔离**：测试用 Postgres 5434 / backend 9011 / 前端 9007 三组端口，与 dev 的 5433/9010/9005 互不影响。任何测试脚本不得读写 dev 用的 Postgres / 9010 backend；临时改 `.env.local` 必须带还原 trap，无论成功失败或中断都还原。
+- **环境完全隔离**：测试用 Postgres 5434 / backend 9011 / 前端 9007/9008/9009 三 profile 端口，与 dev 的 5433/9010/9005 互不影响。任何测试脚本不得读写 dev 用的 Postgres / 9010 backend；临时改 `.env.local` 必须带还原 trap，无论成功失败或中断都还原。
 - **e2e 跑 build 产物，不跑 dev server**：每个 flag profile 一份独立 `quasar build` 产物，按 (env-sha256, git rev, package.json hash) 联合 cache 复用。原因是 `process.env.*` 构建期内联，runtime 切 flag 不可行。
-- **判据即代码**：`plans/cloud-sync-migration.md` 每条「通过判据」必须映射到具体 pytest test name 或 Playwright spec name，并在 plan 对应 Step 写下 `spec:` / `api:` 引用。手测判据不再视为完成标准。
-- **新 Step 落地 = 同 PR 落 spec**：任何新 Step 的代码变更必须在同一 PR 里附上对应自动化 case，否则视为未完成。回归套件持续累积，不允许欠账。
-- **调试钩子守卫**：给 e2e 暴露的 `window.__db__` / `window.__authSource__` 等钩子必须放在 `EXPOSE_DB=true` env 守卫的 boot 文件里；prod docker build 流程必须断言此 env 非 true 才允许出包，避免暴露 IndexedDB 操作面。
-- **测试命令命名**：测试相关 pnpm script 统一 `test:` 前缀（如 `test:up` / `test:down` / `test:api` / `test:e2e[:<profile>]`）；退出码 0 = 全绿、非 0 = 失败数；reporter 输出统一进 `tests/.results/`。
+- **profile 选择**：`baseline`（全 flag 关）/ `providers-rest`（backend providers + BACKEND_AUTH，无 realtime）/ `realtime-ws`（上面 + REALTIME_TRANSPORT=ws）。新加表或 flag 时按 cloud-sync-migration plan 选合适 profile，不够用就新增 profile（同步加 `playwright.config.ts` project + 端口 + `tests/env/.env.test.<name>`）。
+- **调试钩子守卫**：给 e2e 暴露的 `window.__db__` / `window.__authSource__` / `window.__repos__` / `window.aiawRealtime` 等钩子必须放在 `EXPOSE_DB=true` env 守卫的 boot 文件里；prod docker build 流程必须断言此 env 非 true 才允许出包，避免暴露 IndexedDB 操作面。
+- **测试命令命名**：测试相关 pnpm script 统一 `test:` 前缀；退出码 0 = 全绿、非 0 = 失败数；reporter 输出统一进 `tests/.results/`。
 - **dexie-cloud SaaS 不进 e2e 默认路径**：测试 env 默认关 `DEXIE_DB_URL`，只测 backend 路径；要测 dexie auth 链路时单独开 profile，必要时用 helper 拦 host 模拟 SaaS down。避免 e2e 依赖外部 SaaS 可用性。
+
+### 工作流（每个需求都必须遵守）
+
+- **判据即代码**：`plans/cloud-sync-migration.md` 每条「通过判据」必须映射到具体 pytest test name 或 Playwright spec name，并在 plan 对应 Step 段尾写下 `- api: tests/api/<file>::<test>` / `- spec: tests/e2e/<path>::<test>` 引用。手测判据不再视为完成标准。
+- **新需求落地 = 同 PR 落 spec + 真跑过测试**：任何新 Step / 新功能 / 新表 / 新 endpoint / bug 修复，**代码变更必须在同一 PR 里附对应自动化 case**，并在本地真跑过 `pnpm test:api && pnpm test:e2e`。三种情况都视为未完成、不允许 commit / push：① 只改代码不写 spec；② 写了 spec 但本地没跑；③ 跑了但有非「文档化预期红」的 case 红。回归套件持续累积，不允许欠账。
+- **TDD 默认顺序**：spec-first → 跑红（确认 spec 真在卡功能）→ 写代码 → 跑绿。Phase 5 的 step4 spec 就是范例（红的输出本身证明 Step 4 未做）。无法先写 spec 的纯重构 / 配置改动可以后置 spec，但同 PR 必须有。
+- **改动什么 → 跑什么**：
+  - 改 `src-backend/data/`（路由 / 模型 / auth / realtime / migration）→ 必跑 `pnpm test:api`，必要时跑 `pnpm test:e2e -g <相关 spec>`
+  - 改 `src/data/`（repos / auth source / sync source / http / realtime-ws）→ 必跑 `pnpm test:e2e`（至少跑相关 stage 的 spec）
+  - 改 `src/boot/expose-debug.ts` 或 `quasar.config.js` 的 boot 列表 → 必跑 `pnpm test:e2e -g smoke`
+  - 改 `tests/env/.env.test.<profile>` → cache 自动 miss 重 build，必跑全套 `pnpm test:e2e`
+  - 改 `tests/scripts/` / `playwright.config.ts` / `pytest.ini` / `docker-compose.test.yml` → 必跑全套 `pnpm test:api && pnpm test:e2e`
+  - 改 `src/i18n/`（影响 e2e selector 的标签）→ 跑相关 spec 验证 selector 仍命中
+  - 改 `src/utils/db.ts`（Dexie schema）→ 跑相关 stage spec + 手测一次升级路径（schema 升级目前没自动 case，是 Stage 3+ 待补）
+  - 纯前端 UI 视图（`src/pages/` / `src/components/` / `src/views/`）改样式 / 文案 → 不强制跑 e2e，但若改 selector-relevant 文本需评估
+- **commit 前必跑**：`pnpm test:api` + 与改动相关的 `pnpm test:e2e -g <pattern>`。整套 e2e 跑全 profile ~1min，commit 前推荐跑全套；至少跑相关项目（`--project=<profile>`）。
+- **判据失败优先修代码，不优先改 spec 预期值**：spec 红了先把它当真信号，沿着 stdout 给的 `lastA / lastB / elapsedMs / status / body` 等具体值定位代码 bug；只有确认 spec 假设本身错了（plan 改了 / 接口换了）才动 spec。
+- **新 spec 落地后必须真跑红一次再跑绿**：写完 spec 不要立刻跑绿就 commit，先想办法构造一次预期失败（注掉一行核心代码 / 改个返回码），确认 spec stdout 输出包含足够定位信息（具体 status + body + dict + elapsed），再恢复并跑绿。这是 plan Phase 3/4/5 验收都要求的「故障注入红测」习惯。
+- **测试命令最短形式**（详细见 `tests/README.md`）：
+  ```bash
+  pnpm test:api                       # 全 pytest（~50s）
+  pnpm test:api -k <substring>        # 单 case 调试
+  pnpm test:api -m "not slow"         # 跳 slow mark
+  pnpm test:e2e                       # 全 Playwright（~1min）
+  pnpm test:e2e -g <pattern>          # 单/多 spec
+  pnpm test:e2e --project=<profile>   # 单 profile
+  pnpm test:up / test:down            # docker 5434 起停
+  pnpm test:backend:start/stop        # 9011 backend 起停
+  ```
+- **新建 spec 必读 helper 对照表**：写 spec 前必须 Read `tests/README.md` §5 的 helper ↔ plan 词汇表，**优先用现有 helper 而不是手写**（`expectRowSync` / `setOffline` / `injectAuth` / `openContextsForUsers` / `dumpTable` / `pgQuery` / `captureWs` / `backendClient` 等已经覆盖大部分形状）。需要新 helper 时加进 `tests/e2e/helpers/`，同步在 README §5 表里加一行。
+- **README 维护**：tests/README.md 的「判据映射表」「已知预期红」「helper ↔ plan 词汇」「调试排查」「守则」段在以下情况必须同步更新：① 新增 / 删除 helper；② 已知预期红转绿或新增；③ 加新 profile / 端口；④ 加新顶层 `pnpm test:` script；⑤ 工作流守则发生变化。
 
 ## 常用命令
 

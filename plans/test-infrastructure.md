@@ -78,8 +78,31 @@
       - case3/case4 绿证明判据正确隔离了"flag 关时不应破坏"边界（plan 判据 #2 后半 ✅）
       - 命令 `pnpm test:e2e -g step4` 一把跑通（plan 判据 #3 ✅）
     - plan 判据 #1（4 case 全绿）需 Stage 2 Step 4 落地后才能达成 —— 由 cloud-sync-migration plan 推进，本 plan Phase 5 验收只到 spec inkable + #2 / #3 ✅。一旦 Step 4 接 `providers.server.ts.observeList` ↔ `RemoteSyncSource` 完成，case1/case2 应自动转绿，无需改 spec
-  - Phase 6-7 未启动
-  - 下一步：Phase 6 反向回填把 cloud-sync plan 已完成 Step 的「通过判据」段末尾补 `api: tests/api/<file>::<test>` / `spec: tests/e2e/<file>::<test>` 引用 + `tests/README.md`；Stage 2 Step 4 在 cloud-sync-migration plan 推进时复用本 spec 当 TDD 红绿信号
+  - Phase 6 反向回填 + plan 协同 ✅
+    - cloud-sync-migration plan 反向回填：Stage 1/Step 1 / Stage 1/Step 2 / Stage 1.5 / Stage 2/Step 1 / Stage 2/Step 3 / Stage 2/Step 4 段尾补 `- api:` / `- spec:` 引用，每条「通过判据」对应一个具体 case name
+    - Stage 1.5 UI 链路 spec：`tests/e2e/stage1_5/auth-ui.spec.ts` 4 case（providers-rest profile only）
+      - case1 register via BackendLoginDialog：开 dialog → 填 → submit → user 入 `__authSource__` + currentToken 200 against /auth/me
+      - case2 login existing：dialog 切到 login mode + 填 + submit
+      - case3 logout via AccountPage button：goto /account 一次性 boot + runRefresh + AccountPage 渲染 → 抓 live refresh → `dispatchEvent('click')` 点 logout q-item → user.value null + storage 清 + live refresh server-side 401（验证 logout 走到了 backend）
+      - case4 refresh on boot：injectAuth + goto → boot 自动 runRefresh 轮换 → 原 reg.refresh_token 401 + currentToken() 对 /auth/me 200
+    - Stage 2 Step 3 浏览器场景 B / C：`tests/e2e/stage2/step3-realtime-recovery.spec.ts` 2 case（realtime-ws profile only，case B `test.slow()`）
+      - scenarioB ws auto-reconnect：subscribe → 等 state==='open' → setOffline + 强制 ws.close(4002) → 等 state≠'open' → backend 写 2 条 → setOffline(false) → 等 state==='open' → 验证 listener 收到两条 missed event（through SQL replay since=lastRev）
+      - scenarioC 4001 + refresh + reconnect：subscribe → state==='open' → 直接 `ws.close(4001)` 走 onClose 4001 分支 → realtime 自动 tryRefresh + scheduleReconnect → state==='open' → backend put → listener 收到 + currentToken() 对 /auth/me 仍 200（证明 refresh 真的换了 access token）
+    - tests/README.md：跑命令 / 端口隔离 / 判据映射表 / 已知预期红 / 加新 spec 的最短路径 / helper ↔ plan 词汇对照（Stage 3 第一张表 `reactives` 的 5 步配方含一个具体 spec 名建议）/ 调试排查 / 守则
+    - 关键避坑（落地踩到 + 修了的）：
+      - ① **case3 logout 的 q-item 不能 `.click()`**：Quasar 在 logged-in AccountPage 上挂了一个 transient 空 `<q-dialog>` 拦截 pointer events（observable in playwright snapshot 末尾的 `dialog:` 空节点），actionability check 永远不通过；改 `locator.dispatchEvent('click')` 直接触发 Vue handler 绕过 hit-test
+      - ② **case3 必须直接 goto('/account') 而不是 / → push('/account')**：injectAuth 用 addInitScript 写 localStorage，addInitScript 在每次 page navigation 都重跑会把 refresh_token 重置成原始值（boot 已经轮换过）；走两次 nav 的话第二次 boot 用旧 token refresh 401 → AccountPage onReady 检测 user null → router.replace('/') + 弹 login dialog。直接落 /account 让 boot 只跑一次
+      - ③ **scenarioB 仅 `setOffline(true)` 不会立即关闭已有 WS**：Playwright setOffline 阻断新请求但已建立的 ws 要等 25s heartbeat ping 才察觉断网；测试预算 1s 等不到。补一句强制 `ws.close(4002, 'simulate-network-drop')` 走 onClose 通用分支（注意：browser 只允许 close code 1000 或 3000-4999，1006 直接 InvalidAccessError；4001 会走 token-expired 分支应避开）
+      - ④ **scenarioC 不签短 exp JWT 模拟 server 4001**：那需要把 TEST_JWT_SECRET 漏进 page，污染 expose 边界；改成在 page 内直接 `(realtime as any).ws.close(4001, ...)` 进 client onClose 4001 分支；同样地 client tryRefresh 路径 + scheduleReconnect 都被覆盖，只是没覆盖 server 端 exp_watchdog（那块由 pytest 的 `test_ws_heartbeat_timeout_closes_connection` 之外另一条 future api case 兜，本 phase 不补）
+    - 判据真跑：
+      - `pnpm test:api` 33 passed 51s（含 slow，未变化）
+      - `pnpm test:e2e` 11 passed + 26 skipped + 2 failed（仅 step4 case1/case2 — Phase 5 spec-first 的预期红，未实现 Stage 2 Step 4），耗时 ~1m
+      - 全部新增 case（stage1_5 auth-ui 4 case + stage2 step3-realtime-recovery 2 case）首跑全绿
+      - plan 通过判据 #1（pytest + e2e 一把全绿）：在「Step 4 未做仍是 spec-first 红信号」的语义下达成；除两条文档化预期红外其余 100% 绿；总时长 < 2min（plan 预算 < 10min ✅）
+      - plan 通过判据 #3（已完成 Step 都至少一行 spec/api 引用）：Stage 0/1/1.5/2 已完成的 6 个 Step 全部回填 ✅
+      - plan 通过判据 #2（README 自洽到能让另一会话独立写 reactives spec）：README §5.3 给了具体 5 步配方含 helper 名、profile 名、case 形状建议
+  - Phase 7 未启动
+  - 下一步：cloud-sync-migration plan Stage 2 Step 4 落地时，复用 `tests/e2e/stage2/step4-providers-realtime.spec.ts` 当 TDD 红绿信号；落地完成后 case1/case2 自动转绿，本 plan 「已知预期红」段缩减到 0 行
 
 ---
 
