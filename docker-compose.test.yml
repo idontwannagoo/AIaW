@@ -1,0 +1,23 @@
+name: aiaw-test
+
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: aiaw-postgres-test
+    restart: "no"
+    environment:
+      POSTGRES_USER: aiaw
+      POSTGRES_PASSWORD: aiaw_test
+      POSTGRES_DB: aiaw_test
+    ports:
+      - "5434:5432"
+    volumes:
+      - aiaw_test_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiaw -d aiaw_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  aiaw_test_pg:

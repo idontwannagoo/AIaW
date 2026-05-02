@@ -19,9 +19,15 @@
   - **影响范围**：新增 `tests/` 顶层目录、`docker-compose.test.yml`、`playwright.config.ts`、`pytest.ini`；package.json 新增若干 `test:*` script；不动现有源代码（除 dev/test build 给 `window.__db__` / `window.__authSource__` 加 `EXPOSE_DB=true` 守卫的暴露开关）。
 
 - **进度快照（2026-05-02）**
-  - plan 文件入库 ⏳ 当前会话进行中
-  - Phase 1-7 全部未启动
-  - 下一步：Phase 1（docker-compose.test.yml + 启停脚本 + backend 9011 起停）
+  - plan 文件入库 ✅ `aa15721`
+  - Phase 1 测试环境底座 ✅ 本次提交
+    - docker-compose.test.yml（Postgres 16 → 5434，project name `aiaw-test`，volume `aiaw_test_pg`，pg_isready healthcheck）
+    - tests/scripts/{test-up,test-down,backend-start,backend-stop}.sh（全 chmod +x）
+    - package.json 加 `test:up` / `test:down` / `test:backend:start` / `test:backend:stop`
+    - .gitignore 加 `/tests/.builds/` `/tests/.results/`
+    - 判据真跑：`/api/v1/health` → `{status:"ok",db:"ok"}`；dev 5433/aiaw-postgres 不受影响；`test:down` 释放 5434 + 删 volume；二次 up/start 幂等；5434/9011 被占时 lsof 友好报错
+  - Phase 2-7 未启动
+  - 下一步：Phase 2（前端 profile 构建管理 + sha256 cache + serve-build）
 
 ---
 
@@ -97,7 +103,7 @@ pytest.ini
 
 ## Phase 拆分
 
-### Phase 1 — 测试环境底座 ⏳
+### Phase 1 — 测试环境底座 ✅
 
 **做什么**
 - `docker-compose.test.yml`：Postgres 16 → 5434，独立 named volume `aiaw_test_pg`，含 `pg_isready` healthcheck。与 dev 5433 完全互不干扰。

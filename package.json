@@ -9,6 +9,10 @@
   "scripts": {
     "lint": "eslint --ext .js,.ts,.vue ./",
     "test": "echo \"No test specified\" && exit 0",
+    "test:up": "bash tests/scripts/test-up.sh",
+    "test:down": "bash tests/scripts/test-down.sh",
+    "test:backend:start": "bash tests/scripts/backend-start.sh",
+    "test:backend:stop": "bash tests/scripts/backend-stop.sh",
     "dev": "quasar dev",
     "build": "quasar build",
     "docs:dev": "vitepress dev docs",

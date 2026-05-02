@@ -42,6 +42,10 @@ pnpm-debug.log*
 # Code counter
 .VSCodeCounter
 
+# Test infrastructure (build cache, reporter outputs, backend pid/log)
+/tests/.builds/
+/tests/.results/
+
 # Deploy config
 /deploy
 
