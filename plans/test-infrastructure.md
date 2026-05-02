@@ -20,13 +20,13 @@
 
 - **进度快照（2026-05-02）**
   - plan 文件入库 ✅ `aa15721`
-  - Phase 1 测试环境底座 ✅ `8e61258`
+  - Phase 1 测试环境底座 ✅
     - docker-compose.test.yml（Postgres 16 → 5434，project name `aiaw-test`，volume `aiaw_test_pg`，pg_isready healthcheck）
     - tests/scripts/{test-up,test-down,backend-start,backend-stop}.sh（全 chmod +x）
     - package.json 加 `test:up` / `test:down` / `test:backend:start` / `test:backend:stop`
     - .gitignore 加 `/tests/.builds/` `/tests/.results/`
     - 判据真跑：`/api/v1/health` → `{status:"ok",db:"ok"}`；dev 5433/aiaw-postgres 不受影响；`test:down` 释放 5434 + 删 volume；二次 up/start 幂等；5434/9011 被占时 lsof 友好报错
-  - Phase 2 前端 profile 构建管理 ✅ 本次提交
+  - Phase 2 前端 profile 构建管理 ✅
     - tests/env/.env.test.{baseline,providers-rest,realtime-ws}（含 EXPOSE_DB=true 给 e2e 钩子用）
     - tests/scripts/build-frontend-profile.mjs（cache key = sha256(profile + env-sha + git rev + pkg-sha)，trap-style .env.local 还原：finally + SIGINT/SIGTERM/SIGHUP/uncaughtException 多入口 idempotent restore）
     - tests/scripts/serve-build.mjs（plain node:http，SPA fallback：无扩展名路径 → index.html，带扩展名缺失 → 404；EADDRINUSE 友好报错）

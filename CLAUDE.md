@@ -20,7 +20,7 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 **plan 文件维护规则（静态，不随进度变化）：**
 
 - **plan 是单一真源**：阶段当前进度、最近完成的 commit、下一步、决策修订都写进 plan 文件，不写进本 CLAUDE.md。新会话从 plan 拿动态状态。
-- **每完成一个 Step 必须更新 plan**：在 plan 对应 Step 标 ✅ + commit 短 hash；同步更新「进度快照」段；同一次提交里把代码改动与 plan 更新一起 commit，避免 plan 与代码漂移。
+- **每完成一个 Step 必须更新 plan**：在 plan 对应 Step 标 ✅，同步更新「进度快照」段；同一次提交里把代码改动与 plan 更新一起 commit，避免 plan 与代码漂移。**不要在 plan 里写当前 commit 自身的 hash**——commit hash 由内容（含 plan）决定，自指数学上无解（amend 后 hash 漂移，plan 写的 hash 失效）。要追溯具体提交直接 `git log` / `git blame` plan 文件。已完成的前序 step 想顺手附个短 hash 做导航锚 OK，但非必须；标 ✅ + Step 名足以定位。
 - **方案有调整必须加修订记录**：当某阶段假设被否定 / 子步骤拆分 / 顺序调整 / 上线策略变化时，在 plan 顶部「修订记录」追加一条带日期 + 背景 + 变更 + 影响范围的条目，再改正文。不要静默改正文。
 - **每次代码修改必须配套通过判据**：每个 Step 在 plan 里都有「通过判据」段，代码改动落地后必须按判据真测一遍（curl / Console / 多 tab / 清缓存等），把结果记进进度快照。判据失败时优先修代码，而不是改判据。
 - **flag 默认关 = 字节级一致**：任何阶段的代码合并到 my-deploy 时，前端 `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` / `REALTIME_TRANSPORT` 与后端 `BACKEND_DATA_API_ENABLED` 默认全不开，行为必须与上一阶段完全一致。这是回滚兜底，不可破坏。
