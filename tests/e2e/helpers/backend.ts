@@ -238,3 +238,36 @@ export async function deleteWorkspace(
     `/api/v1/workspaces/${id}?cascade=${cascade}`
   )
 }
+
+// Stage 4 / 批次-4b — dialogs endpoint (id-PK; data carries the full
+// Dialog row, workspace_id is server-side promoted to its own column +
+// FK).
+export interface DialogRow {
+  id: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: Record<string, unknown> | null
+}
+
+export async function putDialog(
+  token: string,
+  id: string,
+  data: Record<string, unknown>
+): Promise<DialogRow> {
+  return backendClient(token).put(`/api/v1/dialogs/${id}`, data)
+}
+
+export async function listDialogs(
+  token: string,
+  since = 0
+): Promise<DialogRow[]> {
+  return backendClient(token).get(`/api/v1/dialogs?since=${since}`)
+}
+
+export async function deleteDialog(
+  token: string,
+  id: string
+): Promise<DialogRow> {
+  return backendClient(token).del(`/api/v1/dialogs/${id}`)
+}

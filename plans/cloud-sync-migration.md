@@ -91,7 +91,7 @@
 
 ---
 
-## 进度快照（最新 · 2026-05-02）
+## 进度快照（最新 · 2026-05-03）
 
 > 本段反映"现在到哪 / 下一步做什么"，每个 Stage 落地时同步刷新。已落地代码细节查 `git log` + commit message。
 
@@ -105,27 +105,28 @@
 - **Stage 3 / 批次-3a** ✅ `reactives` KV 表迁到 backend：复合主键 `(user_id, key)` + envelope `{key, version, updated_at, deleted, data}` + alembic migration `d6a3f8c91e22` + WS / SSE 加 reactives 白名单 + 前端 `reactives.server.ts` 路由 + `BACKEND_DATA_TABLES=providers,reactives`。`persistent-reactive.ts` 透明走 server，跨 tab 实时同步可用
 - **Stage 3 / 批次-3b** ✅ `assistants` (id-PK) + `installedPlugins` (KV-PK like reactives, 但 `data` 是整行) + `avatarImages` (id-PK + ArrayBuffer↔base64 wire) 三张叶子表迁到 backend：alembic migration `e4b2c5f9d017` + 3 个 router + WS / SSE 加 3 张表白名单 + 3 个 `<table>.server.ts` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages`
 - **Stage 4 主体 / 批次-4a** ✅ `workspaces` (id-PK，type/parentId 嵌 `data`、`$root` sentinel、不建自引用 FK) 迁到 backend：alembic migration `a7f3c2e9b481` + `routers/workspaces.py`（DELETE 接 `?cascade=true|false` no-op 预留 4b/4c/4d/4e wire 形状）+ WS / SSE 加 workspaces 白名单与 serializer + `workspaces.server.ts`（delete 走 `?cascade=true`）+ `BACKEND_DATA_TABLES=...,workspaces`；顺手修 `stores/workspaces.ts::deleteItem` 不再 runTx 包 dexie 事务（与 server-routed 表不兼容）+ `db.ts` 3 个 reading hook 容忍 undefined（latent bug）
+- **Stage 4 主体 / 批次-4b** ✅ `dialogs` (id-PK + `workspace_id` 提到顶层列，FK→workspaces.id ON DELETE CASCADE) 迁到 backend：alembic migration `b5d2c8e7a394` + `routers/dialogs.py`（PUT 校验 workspaceId 存在 + 同 user，缺失/跨 user 返回 409 而非 500）+ `routers/workspaces.py::delete_workspace` 接通真级联（cascade=true 时同事务 tombstone 所有 workspace_id 匹配的 dialogs，发独立 WS event 链）+ WS / SSE 加 dialogs 白名单 + `dialogs.server.ts`（id-PK 模板）+ `BACKEND_DATA_TABLES=...,dialogs`
 - **Stage 4 硬前置 2** ✅ 对象存储 BlobStore + `/api/v1/blobs` endpoint：`blobs` 表 (sha256 PK + size + content_type + storage_key) + `blob_refs` 表 ((user_id, sha256) 复合 PK + last_seen_at) + alembic migration `f1a3b8c5d4e2`；`BlobStore` 抽象接口 + `LocalFsBlobStore` 默认实现（src-backend/.blob-store 分片路径 `<sha[:2]>/<rest>`）+ `S3BlobStore` 骨架 (boto3 lazy import)；HMAC-SHA256(JWT_SECRET, `sha\|exp`) 签名 URL TTL 1h；POST 上传 + GET metadata + HEAD + GET `/{sha}/data?exp=&sig=` presign + DELETE per-user ref；前端 `src/data/blob-client.ts`（`putBlob` / `fetchBlob` / `serializeAttachment` / `materializeAttachment` + `BLOB_INLINE_MAX_BYTES=64KB`）
 - **Stage 4 硬前置 1** ✅（仅 cursor 分页）`src-backend/data/pagination.py`（`CursorPage` envelope + `normalize_limit` + `build_page` + `CURSOR_MAX_LIMIT=1000`）+ `routers/providers.py` 的 list endpoint 加 `?limit=N` opt-in（不带 limit 维持 `list[Row]` 向后兼容，带 limit 升格为 `{rows, next_cursor}` envelope）+ `tests/api/test_pagination.py`（无 limit / 带 limit / 满页 next_cursor / 边界 / `limit<=0` 拒 / `>CURSOR_MAX_LIMIT` clamp / 续拉到 null 等多 case）。原设计中的 notify-only WS 协议 / per-table payload-mode / fetchAndDispatch 等整体放弃，详见 2026-05-02「硬前置 1 收窄」修订记录。流式云同步走 inline envelope，所有表（含 messages / artifacts）共用 Stage 1–3 现有协议
-- **测试脚手架** ✅ pytest（`tests/api/`，117 case 全绿 ~83s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，68 passed / 244 skipped + 1 pre-existing flake `scenarioB ws auto-reconnect` ~4.8 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
+- **测试脚手架** ✅ pytest（`tests/api/`，132 case 全绿 ~90s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，72 passed / 264 skipped ~5 min；偶发 pre-existing flake `scenarioB ws auto-reconnect` + reactives cache-roundtrip race，单跑均稳）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
 
 ### 部署状态
 
 - **服务 1（指向 `my-deploy`）**：HEAD `2b26349`（Stage 0 baseline + Dexie 路径 bug fix）。env 不开任何 backend flag。承载老用户。Stage 5 落地后由 active 用户迁移率 ≥ 80% 触发 6 周下线窗
 - **服务 2（指向 `new-deploy`）**：公网域名 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run`，独立 Postgres
-  - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages,workspaces` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
+  - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages,workspaces,dialogs` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
   - 后端 Northflank 控制台 env：`BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=true`
   - Dockerfile 第二阶段含 `alembic upgrade head` 启动钩子
-  - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/workspaces` 401、`/api/v1/auth/register` 422
-  - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages + workspaces 跨设备同步可用；其他 4 张表（dialogs / messages / artifacts / items）仍只在本地 IndexedDB；workspaces 删除时子 dialogs / messages / items / artifacts 仍由前端 dexie 清（`stores/workspaces.ts::deleteItem` 顺序 await，不跨表事务）；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
+  - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/workspaces` 401、`/api/v1/dialogs` 401、`/api/v1/auth/register` 422
+  - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages + workspaces + dialogs 跨设备同步可用；workspace 删除时 dialogs 走 server 端真级联（同事务 tombstone + 各发 WS event）；其他 3 张表（messages / artifacts / items）仍只在本地 IndexedDB，workspace 删除时由前端 `stores/workspaces.ts::deleteItem` 顺序 await 清；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
 
-### 下一步：开 Stage 4 主体批次-4b（`dialogs`） / 批次-4c（`items`）
+### 下一步：开 Stage 4 主体批次-4c（`items`）
 
-批次-4a workspaces 落地后，按依赖顺序进入 4b dialogs（依赖 workspaces FK，建议加 ON DELETE CASCADE 联动 workspaces tombstone 把 server 端子表清理职责接力过去）+ 4c items（独立，可与 4b 并行）→ 4d artifacts（依赖硬前置 2 对象存储）→ 4e messages（依赖硬前置 1+2，inline envelope 流式同步，最难）。
+批次-4b dialogs 落地后，按依赖顺序进入 4c items（独立无 FK 依赖，可独立做）→ 4d artifacts（依赖硬前置 2 对象存储）→ 4e messages（依赖硬前置 1+2，inline envelope 流式同步，最难）。`workspaces.delete(?cascade=true)` 当前已经 server-side 真级联到 dialogs；4c/4d/4e 落地时按相同模板把 items / artifacts / messages 各自的 update-tombstone 链路加进 `routers/workspaces.py::delete_workspace` 的 cascade 分支即可。
 
 ### 未启动（按依赖顺序）
 
-- **Stage 4 主体** 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages` ⏳
+- **Stage 4 主体** 批次-4c `items` → 批次-4d `artifacts` → 批次-4e `messages` ⏳
 - **Stage 4.5** 服务端 Import Job + bootstrap ⏳ ← **可让老用户用的物理分水岭**
 - **Stage 4.9** flag 路由层 + dexie 实现一次性下架 ⏳ ← 需 Stage 4.5 端到端验收通过 + 稳定运行 1 周
 - **Stage 5** 端到端验证（旧版 export → 新版 import 字节级互通 + 卸载重装 + 跨平台真机） ⏳
@@ -816,7 +817,16 @@ interface AuthSource {
   - 测试输出：`pnpm test:api` 117 passed ~83s（96 → 117，+12 + ~9 历史 case 增量计数纠偏）；`pnpm test:e2e` 68 passed / 244 skipped ~4.8 min（57 → 68，+11 含 4a × 6 profile 切片）
   - 红测验证：把 `routers/workspaces.py::_to_row` 的 `data=None if w.deleted_at else w.data` 临时写死 `data=None`，5/12 case 红、stdout 准确报 `assert body['data']['name'] == 'Workspace 1' → TypeError: 'NoneType' object is not subscriptable`，恢复后绿
   - 红测验证（e2e）：第一次跑 case2 时 cascade evaluate 触发 db.workspaces.hook('reading') 在 undefined 上爆 `Cannot read properties of undefined (reading 'type')`（pre-existing latent bug），加 `workspace?.type` 守卫后绿；spec stdout / Playwright error-context.md / failed screenshot 三路定位准确
-- 批次-4b (`dialogs`)：⏳ 未开
+- 批次-4b (`dialogs`)：✅ 落地
+  - 后端：`models/dialog.py`（id-PK envelope + `workspace_id` 提到顶层列、FK→workspaces.id ON DELETE CASCADE）+ `routers/dialogs.py`（GET list / GET one / PUT / DELETE，PUT 校验 `data.workspaceId` 存在 + 同 user，缺失/跨 user 返回 409 而非 500；同时 catch 后端 IntegrityError 转 409 防 race）+ `routers/workspaces.py::delete_workspace` 接通真级联（cascade=true 时同事务 update Dialog.deleted_at，全部 cascaded dialogs 共用一个 cascade_version，发独立 WS event 链）+ alembic migration `b5d2c8e7a394`（依赖 `a7f3c2e9b481`）+ stream/sse 加 `dialogs` 白名单与 `_serialize_dialog` + `app.py::_enable_backend_data_api` 挂载 dialogs_router
+  - 前端：`dialogs.server.ts`（id-PK，复用 workspaces 模板；observeList/observeFind/observeOne 触发 `ensureRealtimeSubscription`）+ `repositories/index.ts` flag 路由 dialogs 分支 + `SERVER_CAPABLE_TABLES` 加 `dialogs`
+  - env：`.env.docker` `BACKEND_DATA_TABLES=...,workspaces,dialogs`；`tests/env/.env.test.{providers-rest,realtime-{ws,sse,poll,auto}}` 同步加 `dialogs`；`tests/api/conftest.py` TRUNCATE 列表加 `dialogs`
+  - helper 增量：`tests/e2e/helpers/backend.ts` 加 `DialogRow` / `putDialog` / `listDialogs` / `deleteDialog`
+  - api: `tests/api/test_dialogs.py::test_put_creates_and_list_returns_it / test_get_returns_single_row / test_put_update_bumps_version / test_since_filter_drops_older_revisions / test_soft_delete_yields_tombstone_in_list / test_delete_then_put_revives / test_account_isolation / test_unauth_request_rejected / test_put_rejects_missing_workspace_id / test_put_rejects_unknown_workspace / test_put_rejects_cross_user_workspace / test_workspace_cascade_true_tombstones_dialogs / test_workspace_cascade_false_leaves_dialogs / test_workspace_cascade_skips_other_workspaces / test_cross_user_cannot_delete`（15 case 全绿）
+  - spec: `tests/e2e/stage4/dialogs-realtime.spec.ts::case1 ws double-tab put+update+delete / case2 ws double-tab cascade tombstones server dialog rows + B receives ws delete / case3 providers-rest no-realtime / case4 baseline byte-identical`（4 case 全绿）
+  - 测试输出：`pnpm test:api` 132 passed ~90s（117 → 132，+15）；`pnpm test:e2e` 72 passed / 264 skipped ~5 min（68 → 72，+4 含 4b 1 case × 4 profile 切片实跑）
+  - 红测验证（api）：在 `routers/workspaces.py::delete_workspace` 把 `if cascade:` 临时改为 `if False and cascade:` 关掉级联分支，3 个 cascade 相关 case 红、stdout 准确报 `assert by_id['d1']['deleted'] is True → AssertionError: d1 still alive: {'id': 'd1', ..., 'deleted': False, 'data': {...}}`；恢复后绿
+  - 红测验证（e2e）：在 `dialogs.server.ts` 的 realtime subscribe 回调里把 put / delete 分发注释掉，case1/case2 红、stdout 报 `row dialogs/dlg-xxx did not converge within 1500ms (A={"id":"dlg-xxx","name":"d1",...} B=undefined)`；恢复后绿。注意：build profile cache 不感知工作树 diff，红测后必须 `rm -rf tests/.builds/realtime-ws` 才能让新版代码进 bundle
 - 批次-4c (`items`)：⏳ 未开
 - 批次-4d (`artifacts`)：⏳ 未开 · 依赖 Stage 4 硬前置 2 对象存储完成 + 硬前置 1 cursor 分页落地
 - 批次-4e (`messages`)：⏳ 未开 · 依赖 Stage 4 硬前置 1 cursor 分页 + 硬前置 2 对象存储全部完成

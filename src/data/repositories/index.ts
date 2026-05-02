@@ -12,6 +12,7 @@ import { serverAssistantsRepository } from './assistants.server'
 import { serverInstalledPluginsRepository } from './installed-plugins.server'
 import { serverAvatarImagesRepository } from './avatar-images.server'
 import { serverWorkspacesRepository } from './workspaces.server'
+import { serverDialogsRepository } from './dialogs.server'
 import type { Repository } from '../types'
 
 const SERVER_CAPABLE_TABLES = new Set([
@@ -22,7 +23,8 @@ const SERVER_CAPABLE_TABLES = new Set([
   // snake_case tables (`installed_plugins` / `avatar_images`).
   'installedPlugins',
   'avatarImages',
-  'workspaces'
+  'workspaces',
+  'dialogs'
 ])
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -39,9 +41,11 @@ const dexieInstalledPlugins = createDexieRepository<InstalledPlugin, string>(t((
 const dexieAvatarImages = createDexieRepository<AvatarImage, string>(t(() => db.avatarImages)) as Repository<AvatarImage, string>
 const dexieWorkspaces = createDexieRepository<Workspace | Folder, string>(t(() => db.workspaces)) as Repository<Workspace | Folder, string>
 
+const dexieDialogs = createDexieRepository<Dialog, string>(t(() => db.dialogs)) as Repository<Dialog, string>
+
 export const repos = {
   workspaces: routeToServer('workspaces') ? serverWorkspacesRepository : dexieWorkspaces,
-  dialogs: createDexieRepository<Dialog, string>(t(() => db.dialogs)) as Repository<Dialog, string>,
+  dialogs: routeToServer('dialogs') ? serverDialogsRepository : dexieDialogs,
   messages: createDexieRepository<Message, string>(t(() => db.messages)) as Repository<Message, string>,
   assistants: routeToServer('assistants') ? serverAssistantsRepository : dexieAssistants,
   artifacts: createDexieRepository<Artifact, string>(t(() => db.artifacts)) as Repository<Artifact, string>,

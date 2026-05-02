@@ -40,6 +40,7 @@ from ..auth import _decode_access
 from ..db import SessionLocal
 from ..models.assistant import Assistant
 from ..models.avatar_image import AvatarImage
+from ..models.dialog import Dialog
 from ..models.installed_plugin import InstalledPlugin
 from ..models.provider import Provider
 from ..models.reactive import Reactive
@@ -59,6 +60,7 @@ TABLE_MODELS = {
     'avatar_images': AvatarImage,
     'installed_plugins': InstalledPlugin,
     'workspaces': Workspace,
+    'dialogs': Dialog,
 }
 
 # SSE keepalives are comments; clients (including event-source-polyfill)
@@ -174,6 +176,24 @@ def _serialize_workspace(w: Workspace) -> dict[str, Any]:
     }
 
 
+def _serialize_dialog(d: Dialog) -> dict[str, Any]:
+    deleted = d.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'dialogs',
+        'op': 'delete' if deleted else 'put',
+        'id': d.id,
+        'rev': d.version,
+        'row': None if deleted else {
+            'id': d.id,
+            'version': d.version,
+            'updated_at': d.updated_at.isoformat(),
+            'deleted': False,
+            'data': d.data,
+        },
+    }
+
+
 SERIALIZERS = {
     'providers': _serialize_provider,
     'reactives': _serialize_reactive,
@@ -181,6 +201,7 @@ SERIALIZERS = {
     'avatar_images': _serialize_avatar_image,
     'installed_plugins': _serialize_installed_plugin,
     'workspaces': _serialize_workspace,
+    'dialogs': _serialize_dialog,
 }
 
 
