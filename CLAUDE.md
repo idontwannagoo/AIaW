@@ -6,9 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 + TypeScript**。同一份前端代码以 SPA / PWA / Tauri 桌面 / Capacitor Android 形式发布。当前 fork 是部署版本，附带一个 Python (FastAPI) 后端用于代理与文档解析。
 
-## 长期迁移工作流（云同步重构）
+## plan 文件与长期工作流
 
-本仓库正在执行云同步从 Dexie Cloud 迁到自家 FastAPI 的多阶段迁移，**权威计划在 `plans/cloud-sync-migration.md`**。该文件含完整阶段拆分、Step 通过判据、上线/回滚策略、修订记录、进度快照。涉及云同步 / 数据层 / 鉴权 / 实时通道的任何工作前必须先 Read。
+本仓库使用 `plans/` 目录维护多份长期工作 plan。**开始任何会话前，必须先 Read `plans/` 下与本次工作主题相关的所有 plan 文件**，从中获取动态进度（当前 Step / commit hash / 已知问题 / 修订记录）。本 CLAUDE.md 仅含静态规则，不含动态进度。
+
+当前在册 plan：
+
+- `plans/cloud-sync-migration.md` —— 云同步从 Dexie Cloud 迁到自家 FastAPI 的多阶段迁移。涉及云同步 / 数据层 / 鉴权 / 实时通道的工作必读。
+- `plans/test-infrastructure.md` —— 自动化测试脚手架方案。涉及测试 / 验收手段 / CI / 写新 spec 或加 helper 的工作必读。
+
+新增 plan 时同步在本段追加一行索引。
 
 **plan 文件维护规则（静态，不随进度变化）：**
 
@@ -19,6 +26,19 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 - **flag 默认关 = 字节级一致**：任何阶段的代码合并到 my-deploy 时，前端 `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `BACKEND_AUTH` / `REALTIME_TRANSPORT` 与后端 `BACKEND_DATA_API_ENABLED` 默认全不开，行为必须与上一阶段完全一致。这是回滚兜底，不可破坏。
 - **后端模块条件挂载**：新增 backend 子模块（如 Stage 2 `realtime.py`）若依赖 `JWT_SECRET` 等强制 env，必须放在 `_enable_backend_data_api()` flag 守卫的 lazy import 里，不能让无 flag 的 Northflank 部署在 import 期就崩。
 - **提交信息**：遵循全局规则（中文、不带 `Co-Authored-By` 与 AI 署名）；项目惯用 `<scope>: <短描述>` 或 `云同步重构stageX-stepY: <内容>` 形式（参考 `git log`）。
+
+## 测试体系（静态规则）
+
+测试体系的动态进度与 Phase 拆分见 `plans/test-infrastructure.md`。本段仅列不随进度变化的稳定规则：
+
+- **两层架构**：后端走 pytest（`tests/api/`），端到端走 Playwright（`tests/e2e/`）。不引入 Vitest 单元层（投资回报低，本项目 bug 几乎全是多端协作 / 时序 / 网络型）。
+- **环境完全隔离**：测试用 Postgres 5434 / backend 9011 / 前端 9007 三组端口，与 dev 的 5433/9010/9005 互不影响。任何测试脚本不得读写 dev 用的 Postgres / 9010 backend；临时改 `.env.local` 必须带还原 trap，无论成功失败或中断都还原。
+- **e2e 跑 build 产物，不跑 dev server**：每个 flag profile 一份独立 `quasar build` 产物，按 (env-sha256, git rev, package.json hash) 联合 cache 复用。原因是 `process.env.*` 构建期内联，runtime 切 flag 不可行。
+- **判据即代码**：`plans/cloud-sync-migration.md` 每条「通过判据」必须映射到具体 pytest test name 或 Playwright spec name，并在 plan 对应 Step 写下 `spec:` / `api:` 引用。手测判据不再视为完成标准。
+- **新 Step 落地 = 同 PR 落 spec**：任何新 Step 的代码变更必须在同一 PR 里附上对应自动化 case，否则视为未完成。回归套件持续累积，不允许欠账。
+- **调试钩子守卫**：给 e2e 暴露的 `window.__db__` / `window.__authSource__` 等钩子必须放在 `EXPOSE_DB=true` env 守卫的 boot 文件里；prod docker build 流程必须断言此 env 非 true 才允许出包，避免暴露 IndexedDB 操作面。
+- **测试命令命名**：测试相关 pnpm script 统一 `test:` 前缀（如 `test:up` / `test:down` / `test:api` / `test:e2e[:<profile>]`）；退出码 0 = 全绿、非 0 = 失败数；reporter 输出统一进 `tests/.results/`。
+- **dexie-cloud SaaS 不进 e2e 默认路径**：测试 env 默认关 `DEXIE_DB_URL`，只测 backend 路径；要测 dexie auth 链路时单独开 profile，必要时用 helper 拦 host 模拟 SaaS down。避免 e2e 依赖外部 SaaS 可用性。
 
 ## 常用命令
 
