@@ -77,6 +77,7 @@ profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 | Stage 2 / Step 3 客户端 RealtimeConn | `spec: tests/e2e/stage2/step3-realtime-recovery.spec.ts` (scenarioB / C) |
 | Stage 2 / Step 4 接 RemoteSyncSource | `spec: tests/e2e/stage2/step4-providers-realtime.spec.ts` (4 case) |
 | Stage 2 / Step 5 SSE / poll / auto 降级 | `api: tests/api/test_realtime_sse.py` (5 case) + `spec: tests/e2e/stage2/step5-transport-degradation.spec.ts` (4 case) |
+| Stage 3 / 批次-3a reactives KV | `api: tests/api/test_reactives.py` (8 case) + `spec: tests/e2e/stage3/reactives-realtime.spec.ts` (4 case) + `tests/e2e/stage3/reactives-cache-roundtrip.spec.ts` (2 case) + `tests/e2e/stage3/persistent-reactive-passthrough.spec.ts` (1 case) |
 
 ---
 
@@ -133,9 +134,11 @@ plan Stage 2 Step 4 落地转绿（providers.server.ts 接到 RemoteSyncSource�
 | 「把 token 注入页面」 | `injectAuth(page, pair)`（addInitScript 写 `aiaw.backendAuth.refresh` + `...user`）|
 | 「等 IDB 暴露」 | `exposeReady(page)`（等 `window.__exposeDebugReady__`） |
 | 「读表」 | `dumpTable<T>(page, 'providers')` / `getRow<T>(page, table, id)` |
-| 「server 直接写」 | `putProvider(token, id, data)` / `listProviders(token, since)` / `deleteProvider(token, id)` |
+| 「server 直接写」（providers） | `putProvider(token, id, data)` / `listProviders(token, since)` / `deleteProvider(token, id)` |
+| 「server 直接写」（reactives，KV） | `putReactive(token, key, value)` / `listReactives(token, since)` / `getReactive(token, key)` / `deleteReactive(token, key)` |
 | 「服务端真值」 | `pgQuery<Row>(sql, params)` / `expectRowExists(table, id, userId)` / `countByUser(table, userId)` |
-| 「双 tab 在 1.5s 内一致」 | `expectRowSync(pageA, pageB, table, id, { withinMs: 1500 })` |
+| 「双 tab 在 1.5s 内一致」（id 主键） | `expectRowSync(pageA, pageB, table, id, { withinMs: 1500 })` |
+| 「双 tab 在 1.5s 内一致」（KV / 任意字段） | `expectKvRowSync(pageA, pageB, table, field, value, { withinMs: 1500 })` —— 给 reactives 这种用 `key` 而非 `id` 的表用 |
 | 「等到 version >= N」 | `waitForVersion(page, table, id, minVersion)` |
 | 「断网」 | `setOffline(ctx, true)` |
 | 「禁 ws」 | `blockWS(ctx)` — 走 Playwright 1.48+ `routeWebSocket()`，匹配 `**/api/v1/stream**` |
@@ -144,26 +147,24 @@ plan Stage 2 Step 4 落地转绿（providers.server.ts 接到 RemoteSyncSource�
 | 「捕 ws 帧」 | `captureWs(page)` → `waitForFrame(predicate, timeoutMs)` / `expectFrame(predicate)` |
 | 「导出 / 导入」 | `exportData(page)` → 文件路径 / `importData(page, filePath)` |
 
-### 5.3 Stage 3 第一张表：`reactives`
+### 5.3 Stage 3 第一张表：`reactives`（已落地，可作为模板）
 
-举例（从这份 README 即可下手）：
+`reactives` 是 KV 形状的第一张 backend 表（复合 PK `(user_id, key)` + envelope `{key, version, updated_at, deleted, data}`），落地物可直接参考：
 
-1. 后端：拷 `routers/providers.py` → `routers/reactives.py`，模型加 KV-shape
-   字段（key 主键 + value JSON）；写 alembic migration；在 `app.py` 的
-   `_enable_backend_data_api()` 里挂路由
-2. 前端：抄 `providers.server.ts` → `reactives.server.ts`，在
-   `repositories/index.ts` 加 SERVER_CAPABLE_TABLES
-3. pytest：在 `tests/api/test_reactives.py` 复用 conftest 全部 fixture，
-   PUT/list/get/since/soft-delete/account-isolation 6 case + unauth 401（同
-   `test_providers.py` 形状）
-4. e2e：在 `tests/e2e/stage3/reactives.spec.ts` 写 4 case：
-   - `case1 cache write-through` — `pageA.evaluate(repos.reactives.put({...}))` →
-     `dumpTable(pageA, 'reactives')` 含写入 → `expectRowExists('reactives', id, userId)`
-   - `case2 cross-tab realtime`（仅 realtime-ws profile）— A put → B 1.5s 内看到
-   - `case3 providers-rest fallback` — 同 step4 case3 形状
-   - `case4 baseline byte-identical` — 抄 step4 case4
-5. 把 spec 路径写回 cloud-sync-migration plan 对应 Step 段尾的
-   `- api:` / `- spec:` 行
+- 后端：`src-backend/data/models/reactive.py`（PrimaryKeyConstraint + 共享 `global_change_seq`）+ `routers/reactives.py`（envelope 用 `key` 替 `id`）+ alembic migration `d6a3f8c91e22` + `stream.py`/`sse.py` `TABLE_MODELS` & `SERIALIZERS` 加 reactives + `app.py::_enable_backend_data_api` lazy import
+- 前端：`src/data/repositories/reactives.server.ts`（KV unwrap：`db.reactives.put({key: row.key, value: row.data})`；**`get`/`put`/`delete` 都触发 `ensureRealtimeSubscription`**——`persistent-reactive.ts` 用 `useLiveQuery(get(key))` 而非 `observe*`，realtime 必须在所有读写路径上都激活，否则跨 tab 推送拿不到）
+- env：`.env.docker` `BACKEND_DATA_TABLES=providers,reactives`；测试 profile 同步加（baseline 仍空）
+- 测试：
+  - `tests/api/test_reactives.py` 8 case（CRUD + ?since 严格大于 + soft-delete + delete-then-put 复活 + 同 key 跨用户隔离 + unauth 401）
+  - `tests/e2e/stage3/reactives-realtime.spec.ts` 4 case（ws double-tab / 30s reconnect / providers-rest no-realtime / baseline byte-identical）
+  - `tests/e2e/stage3/reactives-cache-roundtrip.spec.ts` 2 case（clear+reload bootstrap / cache 不重 ?since=0）
+  - `tests/e2e/stage3/persistent-reactive-passthrough.spec.ts` 1 case（put → server 真值 → 第二 tab observeOne+get → realtime 更新）
+
+模板复用要点（写 批次-3b 等其他叶子表时）：
+
+- KV 表 spec 用 `expectKvRowSync(pageA, pageB, table, 'key', value)` 而不是 `expectRowSync`（id 主键表用后者）
+- 表名要进 `stream.py` / `sse.py` 的 `TABLE_MODELS` + `SERIALIZERS`，否则 client subscribe 收 `unknown-table` 错误，realtime spec 全红——这是 Stage 3 第一次掉过的坑
+- 测试用 conftest 的 `db_reset` 必须把新表名加进 TRUNCATE 列表（`tests/api/conftest.py`），不然测试间脏数据相互干扰
 
 ---
 

@@ -88,32 +88,26 @@
 - **Stage 1.5** ✅ 自家 JWT 多用户鉴权（register / login / refresh / logout / me + `current_user` 依赖项）
 - **Stage 2** ✅ 实时通道：后端 broker + WS `/api/v1/stream`；前端 `RemoteSyncSource` + WS / SSE / poll / auto 四档 transport 降级；`providers` 表整张接通 realtime 跨 tab
 - **Stage 2.5** ✅ 摘 `dexie-cloud-addon` + 删双登录 UI + 删 `linked_dexie_email` 字段链 + 后端 alembic migration drop 列（`c4f1e2d3a8b0`）
-- **测试脚手架** ✅ pytest（`tests/api/`，37 case 全绿 ~52s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，17 passed / 85 skipped 1.3 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
+- **Stage 3 / 批次-3a** ✅ `reactives` KV 表迁到 backend：复合主键 `(user_id, key)` + envelope `{key, version, updated_at, deleted, data}` + alembic migration `d6a3f8c91e22` + WS / SSE 加 reactives 白名单 + 前端 `reactives.server.ts` 路由 + `BACKEND_DATA_TABLES=providers,reactives`。`persistent-reactive.ts` 透明走 server，跨 tab 实时同步可用
+- **测试脚手架** ✅ pytest（`tests/api/`，45 case 全绿 ~64s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，28 passed / 116 skipped 2.1 min）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
 
 ### 部署状态
 
 - **服务 1（指向 `my-deploy`）**：HEAD `2b26349`（Stage 0 baseline + Dexie 路径 bug fix）。env 不开任何 backend flag。承载老用户。Stage 5 落地后由 active 用户迁移率 ≥ 80% 触发 6 周下线窗
 - **服务 2（指向 `new-deploy`）**：公网域名 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run`，独立 Postgres
-  - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
+  - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers,reactives` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
   - 后端 Northflank 控制台 env：`BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=true`
   - Dockerfile 第二阶段含 `alembic upgrade head` 启动钩子
-  - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/auth/register` 422
-  - **当前能用 / 不能用**：providers 跨设备同步可用；其他 9 张表仍只在本地 IndexedDB；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
+  - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/auth/register` 422
+  - **当前能用 / 不能用**：providers + reactives 跨设备同步可用（reactives 跨 tab 由 persistent-reactive 透传到 user-data / user-perfs / plugins store）；其他 8 张表仍只在本地 IndexedDB；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
 
-### 下一步：开 Stage 3 / 批次-3a (`reactives`)
+### 下一步：开 Stage 3 / 批次-3b (`assistants` + `installedPluginsV2` + `avatarImages`)
 
-按「方向调整」修订记录折中：Stage 3 拆 2 个批次。先 批次-3a `reactives`（KV 形主键，envelope 重新设计），后 批次-3b `assistants` + `installedPluginsV2` + `avatarImages`。每个批次必须包含：
-
-- 后端：`models/<table>.py` SQLModel + `routers/<table>.py` REST + alembic migration（独立 head）+ router 加进 `app.py::_enable_backend_data_api()` lazy import 列表
-- 前端：`<table>.server.ts` Repository + `repositories/index.ts` flag 路由分支 + `server-tables.ts` `SERVER_CAPABLE_TABLES` 加表名
-- env：`.env.docker` `BACKEND_DATA_TABLES` CSV 加表名（**直接翻开**，不走"上线但不启用"）
-- 测试（详见 Stage 3 段「每个批次必须包含」）：api ~6 case + e2e realtime ~4 case + cache roundtrip ~2 case；reactives 额外加 `persistent-reactive` 透传链路 spec
-- 工作流：spec-first（先写红再写代码转绿）+ 本地 `pnpm test:api && pnpm test:e2e` 全绿 + 必须真跑红一次再跑绿
-- plan：Stage 3 段尾「批次状态」表更新对应批次行（commit、spec/api 引用、测试输出摘要）
+3 张叶子表合一批：schema 都是 `id` 主键 + 没级联 + 没大行 + 决策点小，可共享 `providers.server.ts` 模板。`avatarImages` 含小 blob，单条 ≥ 64KB 走 base64 内联即可（Stage 4 硬前置 2 才引入对象存储分流）。每个批次必须包含的产物 / 测试 / 翻 flag / 跑红 → 绿守则同 批次-3a，详见 Stage 3 段「每个批次必须包含」。
 
 ### 未启动（按依赖顺序）
 
-- **Stage 3** 批次-3a `reactives` ⏳ → 批次-3b `assistants` / `installedPluginsV2` / `avatarImages` ⏳
+- **Stage 3** 批次-3b `assistants` / `installedPluginsV2` / `avatarImages` ⏳
 - **Stage 4 硬前置** 1（大行 WS 协议改造） ⏳ + 硬前置 2（对象存储 BlobStore + `/api/v1/blobs`） ⏳
 - **Stage 4 主体** 批次-4a `workspaces` → 批次-4b `dialogs` / 批次-4c `items`（可并行）→ 批次-4d `artifacts` → 批次-4e `messages` ⏳
 - **Stage 4.5** 服务端 Import Job + bootstrap ⏳ ← **可让老用户用的物理分水岭**
@@ -643,7 +637,14 @@ interface AuthSource {
 
 #### 批次状态（每批次落地后填）
 
-- 批次-3a (`reactives`)：⏳ 未开
+- 批次-3a (`reactives`)：✅ 落地
+  - 后端：`models/reactive.py`（复合 PK `(user_id, key)`） + `routers/reactives.py`（envelope `{key, version, updated_at, deleted, data}`） + alembic migration `d6a3f8c91e22` + WS / SSE 加 reactives 白名单（`stream.py` `_serialize_reactive` + `sse.py` 同款）+ `app.py::_enable_backend_data_api` 挂载 reactives_router
+  - 前端：`reactives.server.ts`（KV envelope unwrap：`db.reactives.put({key, value: row.data})`； `get`/`put`/`delete` 都触发 `ensureRealtimeSubscription` 因为 `persistent-reactive` 走 `useLiveQuery(get(key))` 而非 `observe*`）+ `repositories/index.ts` flag 路由 + `SERVER_CAPABLE_TABLES` 加 `reactives`
+  - env：`.env.docker` `BACKEND_DATA_TABLES=providers,reactives`；`tests/env/.env.test.{providers-rest,realtime-ws,realtime-sse,realtime-poll,realtime-auto}` 同步加 `reactives`
+  - api: `tests/api/test_reactives.py::test_put_creates_and_list_returns_it / test_get_returns_single_row / test_put_update_bumps_version / test_since_filter_drops_older_revisions / test_soft_delete_yields_tombstone_in_list / test_delete_then_put_revives / test_account_isolation_same_key_two_users / test_unauth_request_rejected`（8 case，全绿）
+  - spec: `tests/e2e/stage3/reactives-realtime.spec.ts::case1 / case2 / case3 / case4`（4 case） + `tests/e2e/stage3/reactives-cache-roundtrip.spec.ts::case1 / case2`（2 case） + `tests/e2e/stage3/persistent-reactive-passthrough.spec.ts`（1 case）
+  - 测试输出：`pnpm test:api` 45 passed ~64s（37 → 45）；`pnpm test:e2e` 28 passed / 116 skipped ~2.1 min（17 → 28）
+  - 红测验证：① api 层临时把 `_to_row` 的 `data` 写死 `None`，5/8 case 红，stdout 准确报 `assert None == {...}`，恢复后绿 ② e2e 第一次跑时发现 stream.py / sse.py `TABLE_MODELS` 仅白名单 `providers`，realtime case 全红 → 加 reactives whitelist + serializer 后绿（spec 真信号准确）
 - 批次-3b (`assistants` / `installedPluginsV2` / `avatarImages`)：⏳ 未开
 
 ---

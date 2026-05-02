@@ -41,6 +41,7 @@ from realtime import Subscription, broker
 from ..auth import _decode_access
 from ..db import SessionLocal
 from ..models.provider import Provider
+from ..models.reactive import Reactive
 from ..models.user import User
 
 logger = logging.getLogger('aiaw.backend.realtime.ws')
@@ -50,6 +51,7 @@ router = APIRouter(tags=['stream'])
 # Tables clients are allowed to subscribe to + how to replay them.
 TABLE_MODELS = {
     'providers': Provider,
+    'reactives': Reactive,
 }
 
 HEARTBEAT_INTERVAL = 25.0  # server pings this often
@@ -115,8 +117,28 @@ def _serialize_provider(p: Provider) -> dict[str, Any]:
     }
 
 
+def _serialize_reactive(r: Reactive) -> dict[str, Any]:
+    deleted = r.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'reactives',
+        'op': 'delete' if deleted else 'put',
+        # KV table: `key` takes the `id` slot in the generic envelope.
+        'id': r.key,
+        'rev': r.version,
+        'row': None if deleted else {
+            'key': r.key,
+            'version': r.version,
+            'updated_at': r.updated_at.isoformat(),
+            'deleted': False,
+            'data': r.data,
+        },
+    }
+
+
 SERIALIZERS = {
     'providers': _serialize_provider,
+    'reactives': _serialize_reactive,
 }
 
 

@@ -7,9 +7,10 @@ import type {
 } from 'src/utils/types'
 import { createDexieRepository } from './dexie'
 import { serverProvidersRepository } from './providers.server'
+import { serverReactivesRepository } from './reactives.server'
 import type { Repository } from '../types'
 
-const SERVER_CAPABLE_TABLES = new Set(['providers'])
+const SERVER_CAPABLE_TABLES = new Set(['providers', 'reactives'])
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const t = <T, K extends string = string>(getter: () => any): (() => Table<T, K>) => () => getter() as Table<T, K>
@@ -19,6 +20,7 @@ function routeToServer(table: string): boolean {
 }
 
 const dexieProviders = createDexieRepository<CustomProvider, string>(t(() => db.providers)) as Repository<CustomProvider, string>
+const dexieReactives = createDexieRepository<StoredReactive, string>(t(() => db.reactives)) as Repository<StoredReactive, string>
 
 export const repos = {
   workspaces: createDexieRepository<Workspace | Folder, string>(t(() => db.workspaces)) as Repository<Workspace | Folder, string>,
@@ -27,7 +29,7 @@ export const repos = {
   assistants: createDexieRepository<Assistant, string>(t(() => db.assistants)) as Repository<Assistant, string>,
   artifacts: createDexieRepository<Artifact, string>(t(() => db.artifacts)) as Repository<Artifact, string>,
   installedPlugins: createDexieRepository<InstalledPlugin, string>(t(() => db.installedPluginsV2)) as Repository<InstalledPlugin, string>,
-  reactives: createDexieRepository<StoredReactive, string>(t(() => db.reactives)) as Repository<StoredReactive, string>,
+  reactives: routeToServer('reactives') ? serverReactivesRepository : dexieReactives,
   avatarImages: createDexieRepository<AvatarImage, string>(t(() => db.avatarImages)) as Repository<AvatarImage, string>,
   items: createDexieRepository<StoredItem, string>(t(() => db.items)) as Repository<StoredItem, string>,
   providers: routeToServer('providers') ? serverProvidersRepository : dexieProviders

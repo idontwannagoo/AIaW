@@ -78,3 +78,49 @@ export async function deleteProvider(
 ): Promise<ProviderRow> {
   return backendClient(token).del(`/api/v1/providers/${id}`)
 }
+
+// Stage 3 / 批次-3a — KV-shaped reactives endpoint. Distinct envelope from
+// providers (`key` instead of `id`, `data` carries only the value blob).
+export interface ReactiveRow {
+  key: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: unknown
+}
+
+export async function putReactive(
+  token: string,
+  key: string,
+  value: unknown
+): Promise<ReactiveRow> {
+  return backendClient(token).put(
+    `/api/v1/reactives/${encodeURIComponent(key)}`,
+    value
+  )
+}
+
+export async function getReactive(
+  token: string,
+  key: string
+): Promise<ReactiveRow> {
+  return backendClient(token).get(
+    `/api/v1/reactives/${encodeURIComponent(key)}`
+  )
+}
+
+export async function listReactives(
+  token: string,
+  since = 0
+): Promise<ReactiveRow[]> {
+  return backendClient(token).get(`/api/v1/reactives?since=${since}`)
+}
+
+export async function deleteReactive(
+  token: string,
+  key: string
+): Promise<ReactiveRow> {
+  return backendClient(token).del(
+    `/api/v1/reactives/${encodeURIComponent(key)}`
+  )
+}

@@ -39,6 +39,7 @@ from realtime import Subscription, broker
 from ..auth import _decode_access
 from ..db import SessionLocal
 from ..models.provider import Provider
+from ..models.reactive import Reactive
 from ..models.user import User
 
 logger = logging.getLogger('aiaw.backend.realtime.sse')
@@ -47,7 +48,7 @@ router = APIRouter(tags=['stream'])
 
 # Mirrors stream.py — kept separate so the WS module is the source of truth
 # for the WS subprotocol path and SSE only depends on the public broker API.
-TABLE_MODELS = {'providers': Provider}
+TABLE_MODELS = {'providers': Provider, 'reactives': Reactive}
 
 # SSE keepalives are comments; clients (including event-source-polyfill)
 # treat them as heartbeats. Send slightly under typical proxy idle timeouts.
@@ -72,7 +73,25 @@ def _serialize_provider(p: Provider) -> dict[str, Any]:
     }
 
 
-SERIALIZERS = {'providers': _serialize_provider}
+def _serialize_reactive(r: Reactive) -> dict[str, Any]:
+    deleted = r.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'reactives',
+        'op': 'delete' if deleted else 'put',
+        'id': r.key,
+        'rev': r.version,
+        'row': None if deleted else {
+            'key': r.key,
+            'version': r.version,
+            'updated_at': r.updated_at.isoformat(),
+            'deleted': False,
+            'data': r.data,
+        },
+    }
+
+
+SERIALIZERS = {'providers': _serialize_provider, 'reactives': _serialize_reactive}
 
 
 def _format_sse(*, event: str, data: dict[str, Any], event_id: Optional[int] = None) -> bytes:
