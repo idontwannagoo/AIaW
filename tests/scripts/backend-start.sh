@@ -52,6 +52,11 @@ export CORS_ALLOW_ORIGINS='http://localhost:9007,http://127.0.0.1:9007,http://lo
 # invite codes. Stage 1.5 plan defaults to invite mode, but that's a deploy
 # concern, not a test concern.
 export ALLOW_REGISTRATION='true'
+# Stage 4.5 Step 1 — turn the ImportJob worker on in the test backend so
+# tests/api/test_import_job.py can drive it (worker registers in lifespan
+# only when this flag is true; off = lifespan no-op = startup_complete never
+# fires for tests that touch get_worker()).
+export IMPORT_JOB_ENABLED='true'
 
 echo "[backend-start] alembic upgrade head"
 ( cd "$REPO_ROOT/src-backend" && "$VENV_ALEMBIC" upgrade head ) >>"$LOG_FILE" 2>&1

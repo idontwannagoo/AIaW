@@ -88,7 +88,8 @@ def db_reset() -> Iterator[None]:
             cur.execute(
                 'TRUNCATE TABLE refresh_tokens, users, providers, reactives, '
                 'assistants, avatar_images, installed_plugins, messages, '
-                'items, artifacts, dialogs, workspaces, blob_refs, blobs '
+                'items, artifacts, dialogs, workspaces, blob_refs, blobs, '
+                'import_jobs '
                 'RESTART IDENTITY CASCADE'
             )
             cur.execute('ALTER SEQUENCE global_change_seq RESTART WITH 1')

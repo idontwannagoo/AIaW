@@ -13,3 +13,7 @@ email-validator==2.2.0
 PyJWT==2.10.1
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
+# Stage 4.5 / Step 1 — streaming JSON parser for ImportJob Phase A. Only
+# imported under IMPORT_JOB_ENABLED + BACKEND_DATA_API_ENABLED so non-backend
+# deploys don't pull this in.
+ijson>=3.2,<4.0

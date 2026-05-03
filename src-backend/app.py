@@ -15,12 +15,30 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(messag
 
 http_client = None
 
+# Set in `_enable_backend_data_api()` when IMPORT_JOB_ENABLED is true. Held at
+# module level so the lifespan hook below can stop the worker on shutdown
+# without needing app.state plumbing.
+_import_worker = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
+    global http_client, _import_worker
     http_client = aiohttp.ClientSession()
-    yield
-    await http_client.close()
+    # Start the ImportJob worker if it was wired up at app construction. We
+    # start it *here* (not at module-import time) because the worker creates
+    # an asyncio.Task and needs an active loop.
+    if _import_worker is not None:
+        await _import_worker.start()
+        logger.info('import worker started')
+    try:
+        yield
+    finally:
+        if _import_worker is not None:
+            await _import_worker.stop()
+            logger.info('import worker stopped')
+        await http_client.close()
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -101,6 +119,25 @@ def _enable_backend_data_api(app: FastAPI) -> None:
         'installed_plugins + blobs + workspaces + dialogs + items + artifacts + '
         'messages + health + stream + sse mounted)'
     )
+
+    # Stage 4.5 / Step 1 — wire up ImportJob worker behind a separate flag.
+    # Lazy import keeps `ijson` dep + worker module out of the import path of
+    # backend deploys that don't enable imports. The worker is *constructed*
+    # here but *started* by the FastAPI lifespan hook (needs a running loop).
+    import_flag = os.environ.get('IMPORT_JOB_ENABLED', '').strip().lower()
+    if import_flag == 'true':
+        global _import_worker
+        from data.import_worker import get_worker
+        _import_worker = get_worker()
+        logger.info(
+            'import worker registered (will start in lifespan); '
+            'IMPORT_JOB_ENABLED=true'
+        )
+    else:
+        logger.info(
+            'import worker disabled '
+            '(set IMPORT_JOB_ENABLED=true to enable)'
+        )
 
 
 _enable_backend_data_api(app)

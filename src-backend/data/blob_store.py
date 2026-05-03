@@ -31,6 +31,7 @@ import hmac
 import os
 import secrets as _secrets
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -88,6 +89,27 @@ class BlobStore(ABC):
     @abstractmethod
     async def get(self, storage_key: str) -> bytes:
         """Fetch the entire blob. Raises FileNotFoundError if absent."""
+
+    def open_stream(
+        self, storage_key: str, *, chunk_size: int = 1024 * 1024
+    ) -> AsyncIterator[bytes]:
+        """Stream the blob in chunks. Default impl falls back to `get()`
+        followed by manual chunking — fine for tiny in-memory blobs but
+        wasteful for large ones. LocalFsBlobStore / S3BlobStore override this
+        with real streaming reads. Stage 4.5 Phase A relies on this so a
+        200MB raw upload can be ijson-parsed without loading the whole file
+        in RAM.
+
+        Note: declared `def` (not `async def`) returning an async generator —
+        callers do `async for chunk in store.open_stream(key): ...`, no
+        intermediate `await store.open_stream(...)` needed.
+        """
+        async def _iter() -> AsyncIterator[bytes]:
+            data = await self.get(storage_key)
+            for i in range(0, len(data), chunk_size):
+                yield data[i:i + chunk_size]
+
+        return _iter()
 
     @abstractmethod
     async def exists(self, storage_key: str) -> bool: ...
@@ -177,6 +199,35 @@ class LocalFsBlobStore(BlobStore):
                 ) from e
 
         return await asyncio.to_thread(_read)
+
+    def open_stream(
+        self, storage_key: str, *, chunk_size: int = 1024 * 1024
+    ) -> AsyncIterator[bytes]:
+        """LocalFS streaming read: open() the file once and yield chunks via
+        asyncio.to_thread per read. Avoids the default impl's read-whole-blob
+        path so Phase A can ijson-parse a 200MB upload with bounded RSS.
+        """
+        path = self._resolve(storage_key)
+
+        async def _iter() -> AsyncIterator[bytes]:
+            if not await asyncio.to_thread(path.exists):
+                raise FileNotFoundError(
+                    f'blob bytes missing on disk: {storage_key}'
+                )
+            # Run blocking file IO on a thread; yield control between chunks
+            # so the worker's event loop can service WS pings / progress
+            # publishes during a long parse.
+            f = await asyncio.to_thread(open, path, 'rb')
+            try:
+                while True:
+                    chunk = await asyncio.to_thread(f.read, chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                await asyncio.to_thread(f.close)
+
+        return _iter()
 
     async def exists(self, storage_key: str) -> bool:
         path = self._resolve(storage_key)
