@@ -57,10 +57,10 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
       for (const c of chars) {
         acc += c
         h.value = acc
-        await new Promise(r => setTimeout(r, 30))
+        await new Promise(resolve => setTimeout(resolve, 30))
       }
       // Wait long enough for the debounce flush plus padding.
-      await new Promise(r => setTimeout(r, 200))
+      await new Promise(resolve => setTimeout(resolve, 200))
       const setCallCount = h.setCallCount()
       const lastSet = h.setCalls[h.setCalls.length - 1]
       const finalValue = h.value
@@ -85,16 +85,16 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
       for (const c of ['O', 'p', 'e', 'n', 'A', 'I']) {
         acc += c
         h.value = acc
-        await new Promise(r => setTimeout(r, 20))
+        await new Promise(resolve => setTimeout(resolve, 20))
       }
       // Wait for debounce flush
-      await new Promise(r => setTimeout(r, 80))
+      await new Promise(resolve => setTimeout(resolve, 80))
       // Now simulate a delayed echo from server pushing the *first*
       // keystroke's value back — this is the bug scenario where a slow
       // round-trip echo arrives mid-typing.
       h.pushSource('O')
       // Tiny delay so the watch handler runs (Vue schedules watchers async).
-      await new Promise(r => setTimeout(r, 10))
+      await new Promise(resolve => setTimeout(resolve, 10))
       const valAfterEcho = h.value
       h.cleanup()
       return { valAfterEcho }
@@ -112,12 +112,12 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
       const h = make('initial', { debounceMs: 50, suppressSourceWhileEditingMs: 200 })
       // Edit locally
       h.value = 'local-edit'
-      await new Promise(r => setTimeout(r, 100)) // debounce flush
+      await new Promise(resolve => setTimeout(resolve, 100)) // debounce flush
       // Wait past the suppression window
-      await new Promise(r => setTimeout(r, 250))
+      await new Promise(resolve => setTimeout(resolve, 250))
       // A genuine remote update arrives — should apply
       h.pushSource('from-other-device')
-      await new Promise(r => setTimeout(r, 10))
+      await new Promise(resolve => setTimeout(resolve, 10))
       const valAfter = h.value
       h.cleanup()
       return { valAfter }
@@ -135,13 +135,13 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
       const h = make('', { debounceMs: 0, suppressSourceWhileEditingMs: 0 })
       // Two rapid edits should both fire set() immediately.
       h.value = 'A'
-      await new Promise(r => setTimeout(r, 5))
+      await new Promise(resolve => setTimeout(resolve, 5))
       h.value = 'AB'
-      await new Promise(r => setTimeout(r, 5))
+      await new Promise(resolve => setTimeout(resolve, 5))
       const callsAfterEdits = h.setCallCount()
       // Source push should apply immediately, no suppression.
       h.pushSource('remote')
-      await new Promise(r => setTimeout(r, 10))
+      await new Promise(resolve => setTimeout(resolve, 10))
       const valAfter = h.value
       h.cleanup()
       return { callsAfterEdits, valAfter }
@@ -169,10 +169,10 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
         // Schedule a stale echo to land 50ms later (still inside suppression).
         const stale = acc.slice(0, Math.max(1, i)) // strictly older
         setTimeout(() => h.pushSource(stale), 50)
-        await new Promise(r => setTimeout(r, 30))
+        await new Promise(resolve => setTimeout(resolve, 30))
       }
       // Drain pending echoes + final debounce flush
-      await new Promise(r => setTimeout(r, 200))
+      await new Promise(resolve => setTimeout(resolve, 200))
       const finalValue = h.value
       const lastSet = h.setCalls[h.setCalls.length - 1]
       h.cleanup()
