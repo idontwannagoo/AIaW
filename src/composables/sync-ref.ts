@@ -39,14 +39,16 @@ export function syncRef<T>(
   const debounceMs = options?.debounceMs ?? 200
   const suppressMs = options?.suppressSourceWhileEditingMs ?? 1500
 
-  // True for the one upcoming val-watch tick we're about to trigger by
-  // pushing source → val. Skips the round-trip back into `set`.
-  let absorbingSourceEcho = false
-
-  // Wall clock of the last *local* edit (as opposed to a source push). Used
-  // to decide whether an arriving source value is likely an echo of a write
-  // we just sent (suppress) or a genuine remote update (apply).
+  // Wall clock of the last *local* edit. Used to decide whether an arriving
+  // source value is likely an echo of a write we just sent (suppress) or a
+  // genuine remote update (apply).
   let lastLocalEditAt = 0
+  // Wall clock of the last source-driven write to val. The val watcher
+  // fires async (post-flush microtask); when it does, if we wrote val from
+  // the source side a moment ago, treat the trigger as an echo and skip
+  // calling set(). 5ms covers Vue's scheduler latency without false
+  // positives — a real local edit takes >>5ms after a source push.
+  let lastSourceWriteAt = -1
 
   let pendingFlush: ReturnType<typeof setTimeout> | null = null
   const cancelPending = () => {
@@ -57,8 +59,8 @@ export function syncRef<T>(
   }
 
   watch(val, newVal => {
-    if (absorbingSourceEcho) {
-      absorbingSourceEcho = false
+    if (lastSourceWriteAt > 0 && Date.now() - lastSourceWriteAt < 5) {
+      lastSourceWriteAt = -1
       return
     }
     // Stamp the edit moment now, not at flush — the suppression window must
@@ -89,7 +91,7 @@ export function syncRef<T>(
     ) {
       return
     }
-    absorbingSourceEcho = true
+    lastSourceWriteAt = Date.now()
     val.value = newVal
   }, { immediate: true, deep: options?.sourceDeep })
 
