@@ -827,13 +827,493 @@ async def run_phase_b(job_id: str) -> dict[str, Any]:
     }
 
 
-# ---- phase stubs (Steps 4 / 5 fill these in) -------------------------------
+# ---- phase C (messages text) -----------------------------------------------
 
 
-async def run_phase_c(job_id: str) -> None:
-    raise NotImplementedError(
-        f'phase C not implemented (Step 4); job {job_id} cannot advance'
+# Plan line 1184 / 1191 / 1192: messages 流式读 + 500 行一批 LWW UPSERT，
+# 进度按批次报。`PHASE_C_BATCH_SIZE` 与 `PHASE_B_BATCH_SIZE` 同值非偶然 —
+# 共用一份「每批 500 行」的 PG bind-param 上限直觉（messages 行的 PG
+# UPSERT 列数比 phase B 表略多 1 列 _pending_blob_extraction，但仍远低于
+# 32k bind-param 上限 / 4 ≈ 8000 行）。Phase B 的 batch size 改了 Phase C
+# 不一定要跟着改 —— 两个常量独立。
+PHASE_C_BATCH_SIZE = 500
+
+
+# 与 frontend `BLOB_INLINE_MAX_BYTES` 对齐的 64KB 阈值。Phase C 用它判定
+# 「这条 message 是否需要 Phase D 扫」—— 行 JSON 整体超过此阈值，或行内
+# 任意层级出现 attachment envelope（type:'inline'/'ref'）的，都进 pending
+# 集合。值故意硬编码而不是从 blob_store 读 —— 避免 import_worker 在 Phase C
+# 阶段就触发 blob_store 模块 import（blob_store 读 JWT_SECRET / S3 client，
+# Phase A/B 都不需要）。Phase D 自己 import blob_store 时再用 module
+# constant 保证一致。
+_PHASE_C_PENDING_SIZE_THRESHOLD = 64 * 1024
+
+
+def _row_has_attachment_envelope(value: Any, _depth: int = 0) -> bool:
+    """Recursively scan a row dict / list for an `{type:'inline'|'ref',...}`
+    envelope. Mirrors `_looks_like_blob_envelope` from Phase A but recurses
+    arbitrarily deep — Phase A only counted top-level + one-level-list (a
+    UX hint, not a hard contract), Phase C needs to be sure: a missed
+    envelope here means Phase D won't see the row, leaving the inline
+    base64 to bloat PG forever.
+
+    Depth cap is defense against pathological self-referential JSON; real
+    dexie rows nest at most a handful of levels (contents[].items[].…).
+    """
+    if _depth > 16:
+        return False
+    if isinstance(value, dict):
+        t = value.get('type')
+        if t == 'inline' or t == 'ref':
+            # Loose check: must also look envelope-shaped (have one of the
+            # well-known sibling keys). Avoid false-positive on user-typed
+            # JSON like {"type":"inline","value":"..."} that happens to
+            # share the discriminator. Sibling keys: `data`/`base64`/`url`
+            # /`sha256` are all envelope hallmarks.
+            for sibling in ('data', 'base64', 'url', 'sha256', 'content_type', 'size'):
+                if sibling in value:
+                    return True
+            # Discriminator alone is enough if we found nothing else but the
+            # loop also didn't find a positive sibling — be conservative and
+            # mark TRUE so Phase D inspects it. False positive: Phase D
+            # finds nothing to extract, clears the flag, costs one extra
+            # row scan. Cheaper than missing a real attachment.
+            return True
+        for v in value.values():
+            if _row_has_attachment_envelope(v, _depth + 1):
+                return True
+        return False
+    if isinstance(value, list):
+        for v in value:
+            if _row_has_attachment_envelope(v, _depth + 1):
+                return True
+    return False
+
+
+def _should_pending_blob_extraction(row: dict[str, Any], row_json: str) -> bool:
+    """Two-pronged decision Phase C uses to set `_pending_blob_extraction`:
+
+    1. Row JSON utf-8 byte size ≥ 64KB → mark TRUE. Catches «huge inline
+       base64 attachment» / «runaway streaming-token accumulation» without
+       inspecting structure. Most safety-net case.
+    2. Row contains an attachment envelope anywhere in its tree (typical
+       carrier: `contentsBlob: {type:'ref',...}` after client-side spill,
+       or per-content `{type:'inline', data:base64, ...}` in legacy exports).
+
+    Both prongs catch the cases plan line 1192/1213 expects: «Phase C 标记
+    含 attachment 的 row → Phase D 把 ≥ 64KB 的 inline 转 ref，把 ref 拍平
+    到 wire-format-stable 状态」.
+    """
+    # Prong 1 — size guard. utf-8 encoding length of the json string is
+    # what the broker queue will eventually carry; if it's already huge
+    # before Phase D runs, Phase D MUST process it.
+    if len(row_json.encode('utf-8')) >= _PHASE_C_PENDING_SIZE_THRESHOLD:
+        return True
+    # Prong 2 — structural envelope scan.
+    return _row_has_attachment_envelope(row)
+
+
+def _publish_phase_c_progress(
+    job: ImportJob, *, processed_rows: int, batch_index: int
+) -> dict[str, Any]:
+    """WS event body for a per-batch progress publish. Same envelope shape
+    as `_publish_table_progress` (Phase B) — frontend code path is unified.
+
+    `data.phase_c_batch_index` is a hint for the UI to render «batch N
+    written» without re-counting; `data.processed_rows` is the cumulative
+    count across all batches so far. Frontend treats successive events as
+    full snapshots not deltas (consistent with Phase B contract).
+    """
+    snap = job._envelope()
+    snap['data']['processed_rows'] = processed_rows
+    snap['data']['phase_c_batch_index'] = batch_index
+    return {
+        'type': 'event',
+        'table': 'import_jobs',
+        'op': 'put',
+        'id': job.id,
+        'rev': int(job.version) if job.version is not None else 0,
+        'row': snap,
+    }
+
+
+async def _append_dead_letter(
+    session: Any, job_id: str, entry: dict[str, Any]
+) -> None:
+    """Append `entry` to `import_jobs.dead_letter` (JSONB list).
+
+    Server-side concat via `||` so concurrent worker restarts can't lose
+    earlier entries — read-modify-write would race. The column server_default
+    is `'[]'::jsonb` so `dead_letter || (entry-as-array)::jsonb` is always
+    well-formed even on first append.
+
+    We pass the entry as a single-element JSON array string so jsonb's `||`
+    operator (array-concat-array semantics) gets two arrays — `dead_letter
+    || '[entry]'::jsonb` produces `dead_letter ++ [entry]`. This avoids
+    the `dead_letter || object` ambiguity (PG's `||` between array and
+    object is asymmetric).
+
+    Caller is responsible for `await session.commit()` — we keep this a
+    pure statement so the worker can batch dead_letter appends with the
+    surrounding UPSERT in one commit when convenient.
+    """
+    entry_array = json.dumps([entry], ensure_ascii=False, default=str)
+    # Raw SQL via `text()` keeps the JSONB `||` operator + parameter
+    # binding readable; using `update(ImportJob).values(...)` would
+    # require a server-side jsonb expression construct and the `||`
+    # operator overload across asyncpg / psycopg quirks. A plain
+    # parameterized UPDATE is unambiguous.
+    await session.execute(
+        text(
+            "UPDATE import_jobs "
+            "SET dead_letter = dead_letter || CAST(:entry AS jsonb), "
+            "    updated_at = now() "
+            "WHERE id = :jid"
+        ),
+        {'entry': entry_array, 'jid': job_id},
     )
+
+
+async def _phase_c_lookup_known_dialogs(
+    session: Any, user_id: str
+) -> set[str]:
+    """Pre-fetch the set of dialog ids owned by this user, so Phase C can
+    pre-flight FK validation per row before issuing the batched UPSERT.
+
+    Why pre-flight rather than relying on PG's FK violation:
+
+    - A FK violation aborts the entire batch transaction (PG's all-or-
+      nothing semantic for `INSERT ... VALUES (...), (...)` plus FK).
+      Splitting an orphan out post-fact would mean re-trying the rest of
+      the batch row-by-row — quadratic in worst case (a fixture with one
+      bad row in every batch would slow Phase C 500x).
+    - Filtering out orphans BEFORE the batch UPSERT keeps each batch a
+      single multi-row INSERT and lands the orphan in dead_letter once.
+
+    Cost: one `SELECT id FROM dialogs WHERE user_id = :u` per Phase C
+    invocation. For typical users (<200 dialogs) that's a few hundred
+    bytes of memory; for pathological users (10k dialogs) still well
+    under the 200MB Phase A budget.
+    """
+    from .models.dialog import Dialog
+
+    result = await session.execute(
+        select(Dialog.id).where(
+            Dialog.user_id == user_id,
+            Dialog.deleted_at.is_(None),
+        )
+    )
+    return {row[0] for row in result.all()}
+
+
+async def run_phase_c(job_id: str) -> dict[str, Any]:
+    """Phase C — stream messages.ndjson into PG with LWW UPSERT.
+
+    Streaming model (memory-bounded):
+
+    - Open `<tmp>/messages.ndjson` once, iterate line-by-line. The largest
+      in-memory allocation at any moment is a 500-row batch list of dict
+      values + matching nextval int list.
+    - Each batch: pre-fetch 500 nextvals in one SQL round-trip (mirrors
+      Phase B's pattern), build the UPSERT statement once, execute with
+      the batch values, commit per-batch. Per-batch commit means a
+      mid-phase crash leaves a clean idempotent state — re-run picks up
+      where it left off because LWW skips already-written rows.
+    - Orphan handling: pre-flight `dialog_id ∈ known_dialogs` per row;
+      orphans go to `dead_letter` (with `error = 'orphan: dialog X not
+      found'`) and are EXCLUDED from the batch UPSERT — keeps each batch
+      one clean INSERT.
+
+    `_pending_blob_extraction` decision (per row): see
+    `_should_pending_blob_extraction`. The flag is written into the PG
+    row but NOT into the wire envelope (`_to_row` / `_to_event` in
+    routers/messages.py only reads `data` JSONB; the underscore prefix
+    on the column name is the local convention reminding maintainers).
+
+    Returns a summary dict the caller (`ImportWorker._do_phase_c`) writes
+    into the job row alongside the status flip to `phase_d`.
+    """
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(ImportJob).where(ImportJob.id == job_id)
+        )
+        job = result.scalar_one()
+        user_id = job.user_id
+        # Snapshot for progress publishes — released from the session so
+        # subsequent commits don't trip the «row was modified» guard.
+        session.expunge(job)
+
+    tmp = temp_dir_for_job(job_id)
+    if not tmp.exists():
+        raise ImportFormatError(
+            f'phase C job {job_id}: temp dir {tmp} missing; phase A did not '
+            'leave NDJSON output to consume'
+        )
+
+    ndjson_path = tmp / 'messages.ndjson'
+    if not ndjson_path.exists():
+        # Fixture / export simply didn't include messages (a brand new
+        # user, or an export from a workspace with no conversation yet).
+        # Plan rule (Step 4 user prompt 「小 fixture 行为」): skip cleanly,
+        # status flip handled by caller.
+        logger.info(
+            'phase C / job %s: no messages.ndjson, skipping',
+            job_id,
+        )
+        return {
+            'total_processed': 0,
+            'orphan_count': 0,
+            'pending_blob_count': 0,
+            'batches': 0,
+        }
+
+    # Pre-flight: known dialog ids for FK validation. We refresh this
+    # *once* per Phase C invocation — Phase B already wrote dialogs
+    # before transitioning to phase_c, so the set is stable for the
+    # duration of this run. If a concurrent dialog-deletion happens
+    # mid-Phase-C, an FK violation in the batch UPSERT would still
+    # surface (PG enforces it server-side); we'd mark the batch failed
+    # and re-run on next dispatch.
+    async with SessionLocal() as session:
+        known_dialogs = await _phase_c_lookup_known_dialogs(session, user_id)
+
+    insert_stmt, Model, conflict_cols = _build_insert_stmt('messages')
+    set_payload: dict[str, Any] = {
+        'data': insert_stmt.excluded.data,
+        'version': insert_stmt.excluded.version,
+        'updated_at': insert_stmt.excluded.updated_at,
+        'deleted_at': None,
+        'dialog_id': insert_stmt.excluded.dialog_id,
+        'imported_from_job_id': insert_stmt.excluded.imported_from_job_id,
+        'imported_at': insert_stmt.excluded.imported_at,
+        '_pending_blob_extraction': insert_stmt.excluded._pending_blob_extraction,
+    }
+    upsert_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=conflict_cols,
+        set_=set_payload,
+        # LWW guard — same shape as Phase B. existing.updated_at < incoming
+        # → overwrite; otherwise PG silently skips this row (DO NOTHING for
+        # this conflict).
+        where=(Model.__table__.c.updated_at < insert_stmt.excluded.updated_at),
+    )
+
+    total_processed = 0
+    orphan_count = 0
+    pending_blob_count = 0
+    batch_index = 0
+    batch: list[dict[str, Any]] = []
+
+    now = datetime.now(timezone.utc)
+
+    async def _flush_batch() -> None:
+        """Commit the current batch + publish progress + clear list."""
+        nonlocal batch, batch_index, total_processed
+        if not batch:
+            return
+        batch_index += 1
+        async with SessionLocal() as session:
+            try:
+                # Pre-fetch nextvals for this batch in one round-trip.
+                nv_result = await session.execute(
+                    text(
+                        "SELECT nextval('global_change_seq') "
+                        'FROM generate_series(1, :n)'
+                    ),
+                    {'n': len(batch)},
+                )
+                next_versions = [row[0] for row in nv_result.all()]
+                # Stitch versions into the batch values right before the
+                # INSERT — version is the only field we couldn't precompute
+                # outside the session (depends on the seq state at flush
+                # time, not row-build time).
+                for values, ver in zip(batch, next_versions):
+                    values['version'] = ver
+                await session.execute(upsert_stmt, batch)
+                # Bump processed_rows + version on the import_jobs row so
+                # WS subscribers see real cumulative progress (mirrors
+                # Phase B per-table commit pattern).
+                total_processed += len(batch)
+                job_next_version = (await session.execute(
+                    text("SELECT nextval('global_change_seq')")
+                )).scalar_one()
+                await session.execute(
+                    update(ImportJob)
+                    .where(ImportJob.id == job_id)
+                    .values(
+                        processed_rows=total_processed,
+                        version=job_next_version,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                await session.commit()
+            except Exception as e:
+                # Single-batch failure: log, dead-letter the whole batch
+                # (with row ids so a future inspect-and-retry tool can
+                # find them), continue. Don't let one bad batch tank the
+                # whole phase.
+                await session.rollback()
+                logger.exception(
+                    'phase C / job %s / batch %d: UPSERT failed (%d rows): %s',
+                    job_id, batch_index, len(batch), e,
+                )
+                async with SessionLocal() as inner:
+                    for values in batch:
+                        await _append_dead_letter(inner, job_id, {
+                            'table': 'messages',
+                            'row_id': values.get('id'),
+                            'error': f'batch upsert failed: {e}',
+                            'batch_index': batch_index,
+                            'ts': datetime.now(timezone.utc).isoformat(),
+                        })
+                    await inner.commit()
+
+        # Publish progress per batch (throttled by definition: one event
+        # per 500 rows). Failure to publish must not abort the phase —
+        # broker is best-effort for progress UX.
+        async with SessionLocal() as session:
+            refreshed = (await session.execute(
+                select(ImportJob).where(ImportJob.id == job_id)
+            )).scalar_one()
+            session.expunge(refreshed)
+        try:
+            from realtime import broker as realtime_broker
+            await realtime_broker.publish(
+                user_id,
+                _publish_phase_c_progress(
+                    refreshed,
+                    processed_rows=total_processed,
+                    batch_index=batch_index,
+                ),
+            )
+        except Exception as e:  # pragma: no cover — broker failure shouldn't kill phase
+            logger.warning(
+                'phase C / job %s: failed to publish progress for batch %d: %s',
+                job_id, batch_index, e,
+            )
+
+        batch = []
+
+    # Stream NDJSON. Use asyncio.to_thread for the file I/O so we don't
+    # block the event loop on disk reads — Phase D blob uploads will be
+    # competing for the same loop time and we want the worker responsive.
+    def _open_messages() -> Any:
+        return open(ndjson_path, 'r', encoding='utf-8')
+
+    f = await asyncio.to_thread(_open_messages)
+    try:
+        while True:
+            line = await asyncio.to_thread(f.readline)
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    'phase C / job %s: skipping malformed line: %s',
+                    job_id, e,
+                )
+                async with SessionLocal() as session:
+                    await _append_dead_letter(session, job_id, {
+                        'table': 'messages',
+                        'row_id': None,
+                        'error': f'malformed json: {e}',
+                        'batch_index': batch_index + 1,
+                        'ts': datetime.now(timezone.utc).isoformat(),
+                    })
+                    await session.commit()
+                continue
+            if not isinstance(row, dict):
+                continue
+
+            row_id = row.get('id')
+            dialog_id = row.get('dialogId')
+            if not isinstance(row_id, str) or not row_id:
+                async with SessionLocal() as session:
+                    await _append_dead_letter(session, job_id, {
+                        'table': 'messages',
+                        'row_id': row_id,
+                        'error': 'missing or non-string id',
+                        'batch_index': batch_index + 1,
+                        'ts': datetime.now(timezone.utc).isoformat(),
+                    })
+                    await session.commit()
+                continue
+            if not isinstance(dialog_id, str) or not dialog_id:
+                async with SessionLocal() as session:
+                    await _append_dead_letter(session, job_id, {
+                        'table': 'messages',
+                        'row_id': row_id,
+                        'error': 'missing or non-string dialogId',
+                        'batch_index': batch_index + 1,
+                        'ts': datetime.now(timezone.utc).isoformat(),
+                    })
+                    await session.commit()
+                orphan_count += 1
+                continue
+
+            # FK pre-flight: dialog must be known (Phase B wrote dialogs).
+            if dialog_id not in known_dialogs:
+                async with SessionLocal() as session:
+                    await _append_dead_letter(session, job_id, {
+                        'table': 'messages',
+                        'row_id': row_id,
+                        'error': f'orphan: dialog {dialog_id} not found',
+                        'batch_index': batch_index + 1,
+                        'ts': datetime.now(timezone.utc).isoformat(),
+                    })
+                    await session.commit()
+                orphan_count += 1
+                continue
+
+            lww_ts = _extract_lww_timestamp(row)
+            # Use the canonical separators=(',', ':') JSON dump for both
+            # «row JSON byte size» measurement AND Phase A NDJSON serial
+            # form so the size threshold behaves consistently regardless
+            # of whitespace coming from the dexie source. The actual
+            # JSONB column receives the dict (psycopg/asyncpg encodes it),
+            # not this string — but using the string for size measurement
+            # keeps the threshold comparable across phases.
+            row_json = json.dumps(
+                row, ensure_ascii=False, separators=(',', ':')
+            )
+            pending = _should_pending_blob_extraction(row, row_json)
+            if pending:
+                pending_blob_count += 1
+
+            batch.append({
+                'id': row_id,
+                'user_id': user_id,
+                'dialog_id': dialog_id,
+                'data': row,
+                # version filled by `_flush_batch` (one nextval call per
+                # batch covers all of them).
+                'updated_at': lww_ts,
+                'deleted_at': None,
+                'imported_from_job_id': job_id,
+                'imported_at': now,
+                '_pending_blob_extraction': pending,
+            })
+
+            if len(batch) >= PHASE_C_BATCH_SIZE:
+                await _flush_batch()
+
+        # Flush remainder.
+        await _flush_batch()
+    finally:
+        await asyncio.to_thread(f.close)
+
+    return {
+        'total_processed': total_processed,
+        'orphan_count': orphan_count,
+        'pending_blob_count': pending_blob_count,
+        'batches': batch_index,
+    }
+
+
+# ---- phase D stub (Step 5 fills this in) -----------------------------------
 
 
 async def run_phase_d(job_id: str) -> None:
@@ -977,13 +1457,19 @@ class ImportWorker:
             await self._do_phase_b(job_id)
             return
 
-        if status in ('phase_c', 'phase_d'):
-            # Steps 4 / 5 plug stub handlers. We leave the row alone —
-            # don't crash the worker loop just because later phases aren't
-            # implemented yet.
-            logger.debug(
-                'import job %s in %s: handler not implemented yet (Step 4+)',
-                job_id, status,
+        if status == 'phase_c':
+            await self._do_phase_c(job_id)
+            return
+
+        if status == 'phase_d':
+            # Step 5 plugs the real handler. Until then we leave the row
+            # alone — don't crash the worker loop and don't mark failed
+            # (the job legitimately reached phase_d, just can't proceed
+            # without the Step 5 implementation). UI will show «phase_d»
+            # status indefinitely; that's acceptable until Step 5 lands.
+            logger.warning(
+                'import job %s in phase_d: Step 5 handler not implemented '
+                'yet, job parked', job_id,
             )
             return
 
@@ -1080,6 +1566,56 @@ class ImportWorker:
             job_id,
             summary.get('per_table_processed'),
             summary.get('total_processed', 0),
+        )
+
+    async def _do_phase_c(self, job_id: str) -> None:
+        """Run Phase C (messages.ndjson → PG with LWW + dead_letter for
+        FK orphans), then advance to phase_d.
+
+        Idempotency: per-batch commit + LWW UPSERT means re-running after a
+        crash is safe — already-written rows skip via LWW WHERE clause,
+        already-dead-lettered orphans get appended again on retry (the
+        dead_letter list grows; that's fine, dedup is a future concern,
+        retries are rare enough for the count to stay small).
+        """
+        try:
+            summary = await run_phase_c(job_id)
+        except ImportFormatError as e:
+            logger.warning('import job %s: phase C failed: %s', job_id, e)
+            await self._mark_failed(job_id, f'phase C: {e}')
+            return
+        except Exception as e:
+            logger.exception(
+                'import job %s: unexpected phase C error: %s', job_id, e
+            )
+            await self._mark_failed(job_id, f'phase C unexpected: {e}')
+            return
+
+        # Advance status → phase_d with a fresh version so the WS event
+        # for the transition is distinct from the per-batch progress
+        # events that fired during run_phase_c.
+        async with SessionLocal() as session:
+            next_version = (await session.execute(
+                text("SELECT nextval('global_change_seq')")
+            )).scalar_one()
+            await session.execute(
+                update(ImportJob)
+                .where(ImportJob.id == job_id)
+                .values(
+                    status='phase_d',
+                    updated_at=datetime.now(timezone.utc),
+                    version=next_version,
+                )
+            )
+            await session.commit()
+        logger.info(
+            'import job %s: phase C done '
+            '(processed=%d orphans=%d pending_blob=%d batches=%d)',
+            job_id,
+            summary.get('total_processed', 0),
+            summary.get('orphan_count', 0),
+            summary.get('pending_blob_count', 0),
+            summary.get('batches', 0),
         )
 
     async def _update_status(self, job_id: str, new_status: str) -> None:

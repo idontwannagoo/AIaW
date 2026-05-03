@@ -1,7 +1,15 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, String, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -75,6 +83,15 @@ class Message(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    # Stage 4.5 / Step 4 — Phase C 写入时打标，Phase D 扫描 + 置 FALSE。
+    # 见 migration c5e9f2a8d6b4 的 docstring 说明为什么单列 + partial index
+    # 而不是把判定烧进 JSONB 表达式。注意：`_` 前缀提示 wire envelope 不
+    # 暴露此列（messages router `_to_row` / `_to_event` 只取 `data` JSONB）。
+    _pending_blob_extraction: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text('FALSE'),
+    )
 
     __table_args__ = (
         # Composite index drives the scoped-pull main query
@@ -88,4 +105,11 @@ class Message(Base):
         Index('ix_messages_user_version', 'user_id', 'version'),
         Index('ix_messages_dialog', 'dialog_id'),
         Index('ix_messages_imported_from_job_id', 'imported_from_job_id'),
+        # Partial index: only TRUE rows make it in. Phase D scan stays
+        # `WHERE user_id = :u AND _pending_blob_extraction = TRUE`.
+        Index(
+            'ix_messages_pending_blob_extraction',
+            '_pending_blob_extraction',
+            postgresql_where=text('_pending_blob_extraction = TRUE'),
+        ),
     )
