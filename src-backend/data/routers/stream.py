@@ -44,6 +44,7 @@ from ..models.artifact import Artifact
 from ..models.assistant import Assistant
 from ..models.avatar_image import AvatarImage
 from ..models.dialog import Dialog
+from ..models.import_job import ImportJob
 from ..models.installed_plugin import InstalledPlugin
 from ..models.item import Item
 from ..models.message import Message
@@ -68,6 +69,11 @@ TABLE_MODELS = {
     'items': Item,
     'artifacts': Artifact,
     'messages': Message,
+    # Stage 4.5 / Step 6 — read-only realtime channel for import progress.
+    # Worker is the only writer (REST PUT is rejected with 405 in
+    # imports.py). Replay path uses the same `version > since` template as
+    # other server-routed tables so reconnect resumes mid-job correctly.
+    'import_jobs': ImportJob,
 }
 
 HEARTBEAT_INTERVAL = 25.0  # server pings this often
@@ -297,6 +303,24 @@ def _serialize_message(m: Message) -> dict[str, Any]:
     }
 
 
+def _serialize_import_job(j: ImportJob) -> dict[str, Any]:
+    """Replay-time serializer for import_jobs subscriptions.
+
+    Reuses ``ImportJob._envelope()`` — same wire shape the worker already
+    publishes via broker during phase transitions / progress ticks. import_jobs
+    has no soft-delete (terminal statuses are 'done' / 'failed' / 'cancelled',
+    not deleted_at-based), so events are always op='put' with a non-null row.
+    """
+    return {
+        'type': 'event',
+        'table': 'import_jobs',
+        'op': 'put',
+        'id': j.id,
+        'rev': int(j.version) if j.version is not None else 0,
+        'row': j._envelope(),
+    }
+
+
 SERIALIZERS = {
     'providers': _serialize_provider,
     'reactives': _serialize_reactive,
@@ -308,6 +332,7 @@ SERIALIZERS = {
     'items': _serialize_item,
     'artifacts': _serialize_artifact,
     'messages': _serialize_message,
+    'import_jobs': _serialize_import_job,
 }
 
 

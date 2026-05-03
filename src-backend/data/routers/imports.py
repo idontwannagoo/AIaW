@@ -676,6 +676,45 @@ async def cancel_import_job(
 # endpoint is unused; we still mount it to keep the LocalFs path drop-in.
 
 
+# ---- PUT /api/v1/import_jobs/{id}  (Stage 4.5 / Step 6 — read-only enforce) -
+#
+# import_jobs is a server-routed table the frontend subscribes to via WS / SSE
+# (see stream.py / sse.py TABLE_MODELS), but the *write* path is intentionally
+# closed to clients: the worker is the only legitimate writer of progress and
+# phase transitions. Without an explicit handler FastAPI would return 404 on
+# this path; plan line 1261 wants 405 so the contract violation is loud.
+#
+# The wire-channel name is `import_jobs` (snake_case, plural) to match the
+# subscribe channel — frontend code that mistakenly tries to PUT on the same
+# channel name should get the same diagnostic.
+#
+# We accept any path id (including non-existent ones) so 405 fires before any
+# DB lookup — this leaks no information about job existence (consistent with
+# the cross-user 404-mask elsewhere in this router).
+
+
+@router.api_route(
+    '/api/v1/import_jobs/{job_id}',
+    methods=['PUT', 'PATCH', 'POST', 'DELETE'],
+    include_in_schema=False,
+)
+async def import_jobs_write_rejected(job_id: str) -> Response:
+    """Reject any client write to the import_jobs realtime channel.
+
+    Per Stage 4.5 / Step 6: import_jobs is read-only over realtime + REST GET
+    (`GET /api/v1/import/jobs/{id}` lives on the business path); the only
+    writer is the import worker. Returning 405 with an Allow header tells the
+    client which methods *are* valid (none, on this path) — better than a
+    silent 404 which would mask a real bug in client retry logic.
+    """
+    return Response(
+        status_code=405,
+        content='import_jobs is read-only; the import worker is the sole writer',
+        headers={'Allow': ''},
+        media_type='text/plain',
+    )
+
+
 @router.put('/api/v1/_internal/multipart/{upload_id}/part/{part_number}')
 async def _put_multipart_part(
     upload_id: str,

@@ -42,6 +42,7 @@ from ..models.artifact import Artifact
 from ..models.assistant import Assistant
 from ..models.avatar_image import AvatarImage
 from ..models.dialog import Dialog
+from ..models.import_job import ImportJob
 from ..models.installed_plugin import InstalledPlugin
 from ..models.item import Item
 from ..models.message import Message
@@ -67,6 +68,10 @@ TABLE_MODELS = {
     'items': Item,
     'artifacts': Artifact,
     'messages': Message,
+    # Stage 4.5 / Step 6 — read-only realtime channel for import progress
+    # (mirror of stream.py TABLE_MODELS; SSE is the WS downgrade transport
+    # and must subscribe to the same broker channels).
+    'import_jobs': ImportJob,
 }
 
 # SSE keepalives are comments; clients (including event-source-polyfill)
@@ -254,6 +259,22 @@ def _serialize_message(m: Message) -> dict[str, Any]:
     }
 
 
+def _serialize_import_job(j: ImportJob) -> dict[str, Any]:
+    """Replay-time serializer for import_jobs subscriptions (SSE).
+
+    Reuses ``ImportJob._envelope()`` — same contract as stream.py. import_jobs
+    has no soft-delete column; events are always op='put'.
+    """
+    return {
+        'type': 'event',
+        'table': 'import_jobs',
+        'op': 'put',
+        'id': j.id,
+        'rev': int(j.version) if j.version is not None else 0,
+        'row': j._envelope(),
+    }
+
+
 SERIALIZERS = {
     'providers': _serialize_provider,
     'reactives': _serialize_reactive,
@@ -265,6 +286,7 @@ SERIALIZERS = {
     'items': _serialize_item,
     'artifacts': _serialize_artifact,
     'messages': _serialize_message,
+    'import_jobs': _serialize_import_job,
 }
 
 
