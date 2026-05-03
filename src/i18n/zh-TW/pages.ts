@@ -112,6 +112,8 @@ export default {
     currentVersion: '目前版本',
     changeLog: '更新日誌',
     webVersion: '網頁版',
-    localClient: '本地客戶端'
+    localClient: '本地客戶端',
+    bootstrapFallback: '部分資料稍後載入',
+    bootstrapFallbackDismiss: '關閉提示'
   }
 }

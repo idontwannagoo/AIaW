@@ -1,5 +1,35 @@
 <template>
   <q-layout view="lHr LpR lFf">
+    <!--
+      Stage 4.5 / Step 8 — bootstrap fallback banner.
+      Only shows when the first-screen `GET /api/v1/bootstrap` failed /
+      timed out and the legacy progressive load took over. Wrapped in
+      q-header so q-layout's view="lHr ..." routes it above the drawer +
+      content; dismiss button clears the session flag so subsequent
+      navigations don't re-show it within the same browser tab.
+    -->
+    <q-header
+      v-if="showBootstrapFallback"
+      bordered
+    >
+      <q-banner
+        inline-actions
+        class="bg-warning text-white"
+        dense
+        data-test-id="bootstrap-fallback-banner"
+      >
+        {{ t('mainLayout.bootstrapFallback') }}
+        <template #action>
+          <q-btn
+            flat
+            dense
+            icon="sym_o_close"
+            :aria-label="t('mainLayout.bootstrapFallbackDismiss')"
+            @click="dismissBootstrapFallback"
+          />
+        </template>
+      </q-banner>
+    </q-header>
     <q-drawer
       v-model="uiStore.mainDrawerOpen"
       show-if-above
@@ -170,8 +200,10 @@ import { BackendAuth } from 'src/utils/config'
 import { useQuasar } from 'quasar'
 import version from 'src/version.json'
 import { useI18n } from 'vue-i18n'
+import { ref, onMounted } from 'vue'
 import { useOpenLastWorkspace } from 'src/composables/open-last-workspace'
 import { IsWeb } from 'src/utils/platform-api'
+import { bootstrapDidFallback, clearBootstrapFallback } from 'src/router'
 
 defineOptions({
   name: 'MainLayout'
@@ -182,6 +214,21 @@ const route = useRoute()
 
 const { openLastWorkspace } = useOpenLastWorkspace()
 route.path === '/' && openLastWorkspace()
+
+// Stage 4.5 / Step 8 — bootstrap fallback banner state. The router guard
+// sets a sessionStorage flag when `GET /api/v1/bootstrap` failed/timed
+// out; we mirror that into a Vue ref on mount so the banner participates
+// in the normal reactive render path. Dismiss = clear both the ref and
+// the flag (subsequent navigations stay quiet for the rest of the tab
+// session).
+const showBootstrapFallback = ref(false)
+onMounted(() => {
+  if (bootstrapDidFallback()) showBootstrapFallback.value = true
+})
+function dismissBootstrapFallback() {
+  showBootstrapFallback.value = false
+  clearBootstrapFallback()
+}
 
 const { t, locale } = useI18n()
 const $q = useQuasar()

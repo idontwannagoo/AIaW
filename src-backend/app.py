@@ -87,6 +87,7 @@ def _enable_backend_data_api(app: FastAPI) -> None:
     from data.routers import auth as auth_router
     from data.routers import avatar_images as avatar_images_router
     from data.routers import blobs as blobs_router
+    from data.routers import bootstrap as bootstrap_router
     from data.routers import dialogs as dialogs_router
     from data.routers import health as health_router
     from data.routers import installed_plugins as installed_plugins_router
@@ -113,11 +114,16 @@ def _enable_backend_data_api(app: FastAPI) -> None:
     app.include_router(messages_router.router)
     app.include_router(stream_router.router)
     app.include_router(sse_router.router)
+    # Stage 4.5 / Step 8 — first-screen hydration endpoint. Returns all
+    # small server-routed tables in one shot + per-dialog messages tail
+    # respecting a 1MB budget. Mounted last so its `/api/v1/bootstrap`
+    # path can't shadow any per-table prefix even if order ever matters.
+    app.include_router(bootstrap_router.router)
     logger.info(
         'backend data API enabled '
         '(auth + providers + reactives + assistants + avatar_images + '
         'installed_plugins + blobs + workspaces + dialogs + items + artifacts + '
-        'messages + health + stream + sse mounted)'
+        'messages + health + stream + sse + bootstrap mounted)'
     )
 
     # Stage 4.5 / Step 1+2 — wire up ImportJob worker behind a separate flag.

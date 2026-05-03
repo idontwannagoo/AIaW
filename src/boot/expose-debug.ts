@@ -16,6 +16,13 @@ import {
   STREAM_FLUSH_INTERVAL_MS,
   STREAM_FLUSH_BYTE_THRESHOLD
 } from 'src/composables/message-stream-flush'
+import { fetchBootstrap } from 'src/data/bootstrap-client'
+import { applyBootstrap } from 'src/data/bootstrap-apply'
+import {
+  bootstrapDidFallback,
+  clearBootstrapFallback,
+  _resetBootstrapForTests
+} from 'src/router'
 
 // Test-only harness: wrap syncRef in an effectScope so onScopeDispose works
 // outside a Vue component. Returns hooks the spec can drive: source ref to
@@ -79,6 +86,21 @@ const importClientHook = {
   }
 }
 
+// Stage 4.5 / Step 8 — bootstrap surface for specs. Three useful shapes:
+//   - `fetch` / `apply`: drive the endpoint manually from a spec
+//     (e.g. heavy-fixture truncation case calls fetch then asserts the
+//     `messages_recent` array length / total response size).
+//   - `didFallback` / `clearFallback`: read / reset the banner state.
+//   - `reset`: clear the once-per-session sentinel so a spec can re-run
+//     bootstrap inside one tab without a hard reload.
+const bootstrapHook = {
+  fetch: fetchBootstrap,
+  apply: applyBootstrap,
+  didFallback: bootstrapDidFallback,
+  clearFallback: clearBootstrapFallback,
+  reset: _resetBootstrapForTests
+}
+
 declare global {
   interface Window {
     __db__?: typeof db
@@ -88,6 +110,7 @@ declare global {
     __importClient__?: typeof importClientHook
     __syncRefHarness__?: typeof syncRefHarness
     __messageStreamFlush__?: typeof messageStreamFlushHook
+    __bootstrap__?: typeof bootstrapHook
     __exposeDebugReady__?: true
   }
 }
@@ -102,6 +125,7 @@ export default boot(() => {
   window.__importClient__ = importClientHook
   window.__syncRefHarness__ = syncRefHarness
   window.__messageStreamFlush__ = messageStreamFlushHook
+  window.__bootstrap__ = bootstrapHook
   window.__exposeDebugReady__ = true
-  console.warn('[expose-debug] window.__db__ / __authSource__ / __repos__ / __blobClient__ / __importClient__ / __syncRefHarness__ / __messageStreamFlush__ exposed — test/dev only')
+  console.warn('[expose-debug] window.__db__ / __authSource__ / __repos__ / __blobClient__ / __importClient__ / __syncRefHarness__ / __messageStreamFlush__ / __bootstrap__ exposed — test/dev only')
 })
