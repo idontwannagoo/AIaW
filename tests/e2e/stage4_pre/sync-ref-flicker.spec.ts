@@ -49,7 +49,7 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
 
     const result = await page.evaluate(async () => {
       const make = (window as AnyWindow).__syncRefHarness__
-      const h = make<string>('', { debounceMs: 100, suppressSourceWhileEditingMs: 1500 })
+      const h = make('', { debounceMs: 100, suppressSourceWhileEditingMs: 1500 })
       // Simulate 6 keystrokes 30ms apart (200ms total) — debounce timer
       // resets each keystroke, so set() fires once 100ms after the last.
       const chars = ['O', 'p', 'e', 'n', 'A', 'I']
@@ -79,7 +79,7 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
 
     const result = await page.evaluate(async () => {
       const make = (window as AnyWindow).__syncRefHarness__
-      const h = make<string>('', { debounceMs: 50, suppressSourceWhileEditingMs: 1000 })
+      const h = make('', { debounceMs: 50, suppressSourceWhileEditingMs: 1000 })
       // Simulate user typing "OpenAI"
       let acc = ''
       for (const c of ['O', 'p', 'e', 'n', 'A', 'I']) {
@@ -109,7 +109,7 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
 
     const result = await page.evaluate(async () => {
       const make = (window as AnyWindow).__syncRefHarness__
-      const h = make<string>('initial', { debounceMs: 50, suppressSourceWhileEditingMs: 200 })
+      const h = make('initial', { debounceMs: 50, suppressSourceWhileEditingMs: 200 })
       // Edit locally
       h.value = 'local-edit'
       await new Promise(r => setTimeout(r, 100)) // debounce flush
@@ -132,7 +132,7 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
 
     const result = await page.evaluate(async () => {
       const make = (window as AnyWindow).__syncRefHarness__
-      const h = make<string>('', { debounceMs: 0, suppressSourceWhileEditingMs: 0 })
+      const h = make('', { debounceMs: 0, suppressSourceWhileEditingMs: 0 })
       // Two rapid edits should both fire set() immediately.
       h.value = 'A'
       await new Promise(r => setTimeout(r, 5))
@@ -158,7 +158,7 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
 
     const result = await page.evaluate(async () => {
       const make = (window as AnyWindow).__syncRefHarness__
-      const h = make<string>('', { debounceMs: 80, suppressSourceWhileEditingMs: 1000 })
+      const h = make('', { debounceMs: 80, suppressSourceWhileEditingMs: 1000 })
       const chars = ['O', 'p', 'e', 'n', 'A', 'I', ' ', 't', 'e', 's', 't']
       let acc = ''
       // Interleave each keystroke with a delayed source echo of an earlier
