@@ -198,13 +198,16 @@ async def test_complete_with_all_parts_triggers_worker(
 
     # Worker should pick this up within ~2s (poll=1s + sub-second Phase A on
     # this micro fixture). After that it'll either be in `parsing` /
-    # `phase_b` (Step 1's terminal-for-Phase-A-only behavior) / `failed`.
+    # `phase_b` / `phase_c` (Step 3 implemented Phase B → status auto-flips
+    # to phase_c on success; Step 4 will pick it up from there) / `failed`.
     await asyncio.sleep(2.5)
     r2 = await client_a.get(f'/api/v1/import/jobs/{job["job_id"]}')
     assert r2.status_code == 200, r2.text
     later = r2.json()
-    # Phase A succeeds → status='phase_b' (Step 1 leaves it there awaiting Step 3).
-    assert later['status'] in ('phase_b', 'parsing'), (
+    # Phase A → Phase B success path: ends in phase_c (Step 4 unimplemented
+    # stub leaves it there). Earlier transitional states accepted for cases
+    # where the poll happened to land mid-flight.
+    assert later['status'] in ('phase_b', 'phase_c', 'parsing'), (
         f'worker did not advance from queued; snap={later}'
     )
 

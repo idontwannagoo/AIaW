@@ -40,7 +40,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -54,9 +54,19 @@ from ..blob_store import (
     verify_multipart_part_signature,
 )
 from ..db import get_session
-from ..import_worker import get_worker
+from ..import_worker import SERVER_ROUTED_TABLES, get_worker
+from ..models.artifact import Artifact
+from ..models.assistant import Assistant
+from ..models.avatar_image import AvatarImage
+from ..models.dialog import Dialog
 from ..models.import_job import ImportJob, NON_TERMINAL_STATUSES
+from ..models.installed_plugin import InstalledPlugin
+from ..models.item import Item
+from ..models.message import Message
+from ..models.provider import Provider
+from ..models.reactive import Reactive
 from ..models.user import User
+from ..models.workspace import Workspace
 
 logger = logging.getLogger('aiaw.backend.imports')
 
@@ -501,6 +511,62 @@ async def list_import_jobs(
 # ---- DELETE /api/v1/import/jobs/{id} ---------------------------------------
 
 
+# Map backend table name → (Model, event-emit-table-name on wire). The
+# wire name matches what the existing per-table router publishes — frontend
+# realtime handlers decode by table name. KV-PK tables (reactives /
+# installed_plugins) do not have an `id` column on the row but they DO
+# have a stable composite key (user_id, key); we publish their tombstone
+# events with `id` = the `key` field so the wire shape stays uniform with
+# id-PK tables. Frontend realtime decoder for those tables already
+# accepts `id` as the cache key.
+_CASCADE_TABLE_MAP: dict[str, tuple[Any, str]] = {
+    'providers': (Provider, 'providers'),
+    'reactives': (Reactive, 'reactives'),
+    'assistants': (Assistant, 'assistants'),
+    # NOTE: wire table names match what each per-table router's _to_event
+    # publishes (see routers/installed_plugins.py / routers/avatar_images.py
+    # — both use snake_case). Frontend realtime decoder dispatches on this
+    # exact string; mismatch would silently drop the cascade tombstone for
+    # those subscribers.
+    'installed_plugins': (InstalledPlugin, 'installed_plugins'),
+    'avatar_images': (AvatarImage, 'avatar_images'),
+    'messages': (Message, 'messages'),
+    'items': (Item, 'items'),
+    'artifacts': (Artifact, 'artifacts'),
+    'dialogs': (Dialog, 'dialogs'),
+    'workspaces': (Workspace, 'workspaces'),
+}
+
+
+def _row_id_for_event(row: Any, backend_table: str) -> str:
+    """Pull the wire-side `id` for a cascade tombstone event.
+
+    For KV-PK tables (reactives / installed_plugins) the natural identity
+    is `key`; the frontend cache also keys on `key` for those, so we put
+    that into the event's `id` field. For id-PK tables it's just `row.id`.
+    """
+    if backend_table in ('reactives', 'installed_plugins'):
+        return getattr(row, 'key', '')
+    return row.id
+
+
+def _cascade_tombstone_event(row: Any, backend_table: str) -> dict[str, Any]:
+    """Build a `delete` WS event for a cascade-soft-deleted row, mirroring
+    the per-table router `_to_event(deleted=True)` shape so the frontend
+    realtime handler can dispatch by `e.table` without knowing the row
+    came from an import-cancel cascade specifically.
+    """
+    _, wire_table = _CASCADE_TABLE_MAP[backend_table]
+    return {
+        'type': 'event',
+        'table': wire_table,
+        'op': 'delete',
+        'id': _row_id_for_event(row, backend_table),
+        'rev': int(row.version) if row.version is not None else 0,
+        'row': None,
+    }
+
+
 @router.delete(
     '/api/v1/import/jobs/{job_id}',
     response_model=JobStatusResponse,
@@ -510,17 +576,22 @@ async def cancel_import_job(
     user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ) -> JobStatusResponse:
-    """Abort the multipart upload + flip status to 'cancelled'.
+    """Abort the multipart upload + flip status to 'cancelled' + cascade-
+    soft-delete every row tagged with this job_id.
 
     Idempotency: aborting an already-cancelled job is a no-op (returns the
-    snapshot). The row is *not* deleted — soft transition keeps history
-    visible to the user and frees the partial unique index slot so a fresh
-    create_import_job() succeeds immediately.
+    snapshot). The job row itself is NOT deleted — soft transition keeps
+    history visible to the user and frees the partial unique index slot
+    so a fresh create_import_job() succeeds immediately.
 
-    TODO(Step 3): once the server-routed tables grow `imported_from_job_id`,
-    a cancel mid-Phase-B/C/D should soft-delete rows tagged with this job.
-    For Step 2 the only side effects to clean are the multipart staging
-    files in BlobStore.
+    Cascade-soft-delete (Stage 4.5 / Step 3): for each server-routed table,
+    UPDATE rows WHERE imported_from_job_id = :job_id AND user_id = :user
+    AND deleted_at IS NULL → set deleted_at=now() and bump version to a
+    shared `cascade_version`. All tombstoned rows share that version so
+    clients treat them as a single batch (consistent with how
+    workspaces.py cascade publishes events). Per-row WS `delete` events
+    fire after commit so live tabs roll back the partial import without a
+    refresh.
     """
     job = await _load_job_for_user(session, job_id, user_id)
     if job.status == 'cancelled':
@@ -535,12 +606,52 @@ async def cancel_import_job(
                 'abort_multipart_upload(%s) failed during cancel: %s',
                 job.multipart_upload_id, e,
             )
+
+    # ---- cascade soft-delete of imported rows --------------------------
+    # Collect tombstoned rows per table so we can publish per-row events
+    # after commit. We use a single shared cascade_version (same template
+    # as workspaces.py): all rows tombstoned in this transaction land on
+    # the same monotonic point in the per-user since timeline.
+    cascade_version = (await session.execute(
+        text("SELECT nextval('global_change_seq')")
+    )).scalar_one()
+
+    cascaded: dict[str, list[Any]] = {}
+    for backend_table in SERVER_ROUTED_TABLES:
+        Model, _ = _CASCADE_TABLE_MAP[backend_table]
+        stmt = (
+            update(Model)
+            .where(
+                Model.imported_from_job_id == job_id,
+                Model.user_id == user_id,
+                Model.deleted_at.is_(None),
+            )
+            .values(version=cascade_version, deleted_at=text('now()'))
+            .returning(Model)
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+        if rows:
+            cascaded[backend_table] = rows
+
+    # Flip the job status itself.
     await session.execute(
         update(ImportJob)
         .where(ImportJob.id == job_id)
         .values(status='cancelled')
     )
     await session.commit()
+
+    # Publish per-table cascade tombstone events (children before parents
+    # mirror workspaces.py ordering). The dict iteration order matches
+    # SERVER_ROUTED_TABLES so subscribers see leaf tables flush first
+    # — frontend cleanup is already idempotent per row, but ordering
+    # keeps debug log output consistent across runs.
+    for backend_table, rows in cascaded.items():
+        for row in rows:
+            await broker.publish(
+                user_id, _cascade_tombstone_event(row, backend_table),
+            )
+
     refreshed = await _load_job_for_user(session, job_id, user_id)
     await broker.publish(user_id, {
         'type': 'event',

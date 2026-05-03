@@ -388,13 +388,446 @@ async def run_phase_a(
     }
 
 
-# ---- phase stubs (Steps 3 / 4 / 5 fill these in) ----------------------------
+# ---- phase B (structural tables) -------------------------------------------
 
 
-async def run_phase_b(job_id: str) -> None:
-    raise NotImplementedError(
-        f'phase B not implemented (Step 3); job {job_id} cannot advance'
+# Wire-name → backend-table-name map. The 7 small tables Phase B writes:
+# providers / reactives / assistants / installedPluginsV2 / avatarImages /
+# workspaces / dialogs. Larger tables (messages / items / artifacts) belong
+# to Phase C / D.
+#
+# Dexie names (left side) come from `src/utils/db.ts` schema declaration —
+# `installedPluginsV2` and `avatarImages` are camelCase per dexie convention,
+# while backend uses snake_case `installed_plugins` / `avatar_images`. The
+# map keeps the worker dexie-name-aware (NDJSON files Phase A wrote use the
+# dexie name as filename) but PG-name-correct (sqlalchemy tables use the
+# snake_case `__tablename__`).
+PHASE_B_TABLES: tuple[tuple[str, str], ...] = (
+    # (dexie_name, backend_table) — order is dependency order:
+    # workspaces have no FK to anything else; dialogs reference workspaces
+    # so MUST come after; the others are independent leaf tables but we
+    # still write workspaces before dialogs as the load-bearing ordering.
+    # The leaf tables (providers / assistants / reactives /
+    # installed_plugins / avatar_images) can go in any relative order — we
+    # keep them in the human-friendly order plan Step 3 lists.
+    ('providers', 'providers'),
+    ('assistants', 'assistants'),
+    ('installedPluginsV2', 'installed_plugins'),
+    ('reactives', 'reactives'),
+    ('avatarImages', 'avatar_images'),
+    ('workspaces', 'workspaces'),
+    ('dialogs', 'dialogs'),
+)
+
+
+# All server-routed tables that grew an `imported_from_job_id` column in
+# Stage 4.5 / Step 3. Used by `imports.py::cancel_import_job` for the
+# DELETE → soft-delete-imported-rows cascade. Order matters only for cascade
+# WS publish ordering (children before parents → consistent with how
+# workspaces.py cascade publishes child events first); for the actual SQL
+# UPDATE order is immaterial since each row is self-contained.
+#
+# When a new server-routed table lands, append both here AND in the
+# alembic migration `b3e7d4f8a1c5_add_imported_from_job_id_to_routed_tables`
+# (or write a follow-up migration adding the column to the new table).
+SERVER_ROUTED_TABLES: tuple[str, ...] = (
+    'providers',
+    'reactives',
+    'assistants',
+    'installed_plugins',
+    'avatar_images',
+    'messages',
+    'items',
+    'artifacts',
+    'dialogs',
+    'workspaces',
+)
+
+
+# Number of NDJSON rows assembled per VALUES batch. Keep small enough to
+# leave headroom for a multi-row pg INSERT (PG ~limit 32k bind params per
+# query → at 4 columns per row, 500 rows = 2000 params, safe). Bigger
+# batches reduce per-table commit cost; smaller batches surface partial
+# progress sooner. 500 matches the messages-batch knob in Step 4.
+PHASE_B_BATCH_SIZE = 500
+
+
+def _extract_lww_timestamp(row: dict[str, Any]) -> datetime:
+    """Pull a deterministic LWW timestamp out of an incoming dexie row.
+
+    Dexie schema (Stage 0+) does NOT declare an `updated_at` field on most
+    tables, so legacy exports won't have one. We accept either `updatedAt`
+    (camelCase, what a future dexie hook would write) or `updated_at`
+    (snake_case, what backend rows would carry if the export came from a
+    new-deploy database). Both ISO 8601 strings.
+
+    Falls back to `datetime.now(UTC)` (the import time) if neither is
+    present. Behaviorally that means a re-import of an old dexie export
+    over a freshly PUT row will overwrite the PUT row, because import time
+    is later than PUT time. Tests that need to assert LWW-skip semantics
+    must inject an explicit `updatedAt` on the imported row (older than
+    the existing row's PG `updated_at`) — see plan Step 3 通过判据
+    `test_lww_skips_older_incoming_when_existing_newer`.
+    """
+    raw = row.get('updatedAt') or row.get('updated_at')
+    if raw is not None:
+        try:
+            # `fromisoformat` handles trailing 'Z' from Python 3.11+.
+            s = raw if not isinstance(raw, str) else raw.replace('Z', '+00:00')
+            return datetime.fromisoformat(s)
+        except (TypeError, ValueError):
+            pass
+    return datetime.now(timezone.utc)
+
+
+def _publish_table_progress(
+    job: ImportJob, table: str, *, processed_rows: int
+) -> dict[str, Any]:
+    """Build the WS event body for a per-table progress publish.
+
+    Contract: same envelope shape as other server-routed tables (and
+    matches `import_jobs._envelope()` so frontend's realtime handler can
+    decode it via the same code path used for status changes). The `data`
+    payload reflects the latest counters — frontend treats successive
+    events as full snapshots, not deltas.
+    """
+    snap = job._envelope()
+    snap['data']['processed_rows'] = processed_rows
+    snap['data']['phase_b_table'] = table
+    return {
+        'type': 'event',
+        'table': 'import_jobs',
+        'op': 'put',
+        'id': job.id,
+        'rev': int(job.version) if job.version is not None else 0,
+        'row': snap,
+    }
+
+
+def _normalize_kv_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Map a dexie wire row to the PG row shape for this table.
+
+    For id-PK tables the dexie row has its own `id` field that becomes the
+    PG primary key; everything else (incl. workspaceId / dialogId nested in
+    the row) lives inside `data`.
+
+    For KV-PK tables (reactives / installed_plugins) the natural identity is
+    the `key` field, NOT `id`. We pluck it out to populate the composite PK
+    and keep the original payload as `data`.
+
+    Returns a dict with keys: pk_extras (dict of PK columns to bind),
+    `data` (JSONB blob), and possibly `workspace_id` / `dialog_id` if the
+    table promotes a parent FK.
+    """
+    if table == 'reactives':
+        # reactives row is `{key, value}` per src/utils/types.ts. PK is
+        # (user_id, key); `data` carries the whole row dict so we don't
+        # lose `value` shape.
+        return {
+            'pk': {'key': row.get('key', '')},
+            'data': row,
+        }
+    if table == 'installed_plugins':
+        # InstalledPlugin row is full plugin envelope; `key` field is the
+        # plugin manifest key. PK is (user_id, key).
+        return {
+            'pk': {'key': row.get('key', '')},
+            'data': row,
+        }
+    if table == 'avatar_images':
+        # avatarImages row is `{id, contentBuffer:ArrayBuffer, mimeType}`.
+        # ArrayBuffer arrives base64-encoded inside JSONB — Phase B keeps
+        # the wire form opaque (consistent with existing avatar_images
+        # router). id is the PK.
+        return {
+            'pk': {'id': row.get('id', '')},
+            'data': row,
+        }
+    if table == 'dialogs':
+        # dialogs has workspace_id promoted to its own column (see
+        # models/dialog.py). Dexie row carries `workspaceId` (camelCase);
+        # we extract it but keep the camelCase in `data` for byte-identical
+        # round-trip.
+        return {
+            'pk': {'id': row.get('id', '')},
+            'data': row,
+            'workspace_id': row.get('workspaceId', ''),
+        }
+    # providers / assistants / workspaces — id-PK, no FK promotion.
+    return {
+        'pk': {'id': row.get('id', '')},
+        'data': row,
+    }
+
+
+def _build_insert_stmt(table: str):
+    """Return a SQLAlchemy `pg_insert` statement bound to the model class
+    for the given backend table name. Worker uses one statement per table
+    with bound params per batch row; the `ON CONFLICT (...) DO UPDATE
+    WHERE ...` clause provides LWW.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from .models.artifact import Artifact
+    from .models.assistant import Assistant
+    from .models.avatar_image import AvatarImage
+    from .models.dialog import Dialog
+    from .models.installed_plugin import InstalledPlugin
+    from .models.item import Item
+    from .models.message import Message
+    from .models.provider import Provider
+    from .models.reactive import Reactive
+    from .models.workspace import Workspace
+
+    # Map table name → (Model, conflict_index_elements)
+    # KV-PK tables conflict on the composite PK; id-PK tables conflict on `id`.
+    table_map: dict[str, tuple[Any, list[str]]] = {
+        'providers': (Provider, ['id']),
+        'assistants': (Assistant, ['id']),
+        'workspaces': (Workspace, ['id']),
+        'dialogs': (Dialog, ['id']),
+        'items': (Item, ['id']),
+        'artifacts': (Artifact, ['id']),
+        'messages': (Message, ['id']),
+        'avatar_images': (AvatarImage, ['id']),
+        'reactives': (Reactive, ['user_id', 'key']),
+        'installed_plugins': (InstalledPlugin, ['user_id', 'key']),
+    }
+    Model, idx = table_map[table]
+    return pg_insert(Model), Model, idx
+
+
+async def _phase_b_load_table(
+    *,
+    session: Any,
+    job: ImportJob,
+    user_id: str,
+    dexie_table: str,
+    backend_table: str,
+    ndjson_path: Path,
+) -> int:
+    """Stream NDJSON for one table → batched UPSERT with LWW. Returns the
+    number of rows processed (incl. those skipped by LWW WHERE clause —
+    which still consume an INSERT attempt at the SQL layer)."""
+    if not ndjson_path.exists():
+        # Fixture / export simply didn't include this table. Common case:
+        # users without any installed plugins / avatar images. Not an
+        # error — just no work to do.
+        logger.debug(
+            'phase B / job %s / table %s: NDJSON missing, skipping',
+            job.id, dexie_table,
+        )
+        return 0
+
+    insert_stmt, Model, conflict_cols = _build_insert_stmt(backend_table)
+    now = datetime.now(timezone.utc)
+
+    # ON CONFLICT DO UPDATE clause — LWW: only overwrite the existing row
+    # when its `updated_at` is older than the incoming row's. The `EXCLUDED`
+    # pseudo-table refers to the values we tried to INSERT; PG eats the
+    # write silently if the WHERE clause is false (DO NOTHING semantics for
+    # this row), which is exactly what we want for skip-older.
+    set_payload: dict[str, Any] = {
+        'data': insert_stmt.excluded.data,
+        'version': insert_stmt.excluded.version,
+        'updated_at': insert_stmt.excluded.updated_at,
+        'deleted_at': None,  # revival on re-import
+        'imported_from_job_id': insert_stmt.excluded.imported_from_job_id,
+        'imported_at': insert_stmt.excluded.imported_at,
+    }
+    if backend_table == 'dialogs':
+        set_payload['workspace_id'] = insert_stmt.excluded.workspace_id
+
+    upsert_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=conflict_cols,
+        set_=set_payload,
+        # LWW guard. `Model.__table__.c.updated_at` references the existing
+        # row's column; `insert_stmt.excluded.updated_at` is the incoming
+        # row's value. For id-PK tables we additionally guard on user_id
+        # ownership (defense-in-depth — id collisions across users would
+        # otherwise be silently overwritten).
+        where=(Model.__table__.c.updated_at < insert_stmt.excluded.updated_at),
     )
+
+    processed = 0
+    batch: list[dict[str, Any]] = []
+
+    # Stream NDJSON line-by-line. Phase A writes one row per line, JSON-
+    # encoded with separators=(',', ':'); empty lines are unexpected but
+    # tolerated (skip silently).
+    def _read_lines() -> list[str]:
+        # Read the whole NDJSON in one go — Phase B's small-table set is
+        # bounded (typical user: < 100 dialogs, < 100 workspaces, < 50
+        # plugins). Even pathological cases stay under a few MB. For
+        # messages (Phase C) the streaming model differs.
+        with open(ndjson_path, 'r', encoding='utf-8') as f:
+            return [line for line in f if line.strip()]
+
+    lines = await asyncio.to_thread(_read_lines)
+
+    next_versions: list[int] = []
+    if lines:
+        # Pre-fetch one nextval per row for monotonic version assignment.
+        # Doing it inline (one round-trip per row) would blow up our query
+        # count; doing it as a single UPDATE-from-VALUES is uglier than
+        # batching nextvals. PG-native approach: SELECT array of nextvals.
+        nv_result = await session.execute(
+            text(
+                "SELECT nextval('global_change_seq') "
+                'FROM generate_series(1, :n)'
+            ),
+            {'n': len(lines)},
+        )
+        next_versions = [row[0] for row in nv_result.all()]
+
+    for line, next_version in zip(lines, next_versions):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                'phase B / job %s / table %s: skipping malformed line: %s',
+                job.id, dexie_table, e,
+            )
+            continue
+        if not isinstance(row, dict):
+            continue
+
+        normalized = _normalize_kv_row(backend_table, row)
+        lww_ts = _extract_lww_timestamp(row)
+        values: dict[str, Any] = {
+            'user_id': user_id,
+            'data': normalized['data'],
+            'version': next_version,
+            'updated_at': lww_ts,
+            'deleted_at': None,
+            'imported_from_job_id': job.id,
+            'imported_at': now,
+        }
+        values.update(normalized['pk'])
+        if 'workspace_id' in normalized:
+            values['workspace_id'] = normalized['workspace_id']
+        batch.append(values)
+        processed += 1
+
+        if len(batch) >= PHASE_B_BATCH_SIZE:
+            await session.execute(upsert_stmt, batch)
+            batch = []
+
+    if batch:
+        await session.execute(upsert_stmt, batch)
+
+    return processed
+
+
+async def run_phase_b(job_id: str) -> dict[str, Any]:
+    """Phase B — load 7 small structural tables from Phase A's NDJSON
+    output into PG with LWW conflict resolution.
+
+    Tables are processed in dependency order (workspaces before dialogs).
+    Each batch commits independently so a mid-table crash leaves an
+    idempotent partial state — re-running phase B will re-attempt every
+    row, and ON CONFLICT will dedupe.
+
+    Returns a summary the caller (`ImportWorker._do_phase_b`) writes back
+    into the job row alongside the status flip to `phase_c`.
+    """
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(ImportJob).where(ImportJob.id == job_id)
+        )
+        job = result.scalar_one()
+        user_id = job.user_id
+        # Pull the row out of the session — we'll reuse it as a snapshot
+        # for progress publishes.
+        session.expunge(job)
+
+    tmp = temp_dir_for_job(job_id)
+    if not tmp.exists():
+        raise ImportFormatError(
+            f'phase B job {job_id}: temp dir {tmp} missing; phase A did not '
+            'leave NDJSON output to consume'
+        )
+
+    per_table_processed: dict[str, int] = {}
+    total_processed = 0
+
+    from .blob_store import BlobStore  # noqa: F401 (circular guard)
+
+    # Load + commit one table at a time — keeps each commit small and lets
+    # progress events fire between tables. If we did one giant transaction
+    # the WS subscriber would see no progress until the very end.
+    for dexie_table, backend_table in PHASE_B_TABLES:
+        ndjson_path = tmp / f'{dexie_table}.ndjson'
+        async with SessionLocal() as session:
+            try:
+                processed = await _phase_b_load_table(
+                    session=session,
+                    job=job,
+                    user_id=user_id,
+                    dexie_table=dexie_table,
+                    backend_table=backend_table,
+                    ndjson_path=ndjson_path,
+                )
+                # Bump the job row's processed_rows counter as we go so a
+                # WS subscriber sees actual progress, not just per-table
+                # phase indicators. Single UPDATE per table keeps the
+                # row + counter atomic with the just-completed batch.
+                total_processed += processed
+                next_version = (await session.execute(
+                    text("SELECT nextval('global_change_seq')")
+                )).scalar_one()
+                await session.execute(
+                    update(ImportJob)
+                    .where(ImportJob.id == job_id)
+                    .values(
+                        processed_rows=total_processed,
+                        version=next_version,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                await session.commit()
+                per_table_processed[backend_table] = processed
+            except Exception as e:
+                logger.exception(
+                    'phase B / job %s / table %s failed: %s',
+                    job_id, backend_table, e,
+                )
+                # Re-raise so the worker's _do_phase_b wrapper can
+                # mark the job failed cleanly. Tables already written in
+                # earlier iterations stay in PG with their imported_from_
+                # job_id tag — a subsequent DELETE / cancel cleans them
+                # via the soft-delete cascade.
+                raise
+
+        # Publish a progress event after each table commits.
+        async with SessionLocal() as session:
+            refreshed = (await session.execute(
+                select(ImportJob).where(ImportJob.id == job_id)
+            )).scalar_one()
+            session.expunge(refreshed)
+        try:
+            from realtime import broker as realtime_broker
+            await realtime_broker.publish(
+                user_id,
+                _publish_table_progress(
+                    refreshed,
+                    backend_table,
+                    processed_rows=total_processed,
+                ),
+            )
+        except Exception as e:  # pragma: no cover — broker failure shouldn't kill phase
+            logger.warning(
+                'phase B / job %s: failed to publish progress for %s: %s',
+                job_id, backend_table, e,
+            )
+
+    return {
+        'per_table_processed': per_table_processed,
+        'total_processed': total_processed,
+    }
+
+
+# ---- phase stubs (Steps 4 / 5 fill these in) -------------------------------
 
 
 async def run_phase_c(job_id: str) -> None:
@@ -540,12 +973,16 @@ class ImportWorker:
             await self._do_phase_a(job_id)
             return
 
-        if status in ('phase_b', 'phase_c', 'phase_d'):
-            # Steps 3 / 4 / 5 plug stub handlers. For Step 1 we leave the
-            # row alone — don't crash the worker loop just because later
-            # phases aren't implemented yet.
+        if status == 'phase_b':
+            await self._do_phase_b(job_id)
+            return
+
+        if status in ('phase_c', 'phase_d'):
+            # Steps 4 / 5 plug stub handlers. We leave the row alone —
+            # don't crash the worker loop just because later phases aren't
+            # implemented yet.
             logger.debug(
-                'import job %s in %s: handler not implemented yet (Step 3+)',
+                'import job %s in %s: handler not implemented yet (Step 4+)',
                 job_id, status,
             )
             return
@@ -597,6 +1034,52 @@ class ImportWorker:
             'import job %s: phase A done (rows=%d blobs=%d bytes=%d)',
             job_id, summary['total_rows'], summary['total_blobs'],
             summary['total_bytes'],
+        )
+
+    async def _do_phase_b(self, job_id: str) -> None:
+        """Run Phase B (structural tables → PG with LWW), then advance to
+        phase_c. Errors mark the job failed with `phase B: <msg>` so the
+        UI can render a meaningful banner.
+
+        Idempotency: ON CONFLICT DO UPDATE WHERE LWW means re-running the
+        whole phase after a crash is safe — already-written rows stay,
+        re-attempted rows match the same LWW guard.
+        """
+        try:
+            summary = await run_phase_b(job_id)
+        except ImportFormatError as e:
+            logger.warning('import job %s: phase B failed: %s', job_id, e)
+            await self._mark_failed(job_id, f'phase B: {e}')
+            return
+        except Exception as e:
+            logger.exception(
+                'import job %s: unexpected phase B error: %s', job_id, e
+            )
+            await self._mark_failed(job_id, f'phase B unexpected: {e}')
+            return
+
+        # Advance status → phase_c with a fresh version so the WS event
+        # caused by the transition is distinct from the per-table progress
+        # events that fired during run_phase_b.
+        async with SessionLocal() as session:
+            next_version = (await session.execute(
+                text("SELECT nextval('global_change_seq')")
+            )).scalar_one()
+            await session.execute(
+                update(ImportJob)
+                .where(ImportJob.id == job_id)
+                .values(
+                    status='phase_c',
+                    updated_at=datetime.now(timezone.utc),
+                    version=next_version,
+                )
+            )
+            await session.commit()
+        logger.info(
+            'import job %s: phase B done (per_table=%s total_processed=%d)',
+            job_id,
+            summary.get('per_table_processed'),
+            summary.get('total_processed', 0),
         )
 
     async def _update_status(self, job_id: str, new_status: str) -> None:

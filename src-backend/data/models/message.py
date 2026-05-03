@@ -67,6 +67,14 @@ class Message(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    # Stage 4.5 / Step 3 — see provider.py for rationale.
+    imported_from_job_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True,
+    )
+    imported_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     __table_args__ = (
         # Composite index drives the scoped-pull main query
@@ -79,4 +87,5 @@ class Message(Base):
         ),
         Index('ix_messages_user_version', 'user_id', 'version'),
         Index('ix_messages_dialog', 'dialog_id'),
+        Index('ix_messages_imported_from_job_id', 'imported_from_job_id'),
     )

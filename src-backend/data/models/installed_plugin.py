@@ -35,8 +35,20 @@ class InstalledPlugin(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    # Stage 4.5 / Step 3 — see provider.py for rationale.
+    imported_from_job_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True,
+    )
+    imported_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     __table_args__ = (
         PrimaryKeyConstraint('user_id', 'key', name='installed_plugins_pkey'),
         Index('ix_installed_plugins_user_version', 'user_id', 'version'),
+        Index(
+            'ix_installed_plugins_imported_from_job_id',
+            'imported_from_job_id',
+        ),
     )

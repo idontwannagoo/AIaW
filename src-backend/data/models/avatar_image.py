@@ -34,7 +34,19 @@ class AvatarImage(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    # Stage 4.5 / Step 3 — see provider.py for rationale.
+    imported_from_job_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True,
+    )
+    imported_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     __table_args__ = (
         Index('ix_avatar_images_user_version', 'user_id', 'version'),
+        Index(
+            'ix_avatar_images_imported_from_job_id',
+            'imported_from_job_id',
+        ),
     )
