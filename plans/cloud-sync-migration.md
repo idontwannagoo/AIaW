@@ -153,7 +153,7 @@
 - **服务 1（指向 `my-deploy`）**：HEAD `2b26349`（Stage 0 baseline + Dexie 路径 bug fix）。env 不开任何 backend flag。承载老用户。Stage 5 落地后由 active 用户迁移率 ≥ 80% 触发 6 周下线窗
 - **服务 2（指向 `new-deploy`）**：公网域名 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run`，独立 Postgres
   - 前端 `.env.docker` 三档全开：`BACKEND_DATA_API_URL=<self>` + `BACKEND_AUTH=true` + `BACKEND_DATA_TABLES=providers,reactives,assistants,installedPlugins,avatarImages,workspaces,dialogs,items` + `REALTIME_TRANSPORT=auto` + `DEXIE_DB_URL=`（留空）
-  - 后端 Northflank 控制台 env：`BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=true`
+  - 后端 Northflank 控制台 env：`BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=invite` + `INVITE_CODE=aiaw-2026-beta`（dev preview 不开放注册；详见 CLAUDE.md「Northflank 部署侧约束 / 服务 2 / 注册模式」段）
   - Dockerfile 第二阶段含 `alembic upgrade head` 启动钩子
   - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/workspaces` 401、`/api/v1/dialogs` 401、`/api/v1/items` 401、`/api/v1/auth/register` 422
   - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages + workspaces + dialogs + items 跨设备同步可用；workspace 删除时 dialogs + items 走 server 端真二级级联（同事务 tombstone + 各发 WS event，共用 cascade_version）；items.contentBuffer ≥ 64KB 自动走对象存储 ref + 跨 tab `materializeAttachment` 字节级一致；其他 2 张表（messages / artifacts）仍只在本地 IndexedDB，workspace 删除时由前端 `stores/workspaces.ts::deleteItem` 顺序 await 清；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**

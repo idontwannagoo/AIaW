@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, Form, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import aiohttp
 import logging
@@ -199,4 +199,12 @@ if os.path.isdir('static'):
 
     @app.exception_handler(404)
     async def return_index(request: Request, exc: HTTPException):
+        # Router 内 raise HTTPException(404) 也会被这里拦下；API 路径必须保留
+        # JSON 形态，否则客户端 await response.json() 会拿到 SPA HTML 抛
+        # `Unexpected token <`，把"找不到行"误报成"网络错误"。
+        if request.url.path.startswith('/api/'):
+            return JSONResponse(
+                status_code=404,
+                content={'detail': getattr(exc, 'detail', 'not found')},
+            )
         return FileResponse("static/index.html")

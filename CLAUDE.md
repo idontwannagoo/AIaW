@@ -52,6 +52,7 @@ AI as Workspace (AIaW) — 跨平台 LLM 客户端，基于 **Quasar 2 + Vue 3 +
 
 - **服务 1（指向 `my-deploy`）**：保留现状。env 不再开 `BACKEND_DATA_API_ENABLED` / `JWT_SECRET` / `BACKEND_AUTH` / `BACKEND_DATA_API_URL` / `BACKEND_DATA_TABLES` / `REALTIME_TRANSPORT` 等任何 backend flag。Stage 5 落地后由 active 用户迁移率（建议 ≥ 80%）触发 6 周下线窗，到期关闭。
 - **服务 2（指向 `new-deploy`）**：已上线（公网域名 `https://p01--new-aiaw--hqdb2bsvdnbt.code.run`），独立 Postgres 实例 + Stage 4 起独立 R2/MinIO bucket；env 已开 `BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` 启用 backend data API。前端 flag（`BACKEND_AUTH` / `BACKEND_DATA_TABLES` / `REALTIME_TRANSPORT`）按 plan 灰度 —— 注意前端是构建期内联，开 flag 必须改 `new-deploy` 上的 `.env.docker` 后 push 重 build，控制台 env override 对前端无效。当前实例属性：仅适合 dev preview，不要导入真实数据 / 不要邀请他人，直到 Stage 4.5 落地+真实端到端验收通过（详见 plan「上线节奏与人工端到端测试分工」段）。
+  - **注册模式（`ALLOW_REGISTRATION` / `INVITE_CODE`）**：`src-backend/data/routers/auth.py:38` 默认值是 `invite`（不是 plan 历史草稿写过的 `true`）。Northflank 控制台当前实际配置 = invite 模式 + `INVITE_CODE=aiaw-2026-beta`。前端 / smoke 脚本 / 任何调 `POST /api/v1/auth/register` 的客户端必须在 body 里带 `invite_code` 字段，否则 403。三种值的语义：`true` 全开 / `invite`（默认）需 INVITE_CODE 匹配 / `false` 完全关。**轮换 invite code**：改 Northflank 控制台 `INVITE_CODE` env → 服务自动重启（runtime env，不需重 build）→ 同步改本段记录值；不要把 INVITE_CODE 写进 `.env.docker`（那是构建期内联到前端 JS bundle 的，会泄露给所有访客）。Stage 4.5 之前不公开传播 invite code，仅自己测 + 内圈使用。
 
 ### 老用户迁移路径（导入导出 only）
 
