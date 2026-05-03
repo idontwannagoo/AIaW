@@ -83,9 +83,9 @@ export function syncRef<T>(
     // earlier write that round-tripped slowly). Drop it; the pending
     // debounce flush will publish the user's latest value anyway.
     if (
-      suppressMs > 0
-      && lastLocalEditAt > 0
-      && Date.now() - lastLocalEditAt < suppressMs
+      suppressMs > 0 &&
+      lastLocalEditAt > 0 &&
+      Date.now() - lastLocalEditAt < suppressMs
     ) {
       return
     }
