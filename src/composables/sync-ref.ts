@@ -60,6 +60,8 @@ export function syncRef<T>(
 
   watch(val, newVal => {
     if (lastSourceWriteAt > 0 && Date.now() - lastSourceWriteAt < 5) {
+      // This trigger is the echo of the source push that just wrote val.
+      // Consume the marker; future user edits must trip set() normally.
       lastSourceWriteAt = -1
       return
     }
@@ -77,7 +79,11 @@ export function syncRef<T>(
       pendingFlush = null
       set(newVal)
     }, debounceMs)
-  }, { deep: options?.valueDeep })
+  // flush:'sync' so the source-push echo fires the val watcher immediately,
+  // before any subsequent user edit can coalesce with it (Vue's default
+  // post-microtask flush merges back-to-back ref writes into one trigger
+  // and our timestamp-based echo detection then fails open).
+  }, { deep: options?.valueDeep, flush: 'sync' })
 
   watch(source, newVal => {
     // If the user is mid-edit, the arriving source value is overwhelmingly
