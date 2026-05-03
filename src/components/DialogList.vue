@@ -66,7 +66,7 @@
 
 <script setup lang="ts">
 import { useQuasar } from 'quasar'
-import { repos, runTx } from 'src/data'
+import { repos } from 'src/data'
 import { isPlatformEnabled } from 'src/utils/functions'
 import { Dialog, Workspace } from 'src/utils/types'
 import { dialogOptions } from 'src/utils/values'
@@ -126,11 +126,16 @@ function deleteItem({ id, name }) {
     },
     ...dialogOptions
   }).onOk(() => {
-    runTx(['dialogs', 'messages', 'items'], async () => {
+    // Bug 5 fix — sequential awaits, not a Dexie transaction.
+    // dialogs / messages / items are all server-routed; runTx would
+    // PrematureCommitError on the first server call. Worst case after a
+    // mid-flight failure: orphan messages/items survive briefly until the
+    // next workspace-level cascade cleans them up.
+    void (async () => {
       await repos.dialogs.delete(id)
       await repos.messages.deleteWhere({ where: { dialogId: id } })
       await repos.items.deleteWhere({ where: { dialogId: id } })
-    })
+    })()
   })
 }
 

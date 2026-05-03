@@ -428,7 +428,7 @@
 
 <script setup lang="ts">
 import { computed, ComponentPublicInstance, inject, onUnmounted, provide, ref, Ref, toRaw, toRef, watch, nextTick } from 'vue'
-import { repos, runTx, observeWithDeps } from 'src/data'
+import { repos, observeWithDeps } from 'src/data'
 import { almostEqual, displayLength, genId, inputValueEmpty, isPlatformEnabled, isTextFile, JSONEqual, mimeTypeMatch, pageFhStyle, textBeginning, wrapCode, wrapQuote } from 'src/utils/functions'
 import { useAssistantsStore } from 'src/stores/assistants'
 import { streamText, generateText, tool, jsonSchema, StreamTextResult, GenerateTextResult, ModelMessage, stepCountIs } from 'ai'
@@ -541,16 +541,39 @@ function mergeRouteIntoBranchState(tree: Record<string, string[]>, route: number
   }
   return branchState
 }
-function updateChain(routeOrBranchState: number[] | Record<string, number>) {
+async function updateChain(routeOrBranchState: number[] | Record<string, number>) {
+  // Bug 5 Round 3 fix — race with stream()'s appendMessage path.
+  //
+  // updateChain is fired by the watch below whenever liveData.messages.length
+  // changes; appendMessage adds a message → length changes → watch fires →
+  // updateChain PUTs dialog with stale cached msgTree (missing the just-added
+  // [id]: [] key) → server-routed dialogs.server.ts shallowMerges current
+  // (stale snapshot) with { msgRoute, msgBranchState } and PUTs the whole row
+  // → the realtime broker echoes the stale msgTree back via WS → local cache
+  // loses the new key → the next appendMessage on the same stream() does
+  // `[...d.msgTree[target], mt]` where target is the just-evicted key →
+  // spread of undefined → `TypeError: ... is not iterable` → stream() throws
+  // → no streamText call → mock LLM hit=0 (Bug 5 Round 3 ws-only red).
+  //
+  // Fix: while stream() is running, the appendMessage path itself is the
+  // single source of truth for dialog.msgRoute / msgBranchState (it computes
+  // them from the just-loaded fresh dialog row, see appendMessage line 666-
+  // 672). Watcher writes during this window are pure interference. After
+  // stream() finishes the watch will fire one more time on the final
+  // messages.length change and perform a clean catch-up update if needed.
+  if (streamActive.value) return
   const branchState = Array.isArray(routeOrBranchState)
     ? mergeRouteIntoBranchState(liveData.value.dialog.msgTree, routeOrBranchState, getBranchState())
     : routeOrBranchState
   const res = getChain(liveData.value.dialog.msgTree, '$root', branchState)
   historyChain.value = res[0]
-  repos.dialogs.update(dialog.value.id, { msgRoute: res[1], msgBranchState: branchState })
+  // Await the PUT so the watcher does not stack multiple in-flight writes
+  // racing the same dialog row (each write does shallowMerge on its own
+  // stale cache snapshot). Vue allows async watch handlers (Promise return).
+  await repos.dialogs.update(dialog.value.id, { msgRoute: res[1], msgBranchState: branchState })
 }
-watch([() => liveData.value.messages.length, () => liveData.value.dialog?.id], () => {
-  liveData.value.dialog && updateChain(liveData.value.dialog.msgRoute)
+watch([() => liveData.value.messages.length, () => liveData.value.dialog?.id], async () => {
+  if (liveData.value.dialog) await updateChain(liveData.value.dialog.msgRoute)
 })
 function getChain(tree: Record<string, string[]>, node: string, branchState: Record<string, number>) {
   const children = tree[node]
@@ -567,15 +590,21 @@ function focusInput() {
 async function edit(index) {
   const target = chain.value[index - 1]
   const { type, contents } = messageMap.value[chain.value[index]]
-  await runTx(['dialogs', 'messages', 'items'], async () => {
-    await appendMessage(target, {
-      type,
-      contents,
-      status: 'inputing'
-    }, false, true)
-    const content = contents[0] as UserMessageContent
-    await saveItems(content.items.map(id => itemMap.value[id]))
-  })
+  // Bug 5 fix — sequential awaits, not a Dexie transaction.
+  // dialogs / messages / items are all server-routed (BACKEND_DATA_TABLES).
+  // Each repo write goes through `await http.put(...)` whose non-Dexie
+  // promise causes Dexie to auto-commit the transaction and throw
+  // PrematureCommitError on the next operation. Same reasoning as the
+  // documented compromise in stores/workspaces.ts:54-61. Worst case after
+  // a mid-flight failure: a few orphan rows; server-side LWW + version
+  // monotonicity keep eventual consistency.
+  await appendMessage(target, {
+    type,
+    contents,
+    status: 'inputing'
+  }, false, true)
+  const content = contents[0] as UserMessageContent
+  await saveItems(content.items.map(id => itemMap.value[id]))
   await nextTick()
   focusInput()
 }
@@ -602,52 +631,70 @@ async function deleteBranch(index) {
     else if (c.type === 'assistant-tool') return c.result || []
     else return []
   })
-  await runTx(['dialogs', 'messages', 'items'], () => {
-    repos.messages.bulkDelete(ids)
-    itemIds.forEach(id => {
-      let { references } = itemMap.value[id]
-      references--
-      references === 0 ? repos.items.delete(id) : repos.items.update(id, { references })
-    })
-    const msgTree = { ...toRaw(dialog.value.msgTree) }
-    msgTree[parent] = msgTree[parent].filter(id => id !== anchor)
-    ids.forEach(id => {
-      delete msgTree[id]
-    })
-    repos.dialogs.update(props.id, { msgTree })
+  // Bug 5 fix — sequential awaits, not a Dexie transaction.
+  // dialogs / messages / items are server-routed; previously the dexie
+  // transaction relied on Dexie's promise-chaining of synchronous-shape
+  // table calls, but the server-routed repos issue `await http.delete /
+  // http.put` internally → Dexie auto-aborts on the first await of a
+  // non-Dexie promise. Now we explicitly await each call so unhandled
+  // rejections cannot escape and so subsequent items are not skipped on
+  // a single transient HTTP failure.
+  await repos.messages.bulkDelete(ids)
+  for (const id of itemIds) {
+    let { references } = itemMap.value[id]
+    references--
+    if (references === 0) {
+      await repos.items.delete(id)
+    } else {
+      await repos.items.update(id, { references })
+    }
+  }
+  const msgTree = { ...toRaw(dialog.value.msgTree) }
+  msgTree[parent] = msgTree[parent].filter(id => id !== anchor)
+  ids.forEach(id => {
+    delete msgTree[id]
   })
+  await repos.dialogs.update(props.id, { msgTree })
 }
 
 async function appendMessage(target, info: Partial<Message>, insert = false, selectBranch = false) {
   const id = genId()
-  await runTx(['dialogs', 'messages'], async () => {
-    await repos.messages.add({
-      id,
-      dialogId: dialog.value.id,
-      workspaceId: dialog.value.workspaceId,
-      ...info
-    } as Message)
-    const d = await repos.dialogs.get(props.id)
-    const children = d.msgTree[target]
-    const changes = insert ? {
-      [target]: [id],
-      [id]: children
-    } : {
-      [target]: [...children, id],
-      [id]: []
-    }
-    const msgTree = { ...d.msgTree, ...changes }
-    const dialogChanges: Partial<Dialog> = { msgTree }
-    if (selectBranch) {
-      const branchState = d.msgBranchState
-        ? { ...d.msgBranchState }
-        : mergeRouteIntoBranchState(d.msgTree, d.msgRoute, {})
-      branchState[target] = insert ? 0 : children.length
-      dialogChanges.msgBranchState = branchState
-      dialogChanges.msgRoute = getChain(msgTree, '$root', branchState)[1]
-    }
-    await repos.dialogs.update(props.id, dialogChanges)
-  })
+  // Bug 5 fix — sequential awaits, not a Dexie transaction.
+  // `repos.messages.add` and `repos.dialogs.update` are both server-routed
+  // (`messages.server.ts` / `dialogs.server.ts`). Each invokes
+  // `await http.put(...)` whose non-Dexie promise causes Dexie to auto-
+  // commit and throw PrematureCommitError on the next operation —
+  // observable as a hung send pipeline (no LLM request issued because the
+  // outer `stream()` fails before reaching `streamText`). Same compromise
+  // documented in stores/workspaces.ts:54-61: server-side LWW + version
+  // monotonicity keep eventual consistency; worst case after a mid-flight
+  // failure is an orphan message with no msgTree pointer.
+  await repos.messages.add({
+    id,
+    dialogId: dialog.value.id,
+    workspaceId: dialog.value.workspaceId,
+    ...info
+  } as Message)
+  const d = await repos.dialogs.get(props.id)
+  const children = d.msgTree[target]
+  const changes = insert ? {
+    [target]: [id],
+    [id]: children
+  } : {
+    [target]: [...children, id],
+    [id]: []
+  }
+  const msgTree = { ...d.msgTree, ...changes }
+  const dialogChanges: Partial<Dialog> = { msgTree }
+  if (selectBranch) {
+    const branchState = d.msgBranchState
+      ? { ...d.msgBranchState }
+      : mergeRouteIntoBranchState(d.msgTree, d.msgRoute, {})
+    branchState[target] = insert ? 0 : children.length
+    dialogChanges.msgBranchState = branchState
+    dialogChanges.msgRoute = getChain(msgTree, '$root', branchState)[1]
+  }
+  await repos.dialogs.update(props.id, dialogChanges)
   return id
 }
 function expandMessageTree(root): string[] {
@@ -866,16 +913,22 @@ onUnmounted(() => removeEventListener('paste', onPaste))
 async function removeItem({ id, references }: StoredItem) {
   const items = [...inputMessageContent.value.items]
   items.splice(items.indexOf(id), 1)
-  await runTx(['messages', 'items'], () => {
-    repos.messages.update(chain.value.at(-1), {
-      contents: [{
-        ...inputMessageContent.value,
-        items
-      }]
-    })
-    references--
-    references === 0 ? repos.items.delete(id) : repos.items.update(id, { references })
+  // Bug 5 fix — sequential awaits, not a Dexie transaction.
+  // messages / items are server-routed; explicit awaits ensure each HTTP
+  // call completes before the next and surface errors instead of letting
+  // them escape as unhandled rejections.
+  await repos.messages.update(chain.value.at(-1), {
+    contents: [{
+      ...inputMessageContent.value,
+      items
+    }]
   })
+  references--
+  if (references === 0) {
+    await repos.items.delete(id)
+  } else {
+    await repos.items.update(id, { references })
+  }
 }
 async function parseFiles(files: File[]) {
   if (!files.length) return
@@ -931,16 +984,18 @@ function quote(item: ApiResultItem) {
 async function addInputItems(items: ApiResultItem[]) {
   const storedItems = items.map(i => ({ ...i, id: genId(), dialogId: props.id, references: 0 }))
   const ids = storedItems.map(i => i.id)
-  await runTx(['messages', 'items'], () => {
-    repos.messages.update(chain.value.at(-1), {
-      // use shallow keyPath to avoid dexie's sync bug
-      contents: [{
-        ...inputMessageContent.value,
-        items: [...inputMessageContent.value.items, ...ids]
-      }]
-    })
-    saveItems(storedItems)
+  // Bug 5 fix — sequential awaits, not a Dexie transaction.
+  // messages / items are server-routed; the previous transaction relied on
+  // Dexie auto-chaining sync-shape table calls but server-routed repos
+  // await `http.put` internally → PrematureCommitError on the next call.
+  await repos.messages.update(chain.value.at(-1), {
+    // use shallow keyPath to avoid dexie's sync bug
+    contents: [{
+      ...inputMessageContent.value,
+      items: [...inputMessageContent.value.items, ...ids]
+    }]
   })
+  await saveItems(storedItems)
 }
 
 async function saveItems(items: StoredItem[]) {
@@ -1103,22 +1158,36 @@ async function send() {
 
 const artifacts = inject<Ref<Artifact[]>>('artifacts')
 const abortController = ref<AbortController>()
+// Bug 5 Round 3 fix — sentinel guarding updateChain against the
+// appendMessage path while a stream is in flight. See comment in
+// updateChain() for the race chain. Set to true at the very top of
+// stream() (before the first appendMessage) and cleared in the outermost
+// finally so an exception path still releases the guard.
+const streamActive = ref(false)
 async function stream(target, insert = false) {
-  const settings: Partial<ModelSettings> = {}
-  for (const key in assistant.value.modelSettings) {
-    const val = assistant.value.modelSettings[key]
-    if (!inputValueEmpty(val)) {
-      settings[key] = val
+  streamActive.value = true
+  try {
+    const settings: Partial<ModelSettings> = {}
+    for (const key in assistant.value.modelSettings) {
+      const val = assistant.value.modelSettings[key]
+      if (!inputValueEmpty(val)) {
+        settings[key] = val
+      }
     }
-  }
-  const messageContent: AssistantMessageContent = {
-    type: 'assistant-message',
-    text: ''
-  }
-  const contents: MessageContent[] = [messageContent]
-  let id
-  await runTx(['dialogs', 'messages'], async () => {
-    id = await appendMessage(target, {
+    const messageContent: AssistantMessageContent = {
+      type: 'assistant-message',
+      text: ''
+    }
+    const contents: MessageContent[] = [messageContent]
+    // Bug 5 fix — sequential awaits, not a Dexie transaction.
+    // dialogs / messages are server-routed (Stage 4 / 批次-4d /
+    // 批次-4e). `appendMessage` internally awaits `http.put` for both
+    // messages.add and dialogs.update; wrapping in `runTx` causes Dexie to
+    // PrematureCommitError → `stream()` throws → outer `send()` has no
+    // try/catch → unhandled rejection → `streamText(params)` (line 1287
+    // pre-fix) is never reached → no LLM network request issued → infinite
+    // spinner. This was the user-visible Bug 5.
+    const id = await appendMessage(target, {
       type: 'assistant',
       assistantId: assistant.value.id,
       contents,
@@ -1126,209 +1195,217 @@ async function stream(target, insert = false) {
       generatingSession: sessions.id,
       modelName: model.value.name
     }, insert, true)
-    !insert && await appendMessage(id, {
-      type: 'user',
-      contents: [{
-        type: 'user-message',
-        text: '',
-        items: []
-      }],
-      status: 'inputing'
-    })
-  })
+    if (!insert) {
+      await appendMessage(id, {
+        type: 'user',
+        contents: [{
+          type: 'user-message',
+          text: '',
+          items: []
+        }],
+        status: 'inputing'
+      })
+    }
 
-  // Stage 4 / 批次-4e — streaming PUT throttle.
-  //
-  // Replaces the legacy 50ms quasar `throttle(() => repos.messages.update(...))`.
-  // For server-routed messages each PUT fans out through PG + the broker
-  // queue, so a long assistant reply at 10–30Hz token cadence would blow
-  // the per-event queue. We batch via a 200ms window / 1KB / sentence-
-  // boundary triple-trigger; non-streaming PUTs (status / usage / error
-  // finalize after the loop) bypass the flusher entirely so they remain
-  // synchronous from the caller's perspective. See `composables/message-
-  // stream-flush.ts` for the trigger semantics.
-  //
-  // The flusher PUTs the full current message envelope on each flush; the
-  // wire protocol has no notion of partial deltas. The IDB cache write is
-  // performed inside `repos.messages.update` so cross-tab subscribers see
-  // a consistent post-flush snapshot.
-  const streamFlush = createMessageStreamFlush<{ contents: MessageContent[] }>({
-    flush: async ({ contents }) => {
-      await repos.messages.update(id, { contents })
-    },
-    // Sentence-boundary trigger keys off the cumulative assistant text so
-    // a flush lands at human-perceivable phrase ends (better cross-tab UX
-    // than time-window-only flushing for short replies).
-    boundaryTextOf: ({ contents }) => {
+    // Stage 4 / 批次-4e — streaming PUT throttle.
+    //
+    // Replaces the legacy 50ms quasar `throttle(() => repos.messages.update(...))`.
+    // For server-routed messages each PUT fans out through PG + the broker
+    // queue, so a long assistant reply at 10–30Hz token cadence would blow
+    // the per-event queue. We batch via a 200ms window / 1KB / sentence-
+    // boundary triple-trigger; non-streaming PUTs (status / usage / error
+    // finalize after the loop) bypass the flusher entirely so they remain
+    // synchronous from the caller's perspective. See `composables/message-
+    // stream-flush.ts` for the trigger semantics.
+    //
+    // The flusher PUTs the full current message envelope on each flush; the
+    // wire protocol has no notion of partial deltas. The IDB cache write is
+    // performed inside `repos.messages.update` so cross-tab subscribers see
+    // a consistent post-flush snapshot.
+    const streamFlush = createMessageStreamFlush<{ contents: MessageContent[] }>({
+      flush: async ({ contents }) => {
+        await repos.messages.update(id, { contents })
+      },
+      // Sentence-boundary trigger keys off the cumulative assistant text so
+      // a flush lands at human-perceivable phrase ends (better cross-tab UX
+      // than time-window-only flushing for short replies).
+      boundaryTextOf: ({ contents }) => {
       // The assistant text we care about is `messageContent.text` (the
       // first content in the array, kept stable across the streaming
       // loop). Tail of last 4 chars is enough for the regex.
-      const ac = contents.find(c => c.type === 'assistant-message') as AssistantMessageContent | undefined
-      if (!ac?.text) return ''
-      return ac.text.slice(-4)
+        const ac = contents.find(c => c.type === 'assistant-message') as AssistantMessageContent | undefined
+        if (!ac?.text) return ''
+        return ac.text.slice(-4)
+      }
+    })
+    // Synchronous shim: callers (callTool / text-delta loop) treat this as
+    // a fire-and-forget signal "contents has changed; please flush soon".
+    // chunkText is the delta text in this tick (used to bump the byte
+    // counter for the threshold trigger); pass undefined for non-text
+    // events (tool status updates) — those still flush via time window.
+    function update(chunkText?: string): void {
+      streamFlush.enqueue({ contents }, { chunkBytes: chunkText?.length ?? 0 })
     }
-  })
-  // Synchronous shim: callers (callTool / text-delta loop) treat this as
-  // a fire-and-forget signal "contents has changed; please flush soon".
-  // chunkText is the delta text in this tick (used to bump the byte
-  // counter for the threshold trigger); pass undefined for non-text
-  // events (tool status updates) — those still flush via time window.
-  function update(chunkText?: string): void {
-    streamFlush.enqueue({ contents }, { chunkBytes: chunkText?.length ?? 0 })
-  }
-  async function callTool(plugin: Plugin, api: PluginApi, args) {
-    const content: MessageContent = {
-      type: 'assistant-tool',
-      pluginId: plugin.id,
-      name: api.name,
-      args,
-      status: 'calling'
+    async function callTool(plugin: Plugin, api: PluginApi, args) {
+      const content: MessageContent = {
+        type: 'assistant-tool',
+        pluginId: plugin.id,
+        name: api.name,
+        args,
+        status: 'calling'
+      }
+      contents.push(content)
+      update()
+      const { result: apiResult, error } = await callApi(plugin, api, args)
+      const result: StoredItem[] = apiResult.map(r => ({ ...r, id: genId(), dialogId: props.id, references: 0 }))
+      saveItems(result)
+      if (error) {
+        content.status = 'failed'
+        content.error = error
+      } else {
+        content.status = 'completed'
+        content.result = result.map(i => i.id)
+      }
+      update()
+      return { result, error }
     }
-    contents.push(content)
-    update()
-    const { result: apiResult, error } = await callApi(plugin, api, args)
-    const result: StoredItem[] = apiResult.map(r => ({ ...r, id: genId(), dialogId: props.id, references: 0 }))
-    saveItems(result)
-    if (error) {
-      content.status = 'failed'
-      content.error = error
-    } else {
-      content.status = 'completed'
-      content.result = result.map(i => i.id)
-    }
-    update()
-    return { result, error }
-  }
-  const { plugins } = assistant.value
-  const tools = {}
-  const enabledPlugins = []
-  let noRoundtrip = true
-  await Promise.all(activePlugins.value.map(async p => {
-    noRoundtrip &&= p.noRoundtrip
-    const plugin = plugins[p.id]
-    const pluginVars = {
-      ...getCommonVars(),
-      ...plugin.vars
-    }
-    plugin.tools.forEach(api => {
-      if (!api.enabled) return
-      const a = p.apis.find(a => a.name === api.name)
-      const { name, prompt } = a
-      tools[`${p.id}-${name}`] = tool({
-        description: engine.parseAndRenderSync(prompt, pluginVars),
-        inputSchema: jsonSchema(a.parameters),
+    const { plugins } = assistant.value
+    const tools = {}
+    const enabledPlugins = []
+    let noRoundtrip = true
+    await Promise.all(activePlugins.value.map(async p => {
+      noRoundtrip &&= p.noRoundtrip
+      const plugin = plugins[p.id]
+      const pluginVars = {
+        ...getCommonVars(),
+        ...plugin.vars
+      }
+      plugin.tools.forEach(api => {
+        if (!api.enabled) return
+        const a = p.apis.find(a => a.name === api.name)
+        const { name, prompt } = a
+        tools[`${p.id}-${name}`] = tool({
+          description: engine.parseAndRenderSync(prompt, pluginVars),
+          inputSchema: jsonSchema(a.parameters),
+          async execute(args) {
+            const { result, error } = await callTool(p, a, args)
+            if (error) throw new ApiCallError(error)
+            return result
+          },
+          toModelOutput: toToolResultContent
+        })
+      })
+      const pluginInfos = {}
+      await Promise.all(plugin.infos.map(async api => {
+        if (!api.enabled) return
+        const a = p.apis.find(a => a.name === api.name)
+        if (a.infoType !== 'prompt-var') return
+        try {
+          pluginInfos[a.name] = await callApi(p, a, api.args)
+        } catch (e) {
+          $q.notify({ message: t('dialogView.callPluginInfoFailed', { message: e.message }), color: 'negative' })
+        }
+      }))
+
+      try {
+        enabledPlugins.push({
+          id: p.id,
+          prompt: p.prompt && engine.parseAndRenderSync(p.prompt, { ...pluginVars, infos: pluginInfos })
+        })
+      } catch (e) {
+        $q.notify({ message: t('dialogView.pluginPromptParseFailed', { title: p.title }), color: 'negative' })
+      }
+    }))
+    if (isPlatformEnabled(perfs.artifactsEnabled) && artifacts.value.some(a => a.open)) {
+      const { plugin, getPrompt, api } = artifactsPlugin
+      enabledPlugins.push({
+        id: plugin.id,
+        prompt: getPrompt(artifacts.value.filter(a => a.open)),
+        actions: []
+      })
+      tools[`${plugin.id}-${api.name}`] = tool({
+        description: api.prompt,
+        inputSchema: jsonSchema(api.parameters),
         async execute(args) {
-          const { result, error } = await callTool(p, a, args)
+          const { result, error } = await callTool(plugin, api, args)
           if (error) throw new ApiCallError(error)
           return result
         },
         toModelOutput: toToolResultContent
       })
-    })
-    const pluginInfos = {}
-    await Promise.all(plugin.infos.map(async api => {
-      if (!api.enabled) return
-      const a = p.apis.find(a => a.name === api.name)
-      if (a.infoType !== 'prompt-var') return
-      try {
-        pluginInfos[a.name] = await callApi(p, a, api.args)
-      } catch (e) {
-        $q.notify({ message: t('dialogView.callPluginInfoFailed', { message: e.message }), color: 'negative' })
-      }
-    }))
-
+    }
     try {
-      enabledPlugins.push({
-        id: p.id,
-        prompt: p.prompt && engine.parseAndRenderSync(p.prompt, { ...pluginVars, infos: pluginInfos })
-      })
-    } catch (e) {
-      $q.notify({ message: t('dialogView.pluginPromptParseFailed', { title: p.title }), color: 'negative' })
-    }
-  }))
-  if (isPlatformEnabled(perfs.artifactsEnabled) && artifacts.value.some(a => a.open)) {
-    const { plugin, getPrompt, api } = artifactsPlugin
-    enabledPlugins.push({
-      id: plugin.id,
-      prompt: getPrompt(artifacts.value.filter(a => a.open)),
-      actions: []
-    })
-    tools[`${plugin.id}-${api.name}`] = tool({
-      description: api.prompt,
-      inputSchema: jsonSchema(api.parameters),
-      async execute(args) {
-        const { result, error } = await callTool(plugin, api, args)
-        if (error) throw new ApiCallError(error)
-        return result
-      },
-      toModelOutput: toToolResultContent
-    })
-  }
-  try {
-    if (noRoundtrip) settings.maxSteps = 1
-    abortController.value = new AbortController()
-    const messages = getChainMessages()
-    const prompt = getSystemPrompt(enabledPlugins.filter(p => p.prompt))
-    prompt && messages.unshift({ role: assistant.value.promptRole, content: prompt })
-    const params = {
-      model: sdkModel.value,
-      messages,
-      tools: {
-        ...providerTools.value,
-        ...tools
-      },
-      providerOptions: providerOptions.value,
-      ...settings,
-      stopWhen: stepCountIs(settings.maxSteps),
-      abortSignal: abortController.value.signal
-    }
-    let result: StreamTextResult<any, any> | GenerateTextResult<any, any>
-    if (assistant.value.stream) {
-      result = streamText(params)
-      await repos.messages.update(id, { status: 'streaming' })
-      lockingBottom.value = perfs.streamingLockBottom
-      for await (const part of result.fullStream) {
-        if (part.type === 'text-delta') {
-          messageContent.text += part.text
-          update(part.text)
-        } else if (part.type === 'reasoning-delta') {
-          messageContent.reasoning = (messageContent.reasoning ?? '') + part.text
-          update(part.text)
-        } else if (part.type === 'error') {
-          throw part.error
-        }
+      if (noRoundtrip) settings.maxSteps = 1
+      abortController.value = new AbortController()
+      const messages = getChainMessages()
+      const prompt = getSystemPrompt(enabledPlugins.filter(p => p.prompt))
+      prompt && messages.unshift({ role: assistant.value.promptRole, content: prompt })
+      const params = {
+        model: sdkModel.value,
+        messages,
+        tools: {
+          ...providerTools.value,
+          ...tools
+        },
+        providerOptions: providerOptions.value,
+        ...settings,
+        stopWhen: stepCountIs(settings.maxSteps),
+        abortSignal: abortController.value.signal
       }
-    } else {
-      result = await generateText(params)
-      messageContent.text = await result.text
-      messageContent.reasoning = await result.reasoningText
-    }
+      let result: StreamTextResult<any, any> | GenerateTextResult<any, any>
+      if (assistant.value.stream) {
+        result = streamText(params)
+        await repos.messages.update(id, { status: 'streaming' })
+        lockingBottom.value = perfs.streamingLockBottom
+        for await (const part of result.fullStream) {
+          if (part.type === 'text-delta') {
+            messageContent.text += part.text
+            update(part.text)
+          } else if (part.type === 'reasoning-delta') {
+            messageContent.reasoning = (messageContent.reasoning ?? '') + part.text
+            update(part.text)
+          } else if (part.type === 'error') {
+            throw part.error
+          }
+        }
+      } else {
+        result = await generateText(params)
+        messageContent.text = await result.text
+        messageContent.reasoning = await result.reasoningText
+      }
 
-    const usage = await result.usage
-    const warnings = (await result.warnings).map(w => (w.type === 'unsupported-setting' || w.type === 'unsupported-tool') ? w.details : w.message)
-    // Drain the streaming flusher BEFORE the finalize PUT so the latest
-    // `contents` snapshot reaches the server / cross-tab subscribers in
-    // a deterministic order: …delta… → final flush → finalize PUT.
-    // Without this, the finalize PUT can race a still-pending batched
-    // PUT and leave the subscriber's last seen rev with stale contents.
-    await streamFlush.stop()
-    await repos.messages.update(id, { contents, status: 'default', generatingSession: null, warnings, usage })
-  } catch (e) {
-    console.error(e)
-    if (e.data?.error?.type === 'budget_exceeded') {
-      $q.notify({
-        message: t('dialogView.errors.insufficientQuota'),
-        color: 'err-c',
-        textColor: 'on-err-c',
-        actions: [{ label: t('dialogView.recharge'), color: 'on-sur', handler() { router.push('/account') } }]
-      })
+      const usage = await result.usage
+      const warnings = (await result.warnings).map(w => (w.type === 'unsupported-setting' || w.type === 'unsupported-tool') ? w.details : w.message)
+      // Drain the streaming flusher BEFORE the finalize PUT so the latest
+      // `contents` snapshot reaches the server / cross-tab subscribers in
+      // a deterministic order: …delta… → final flush → finalize PUT.
+      // Without this, the finalize PUT can race a still-pending batched
+      // PUT and leave the subscriber's last seen rev with stale contents.
+      await streamFlush.stop()
+      await repos.messages.update(id, { contents, status: 'default', generatingSession: null, warnings, usage })
+    } catch (e) {
+      console.error(e)
+      if (e.data?.error?.type === 'budget_exceeded') {
+        $q.notify({
+          message: t('dialogView.errors.insufficientQuota'),
+          color: 'err-c',
+          textColor: 'on-err-c',
+          actions: [{ label: t('dialogView.recharge'), color: 'on-sur', handler() { router.push('/account') } }]
+        })
+      }
+      // Same drain-before-finalize discipline as the success branch.
+      await streamFlush.stop()
+      await repos.messages.update(id, { contents, error: e.message || e.toString(), status: 'failed', generatingSession: null })
     }
-    // Same drain-before-finalize discipline as the success branch.
-    await streamFlush.stop()
-    await repos.messages.update(id, { contents, error: e.message || e.toString(), status: 'failed', generatingSession: null })
+    perfs.artifactsAutoExtract && autoExtractArtifact()
+    lockingBottom.value = false
+  } finally {
+    // Bug 5 Round 3 fix — release updateChain guard. Cleared in finally so
+    // an unexpected throw (e.g. assistant.value missing) still unblocks the
+    // watcher; the natural watch trigger after stream() ends will perform
+    // any deferred catch-up dialog write.
+    streamActive.value = false
   }
-  perfs.artifactsAutoExtract && autoExtractArtifact()
-  lockingBottom.value = false
 }
 function toToolResultContent(items: StoredItem[]) {
   const val = []

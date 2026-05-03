@@ -28,7 +28,7 @@
 - **故障注入红测**: 注释 `src/data/auth.backend.ts:134-136` 的 `if (!wasLoggedIn) emitAuthChange('login')` → spec 红 ✅（`seeded workspace=... must all land in IDB within 3s post-login: Expected: true Received: false`）→ 恢复 → 绿 ✅
 - **关联 bug 顺带消除**: Bug 3 + Bug 4（同源，bootstrap-on-login 一并修好）
 - **已知遗留**:
-  - 发送按钮 DOM 真正 enabled 的链路依赖 `liveData.messages` 反应式刷新 → 看到 typed text → `inputMessageContent.value.text` 非空 → `inputEmpty = false`。本 spec 不断言 DOM enabled（IDB roundtrip 已证 chain resolved），DOM 层面 enable 看起来是 Bug 5 的子问题（observeWithDeps liveData 反应式更新延迟），由 Round 2 单独跟进。
+  - 发送按钮 DOM 真正 enabled 的链路依赖 `liveData.messages` 反应式刷新 → 看到 typed text → `inputMessageContent.value.text` 非空 → `inputEmpty = false`。本 spec 不断言 DOM enabled（IDB roundtrip 已证 chain resolved），DOM 层面 enable 是**独立 RTT 反应式延迟**问题（observeWithDeps liveQuery 异步 emit 与 Vue computed 重新评估之间的窗口）—— 2026-05-04 Bug 5 Round 3 修复后实测验证：临时给本 spec 加 `await expect.poll(sendBtn DOM enabled within 5s).toBe('enabled')` 探测，realtime-ws + providers-rest 双红（仍 disabled）→ 证明与 Bug 5 send-pipeline race fix 无直接关联，留待后续 reactivity-glue 调研。
 
 ---
 
@@ -100,8 +100,40 @@
 
 ## Bug 5：消息发送后进度条空转，根本没向 LLM 提供商发请求
 
-- **状态**: ❌ 未修复
+- **状态**: ✅ 已修复
 - **现象**：刷新页面、发送按钮恢复正常之后，输入消息点发送，UI 上出现"正在加载"的进度条；但打开浏览器开发者工具的 Network 面板，**根本没有任何指向 API 提供商的网络请求**。
 - **结果**：进度条无限转，不会出回答；再次刷新页面也无效（请求始终没发出去）。
 - **影响**：核心对话功能完全不可用。
 - **关联（Round 1 测试期发现）**: Bug 1 修复后看到一个相邻症状 — DialogView 的 `inputMessageContent` 在 typed text 写进 IDB 之后，computed 没有立即 re-evaluate 出新值（liveData.messages 反应式更新延迟），导致发送按钮 DOM 仍 disabled。这一并入 Bug 5 的"send pipeline 反应式问题"调查范围，由 Round 2 单独诊断。
+
+### 修复记录
+- **日期**: 2026-05-04
+- **根因（双段）**:
+  1. **PrematureCommitError 路径（Round 2）**: DialogView 内 6 处 + create-dialog / workspace-actions / plugins / DialogList 内共 13 处 `runTx(['dialogs','messages',...], async () => {...})` 把 server-routed 表的写入包进 Dexie transaction。server-routed 仓库的每个写入内部 `await http.put(...)` —— Dexie transaction 一旦 await 一个非 Dexie promise 就自动 commit / abort 并在下一个 op 抛 `PrematureCommitError`。`stream()` 内 2× `appendMessage`（assistant + 新 inputing user）就在这个 runTx 里 → 第二次 appendMessage 抛 → `stream()` 抛 → outer `send()` 没 try/catch → unhandled rejection → `streamText(params)` 永远到不了 → mock LLM 0 hit → 进度条空转。
+  2. **watcher fire-and-forget race 路径（Round 3，realtime-ws profile only）**: 拆 runTx 后裸露一个 pre-existing race。`appendMessage` 的第 1 次 `await repos.messages.add(...)` → cache.put → `liveData.messages.length` 变化 → DialogView 的 `watch([() => liveData.value.messages.length, ...])` fire → `updateChain` 内 `repos.dialogs.update(...)` **不 await**（fire-and-forget）用 cache 中**旧**的 dialog 重新 PUT 一份。同时 `appendMessage` 自己的 `await repos.dialogs.update(...)` 也在 fly。两个并发 PUT 到 server，server LWW 后到的赢；watcher 的版本 LACKS 第 1 次新加的 `msgTree[id]` 键（因为 watcher 用 cache.get 时的快照）→ ws push 把 LWW winner 推回 cache → cache.dialog.msgTree 失去 id 键。第 2 次 `appendMessage` 内 `[...d.msgTree[target], mt]` → spread of undefined → 抛 `TypeError: Xt is not iterable` → `stream()` 抛 → 同样 streamText 0 hit。realtime-ws 5/5 复现 / providers-rest 0/5（无 ws push 重写）。
+- **核心改动**:
+  - **Round 2（13 处 runTx 拆解 → sequential await）**:
+    - `src/views/DialogView.vue:593+ / 634+ / 662+ / 916+ / 987+ / 1182+`：6 处函数（edit / deleteBranch / appendMessage 调用点 / 其他）的 runTx 拆为 sequential `await`，注释挂 `Bug 5 fix — sequential awaits, not a Dexie transaction`
+    - `src/composables/create-dialog.ts`：`runTx` 拆解（创建 dialog + 创建 inputing message + dialog update msgTree 的三步顺序 await）
+    - `src/composables/workspace-actions.ts`：workspace 删除 cascade 的 runTx 拆解
+    - `src/stores/plugins.ts`：plugin 安装 / 卸载 / 修改的 runTx 拆解
+    - `src/components/DialogList.vue`：dialog 删除 / 重命名的 runTx 拆解
+  - **Round 3（DialogView race fix）**:
+    - `src/views/DialogView.vue:1166`：新增 `const streamActive = ref(false)` sentinel
+    - `src/views/DialogView.vue:1167-1408`：`stream()` 函数体外层包 `try { ... } finally { streamActive.value = false }`，stream 启动顶部置 `streamActive.value = true`
+    - `src/views/DialogView.vue:544 / 575`：`updateChain` 与 `watch handler` 改 `async`
+    - `src/views/DialogView.vue:564`：`updateChain` 顶部 `if (streamActive.value) return` noop guard
+    - `src/views/DialogView.vue:573`：watcher PUT 路径 `await repos.dialogs.update(...)`（不再 fire-and-forget）
+- **判据映射**:
+  - bug5 spec 在 `realtime-ws` profile 5 次重复跑 5/5 绿（mock LLM hit ≥ 1 + assistant message 收敛 status='default' + 无 PrematureCommitError + 无 `TypeError ... is not iterable`） → spec: `tests/e2e/bugs/bug5-message-send-actually-fires-llm-request.spec.ts::bug5 [realtime-ws] login → input → send → LLM endpoint hit + progress finishes + assistant message rendered`
+  - bug5 spec 在 `providers-rest` profile 5 次重复跑 5/5 绿（同上） → spec: `tests/e2e/bugs/bug5-message-send-actually-fires-llm-request.spec.ts::bug5 [providers-rest] login → input → send → LLM endpoint hit + progress finishes + assistant message rendered`
+  - 现有 Bug 1-4 spec 全 2/2 绿无 regression（providers-rest 44 passed + realtime-ws 47 passed e2e 全集 + 290 pytest 全集）
+- **故障注入红测（双轴）**:
+  - **A. 主 race 复现（验 Round 3）**: 注释 `src/views/DialogView.vue:564` 的 `if (streamActive.value) return` → `rm -rf tests/.builds/realtime-ws` → bug5 spec realtime-ws 红 ✅（`TypeError: kn is not iterable` + mock LLM hit=0 + `allFakeRequests=[]`）→ 恢复 → 绿 ✅
+  - **B. PrematureCommit 复现（验 Round 2）**: 把 `stream()` 内 2× appendMessage 用 `await runTx(['dialogs','messages'], async () => {...})` 包回去（同时 `import { runTx } from 'src/data'`）→ `rm -rf tests/.builds/providers-rest` → bug5 spec providers-rest 红 ✅（mock LLM hit=0 + `allFakeRequests=[]` + 单字符 `[error] F` —— PrematureCommitError 在 minified bundle 下打印被截断，spec sentinel 用 hit count 不依赖字符串）→ 恢复 → 绿 ✅
+- **关联 bug 顺带消除验证**:
+  - **Bug 1 已知遗留（DOM send button enabled）**: 临时给 bug1 spec 末尾加 `await expect.poll(sendBtn enabled within 5s).toBe('enabled')` 探测 → realtime-ws + providers-rest 双红（"Received: disabled"）→ 证明 Bug 1 已知遗留是**独立 RTT 反应式延迟**问题（observeWithDeps liveQuery 异步 emit 与 Vue computed 重新评估之间的窗口），与 Bug 5 Round 3 race fix 无直接关联。Bug 1 spec 维持原样不升级 DOM 断言（保留 IDB roundtrip 作为 Bug 1 修复信号），Bug 1 段「已知遗留」描述同步更新（已删去"由 Round 2 单独跟进"措辞，改为"独立 RTT 问题，留待后续观察"）。
+- **修复 commit**: `fix(dialog-tx): 拆掉 server-routed dialogs/messages 的 runTx 包装并修 stream 期间的 dialog write race`
+- **已知遗留**:
+  - Bug 1 已知遗留（DOM enabled 反应式延迟）独立未消除，留待后续 reactivity-glue 调研
+  - bug5 spec 跑过程中观察到一次 `[page-error] TypeError: Cannot read properties of null (reading 'specificationVersion')` —— 从 ai SDK provider 解析路径出（minified `h1 → jb → Ce`），不影响 mock hit + assistant message 收敛，spec 不 fail，记录待观察（疑与 streamFlush 收尾 / 同 tab 第二次 send 的某个 stale provider ref 有关）

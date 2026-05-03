@@ -302,15 +302,20 @@ test.describe('bug1 send button enabled after login', () => {
         // updateInputText is a no-op, and IDB row.text stays ''.
         //
         // We do NOT also assert send button DOM enabled here because
-        // there's a known downstream issue (Bug 5 — `liveData.messages`
-        // reactivity stops propagating to the inputMessageContent
-        // computed after the same-tab post-fill update; see Bug 5 in
-        // bugs.md). That's out of scope for this round and would mask
-        // the otherwise-clean Bug 1 fix signal.
+        // there's a known independent reactivity-delay surface — the
+        // `liveData.messages` observable from observeWithDeps emits async
+        // after the underlying Dexie write, so even when IDB has the typed
+        // text the Vue computed `inputMessageContent` may not have re-
+        // evaluated yet when this spec inspects the DOM. Bug 5 Round 3
+        // fix (streamActive guard + watcher PUT await) was probed against
+        // this DOM assertion and confirmed independent (still disabled
+        // after 5s post-fill). Tracked as Bug 1 已知遗留 (independent RTT
+        // problem). The IDB roundtrip above is the canonical proof that
+        // Bug 1's send-pipeline data hydration is fixed.
         console.log(
           `[bug1] hydrated in ${hydrateMs}ms; IDB roundtrip via updateInputText confirms ` +
           `chain.at(-1) resolved (proves Bug 1 fix). Send-button DOM enabled ` +
-          `is a Bug 5 follow-up.`
+          `is an independent RTT surface (Bug 1 已知遗留, not transitively cured by Bug 5 Round 3).`
         )
       } finally {
         await ctx.close()

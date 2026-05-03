@@ -6,7 +6,6 @@ import PickAvatarDialog from 'src/components/PickAvatarDialog.vue'
 import SelectWorkspaceDialog from 'src/components/SelectWorkspaceDialog.vue'
 import { genId } from 'src/utils/functions'
 import { useAssistantsStore } from 'src/stores/assistants'
-import { runTx } from 'src/data'
 import { useI18n } from 'vue-i18n'
 
 export function useWorkspaceActions() {
@@ -29,10 +28,17 @@ export function useWorkspaceActions() {
     }).onOk(name => {
       const workspaceId = genId()
       const assistantId = genId()
-      runTx(['workspaces', 'assistants'], async () => {
+      // Bug 5 fix — sequential awaits, not a Dexie transaction.
+      // workspaces / assistants are server-routed (Stage 4 / 批次-3b /
+      // 批次-4a). Each store call awaits `http.put` internally, which
+      // would trigger PrematureCommitError inside `runTx`. Worst case
+      // after a mid-flight failure: workspace exists without its default
+      // assistant — visible to the user as a workspace with no preset
+      // assistant, recoverable by re-add.
+      void (async () => {
         await workspacesStore.addWorkspace({ id: workspaceId, name: name.trim(), parentId, defaultAssistantId: assistantId })
         await assistantsStore.add({ id: assistantId, name: t('workspace.defaultAssistant'), workspaceId })
-      })
+      })()
     })
   }
   function addFolder(parentId = '$root') {

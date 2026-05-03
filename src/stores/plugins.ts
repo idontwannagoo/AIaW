@@ -1,7 +1,7 @@
 import { LobeChatPluginManifest } from '@lobehub/chat-plugin-sdk'
 import { defineStore } from 'pinia'
 import { persistentReactive } from 'src/composables/persistent-reactive'
-import { repos, runTx } from 'src/data'
+import { repos } from 'src/data'
 import { GradioPluginManifest, HuggingPluginManifest, InstalledPlugin, McpPluginManifest, PluginsData } from 'src/utils/types'
 import { buildLobePlugin, timePlugin, defaultData, whisperPlugin, videoTranscriptPlugin, buildGradioPlugin, calculatorPlugin, huggingToGradio, fluxPlugin, lobeDefaultData, gradioDefaultData, emotionsPlugin, mermaidPlugin, mcpDefaultData, dumpMcpPlugin, buildMcpPlugin } from 'src/utils/plugins'
 import { computed } from 'vue'
@@ -34,34 +34,36 @@ export const usePluginsStore = defineStore('plugins', () => {
     })
   ])
 
+  // Bug 5 fix — sequential awaits, not a Dexie transaction.
+  // installedPlugins / reactives / assistants are all server-routed
+  // (BACKEND_DATA_TABLES). Each repo write awaits `http.put` internally;
+  // wrapping in `runTx` causes Dexie to PrematureCommitError on the next
+  // operation. Worst case after a mid-flight failure: plugin row written
+  // without its default `#plugins-data` entry — recoverable by re-install.
   async function installLobePlugin(manifest: LobeChatPluginManifest) {
-    await runTx(['installedPluginsV2', 'reactives'], async () => {
-      const id = `lobe-${manifest.identifier}`
-      await repos.installedPlugins.put({
-        id,
-        key: genId(),
-        type: 'lobechat',
-        available: true,
-        manifest
-      } as InstalledPlugin)
-      await repos.reactives.update('#plugins-data', {
-        [`value.${id}`]: lobeDefaultData(manifest)
-      })
+    const id = `lobe-${manifest.identifier}`
+    await repos.installedPlugins.put({
+      id,
+      key: genId(),
+      type: 'lobechat',
+      available: true,
+      manifest
+    } as InstalledPlugin)
+    await repos.reactives.update('#plugins-data', {
+      [`value.${id}`]: lobeDefaultData(manifest)
     })
   }
 
   async function installGradioPlugin(manifest: GradioPluginManifest) {
-    await runTx(['installedPluginsV2', 'reactives'], async () => {
-      await repos.installedPlugins.put({
-        id: manifest.id,
-        key: genId(),
-        type: 'gradio',
-        available: true,
-        manifest
-      } as InstalledPlugin)
-      await repos.reactives.update('#plugins-data', {
-        [`value.${manifest.id}`]: gradioDefaultData(manifest)
-      })
+    await repos.installedPlugins.put({
+      id: manifest.id,
+      key: genId(),
+      type: 'gradio',
+      available: true,
+      manifest
+    } as InstalledPlugin)
+    await repos.reactives.update('#plugins-data', {
+      [`value.${manifest.id}`]: gradioDefaultData(manifest)
     })
   }
 
@@ -73,30 +75,26 @@ export const usePluginsStore = defineStore('plugins', () => {
   async function installMcpPlugin(manifest: McpPluginManifest) {
     if (manifest.transport.type === 'stdio' && !IsTauri) throw new Error(t('stores.plugins.stdioRequireDesktop'))
     const dump = await dumpMcpPlugin(manifest)
-    await runTx(['installedPluginsV2', 'reactives'], async () => {
-      const plugin = await repos.installedPlugins.findFirst({ where: { id: manifest.id } })
-      if (plugin) {
-        await repos.installedPlugins.update(plugin.key, { type: 'mcp', available: true, manifest: dump })
-      } else {
-        await repos.installedPlugins.add({
-          id: manifest.id,
-          key: genId(),
-          type: 'mcp',
-          available: true,
-          manifest: dump
-        } as InstalledPlugin)
-      }
-      await repos.reactives.update('#plugins-data', {
-        [`value.${manifest.id}`]: mcpDefaultData(manifest)
-      })
+    const plugin = await repos.installedPlugins.findFirst({ where: { id: manifest.id } })
+    if (plugin) {
+      await repos.installedPlugins.update(plugin.key, { type: 'mcp', available: true, manifest: dump })
+    } else {
+      await repos.installedPlugins.add({
+        id: manifest.id,
+        key: genId(),
+        type: 'mcp',
+        available: true,
+        manifest: dump
+      } as InstalledPlugin)
+    }
+    await repos.reactives.update('#plugins-data', {
+      [`value.${manifest.id}`]: mcpDefaultData(manifest)
     })
   }
 
   async function uninstall(id) {
-    await runTx(['installedPluginsV2', 'assistants'], async () => {
-      await repos.installedPlugins.modifyWhere({ where: { id } }, { available: false })
-      await repos.assistants.modifyAll(a => !!a.plugins[id], { [`plugins.${id}`]: undefined })
-    })
+    await repos.installedPlugins.modifyWhere({ where: { id } }, { available: false })
+    await repos.assistants.modifyAll(a => !!a.plugins[id], { [`plugins.${id}`]: undefined })
   }
 
   return {
