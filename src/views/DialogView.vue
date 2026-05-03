@@ -432,7 +432,7 @@ import { repos, runTx, observeWithDeps } from 'src/data'
 import { almostEqual, displayLength, genId, inputValueEmpty, isPlatformEnabled, isTextFile, JSONEqual, mimeTypeMatch, pageFhStyle, textBeginning, wrapCode, wrapQuote } from 'src/utils/functions'
 import { useAssistantsStore } from 'src/stores/assistants'
 import { streamText, generateText, tool, jsonSchema, StreamTextResult, GenerateTextResult, ModelMessage, stepCountIs } from 'ai'
-import { copyToClipboard, throttle, useQuasar } from 'quasar'
+import { copyToClipboard, useQuasar } from 'quasar'
 import AssistantItem from 'src/components/AssistantItem.vue'
 import { DialogContent, ExtractArtifactPrompt, ExtractArtifactResult, GenDialogTitle, NameArtifactPrompt, PluginsPrompt } from 'src/utils/templates'
 import sessions from 'src/utils/sessions'
@@ -447,6 +447,7 @@ import { useCallApi } from 'src/composables/call-api'
 import { until } from '@vueuse/core'
 import ViewCommonHeader from 'src/components/ViewCommonHeader.vue'
 import { syncRef } from 'src/composables/sync-ref'
+import { createMessageStreamFlush } from 'src/composables/message-stream-flush'
 import { useUserPerfsStore } from 'src/stores/user-perfs'
 import ModelItem from 'src/components/ModelItem.vue'
 import ParseFilesDialog from 'src/components/ParseFilesDialog.vue'
@@ -1136,7 +1137,45 @@ async function stream(target, insert = false) {
     })
   })
 
-  const update = throttle(() => repos.messages.update(id, { contents }), 50)
+  // Stage 4 / 批次-4e — streaming PUT throttle.
+  //
+  // Replaces the legacy 50ms quasar `throttle(() => repos.messages.update(...))`.
+  // For server-routed messages each PUT fans out through PG + the broker
+  // queue, so a long assistant reply at 10–30Hz token cadence would blow
+  // the per-event queue. We batch via a 200ms window / 1KB / sentence-
+  // boundary triple-trigger; non-streaming PUTs (status / usage / error
+  // finalize after the loop) bypass the flusher entirely so they remain
+  // synchronous from the caller's perspective. See `composables/message-
+  // stream-flush.ts` for the trigger semantics.
+  //
+  // The flusher PUTs the full current message envelope on each flush; the
+  // wire protocol has no notion of partial deltas. The IDB cache write is
+  // performed inside `repos.messages.update` so cross-tab subscribers see
+  // a consistent post-flush snapshot.
+  const streamFlush = createMessageStreamFlush<{ contents: MessageContent[] }>({
+    flush: async ({ contents }) => {
+      await repos.messages.update(id, { contents })
+    },
+    // Sentence-boundary trigger keys off the cumulative assistant text so
+    // a flush lands at human-perceivable phrase ends (better cross-tab UX
+    // than time-window-only flushing for short replies).
+    boundaryTextOf: ({ contents }) => {
+      // The assistant text we care about is `messageContent.text` (the
+      // first content in the array, kept stable across the streaming
+      // loop). Tail of last 4 chars is enough for the regex.
+      const ac = contents.find(c => c.type === 'assistant-message') as AssistantMessageContent | undefined
+      if (!ac?.text) return ''
+      return ac.text.slice(-4)
+    }
+  })
+  // Synchronous shim: callers (callTool / text-delta loop) treat this as
+  // a fire-and-forget signal "contents has changed; please flush soon".
+  // chunkText is the delta text in this tick (used to bump the byte
+  // counter for the threshold trigger); pass undefined for non-text
+  // events (tool status updates) — those still flush via time window.
+  function update(chunkText?: string): void {
+    streamFlush.enqueue({ contents }, { chunkBytes: chunkText?.length ?? 0 })
+  }
   async function callTool(plugin: Plugin, api: PluginApi, args) {
     const content: MessageContent = {
       type: 'assistant-tool',
@@ -1251,10 +1290,10 @@ async function stream(target, insert = false) {
       for await (const part of result.fullStream) {
         if (part.type === 'text-delta') {
           messageContent.text += part.text
-          update()
+          update(part.text)
         } else if (part.type === 'reasoning-delta') {
           messageContent.reasoning = (messageContent.reasoning ?? '') + part.text
-          update()
+          update(part.text)
         } else if (part.type === 'error') {
           throw part.error
         }
@@ -1267,6 +1306,12 @@ async function stream(target, insert = false) {
 
     const usage = await result.usage
     const warnings = (await result.warnings).map(w => (w.type === 'unsupported-setting' || w.type === 'unsupported-tool') ? w.details : w.message)
+    // Drain the streaming flusher BEFORE the finalize PUT so the latest
+    // `contents` snapshot reaches the server / cross-tab subscribers in
+    // a deterministic order: …delta… → final flush → finalize PUT.
+    // Without this, the finalize PUT can race a still-pending batched
+    // PUT and leave the subscriber's last seen rev with stale contents.
+    await streamFlush.stop()
     await repos.messages.update(id, { contents, status: 'default', generatingSession: null, warnings, usage })
   } catch (e) {
     console.error(e)
@@ -1278,6 +1323,8 @@ async function stream(target, insert = false) {
         actions: [{ label: t('dialogView.recharge'), color: 'on-sur', handler() { router.push('/account') } }]
       })
     }
+    // Same drain-before-finalize discipline as the success branch.
+    await streamFlush.stop()
     await repos.messages.update(id, { contents, error: e.message || e.toString(), status: 'failed', generatingSession: null })
   }
   perfs.artifactsAutoExtract && autoExtractArtifact()

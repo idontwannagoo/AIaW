@@ -306,6 +306,50 @@ export async function deleteItem(
   return backendClient(token).del(`/api/v1/items/${id}`)
 }
 
+// Stage 4 / 批次-4e — messages endpoint (id-PK; data carries the full
+// Message row, dialog_id is server-side promoted to its own column + FK
+// to dialogs. `data.contents`, when JSON-serialized to <64KB, rides
+// inline; over the threshold the entire envelope spills its `contents`
+// into `data.contentsBlob: AttachmentEnvelope` ref — see
+// messages.server.ts. The list endpoint REQUIRES `?dialogId=` (returns
+// 422 otherwise), so the helper signature differs from items/artifacts.).
+export interface MessageRow {
+  id: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: Record<string, unknown> | null
+}
+
+export async function putMessage(
+  token: string,
+  id: string,
+  data: Record<string, unknown>
+): Promise<MessageRow> {
+  return backendClient(token).put(`/api/v1/messages/${id}`, data)
+}
+
+export async function listMessages(
+  token: string,
+  dialogId: string,
+  since = 0,
+  limit?: number
+): Promise<MessageRow[] | { rows: MessageRow[]; next_cursor: number | null }> {
+  const params = new URLSearchParams({
+    dialogId,
+    since: String(since)
+  })
+  if (limit !== undefined) params.set('limit', String(limit))
+  return backendClient(token).get(`/api/v1/messages?${params.toString()}`)
+}
+
+export async function deleteMessage(
+  token: string,
+  id: string
+): Promise<MessageRow> {
+  return backendClient(token).del(`/api/v1/messages/${id}`)
+}
+
 // Stage 4 / 批次-4d — artifacts endpoint (id-PK; data carries the full
 // Artifact row, workspace_id is server-side promoted to its own column +
 // FK to workspaces. `data.versions`, when JSON-serialized to <64KB,

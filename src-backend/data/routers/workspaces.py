@@ -12,15 +12,16 @@ frontend's stores/workspaces.ts still performs the same per-table sweep
 over Dexie tables that haven't migrated yet — the two are complementary,
 not duplicate, since each table lives in exactly one persistence layer.
 
-Cascade chain at 4d: workspace → dialogs → items + artifacts.
-- items are tombstoned based on the dialog ids that this workspace owned
-  (two-hop: workspace -> dialogs -> items via dialog_id).
+Cascade chain at 4e: workspace → dialogs → (items + messages) + artifacts.
+- items + messages are tombstoned based on the dialog ids that this
+  workspace owned (two-hop: workspace -> dialogs -> {items, messages} via
+  dialog_id).
 - artifacts hang directly off workspace_id (no dialog hop — the frontend
   `Artifact` type carries only `workspaceId`, no `dialogId`); they are
   tombstoned by the same `WHERE workspace_id = :ws` predicate.
-- All cascaded rows (dialogs + items + artifacts) share a single
-  `cascade_version` so clients treat them as one tombstone batch (per-row
-  LWW idempotency makes intra-batch ordering immaterial).
+- All cascaded rows (dialogs + items + artifacts + messages) share a
+  single `cascade_version` so clients treat them as one tombstone batch
+  (per-row LWW idempotency makes intra-batch ordering immaterial).
 """
 from typing import Any, Optional
 
@@ -37,6 +38,7 @@ from ..db import get_session
 from ..models.artifact import Artifact
 from ..models.dialog import Dialog
 from ..models.item import Item
+from ..models.message import Message
 from ..models.user import User
 from ..models.workspace import Workspace
 
@@ -137,6 +139,24 @@ def _artifact_event(a: Artifact) -> dict[str, Any]:
     }
 
 
+def _message_event(m: Message) -> dict[str, Any]:
+    deleted = m.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'messages',
+        'op': 'delete' if deleted else 'put',
+        'id': m.id,
+        'rev': m.version,
+        'row': None if deleted else {
+            'id': m.id,
+            'version': m.version,
+            'updated_at': m.updated_at.isoformat(),
+            'deleted': False,
+            'data': m.data,
+        },
+    }
+
+
 @router.get('', response_model=list[WorkspaceRow])
 async def list_workspaces(
     since: int = 0,
@@ -217,6 +237,7 @@ async def delete_workspace(
     cascaded_dialogs: list[Dialog] = []
     cascaded_items: list[Item] = []
     cascaded_artifacts: list[Artifact] = []
+    cascaded_messages: list[Message] = []
     if cascade:
         cascade_version = (await session.execute(
             text("SELECT nextval('global_change_seq')")
@@ -253,6 +274,23 @@ async def delete_workspace(
             )
             cascaded_items = list(
                 (await session.execute(item_stmt)).scalars().all()
+            )
+            # 4e — same hop: messages belonging to those dialogs. Mirror
+            # of the items branch (FK shape and cascade semantics are
+            # identical — both hang off dialog_id). Same cascade_version
+            # so the cross-table batch is atomic on the wire.
+            msg_stmt = (
+                update(Message)
+                .where(
+                    Message.dialog_id.in_(cascaded_dialog_ids),
+                    Message.user_id == user_id,
+                    Message.deleted_at.is_(None),
+                )
+                .values(version=cascade_version, deleted_at=text('now()'))
+                .returning(Message)
+            )
+            cascaded_messages = list(
+                (await session.execute(msg_stmt)).scalars().all()
             )
         # 4d — artifacts hang directly off workspace_id (no dialog hop —
         # the frontend `Artifact` type carries only `workspaceId`). Same
@@ -293,5 +331,7 @@ async def delete_workspace(
         await broker.publish(user_id, _item_event(it))
     for a in cascaded_artifacts:
         await broker.publish(user_id, _artifact_event(a))
+    for m in cascaded_messages:
+        await broker.publish(user_id, _message_event(m))
     await broker.publish(user_id, _to_event(row))
     return _to_row(row)

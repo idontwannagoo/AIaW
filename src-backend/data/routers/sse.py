@@ -44,6 +44,7 @@ from ..models.avatar_image import AvatarImage
 from ..models.dialog import Dialog
 from ..models.installed_plugin import InstalledPlugin
 from ..models.item import Item
+from ..models.message import Message
 from ..models.provider import Provider
 from ..models.reactive import Reactive
 from ..models.user import User
@@ -65,6 +66,7 @@ TABLE_MODELS = {
     'dialogs': Dialog,
     'items': Item,
     'artifacts': Artifact,
+    'messages': Message,
 }
 
 # SSE keepalives are comments; clients (including event-source-polyfill)
@@ -234,6 +236,24 @@ def _serialize_artifact(a: Artifact) -> dict[str, Any]:
     }
 
 
+def _serialize_message(m: Message) -> dict[str, Any]:
+    deleted = m.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'messages',
+        'op': 'delete' if deleted else 'put',
+        'id': m.id,
+        'rev': m.version,
+        'row': None if deleted else {
+            'id': m.id,
+            'version': m.version,
+            'updated_at': m.updated_at.isoformat(),
+            'deleted': False,
+            'data': m.data,
+        },
+    }
+
+
 SERIALIZERS = {
     'providers': _serialize_provider,
     'reactives': _serialize_reactive,
@@ -244,6 +264,7 @@ SERIALIZERS = {
     'dialogs': _serialize_dialog,
     'items': _serialize_item,
     'artifacts': _serialize_artifact,
+    'messages': _serialize_message,
 }
 
 

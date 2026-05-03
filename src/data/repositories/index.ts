@@ -15,6 +15,7 @@ import { serverWorkspacesRepository } from './workspaces.server'
 import { serverDialogsRepository } from './dialogs.server'
 import { serverItemsRepository } from './items.server'
 import { serverArtifactsRepository } from './artifacts.server'
+import { serverMessagesRepository } from './messages.server'
 import type { Repository } from '../types'
 
 const SERVER_CAPABLE_TABLES = new Set([
@@ -28,7 +29,8 @@ const SERVER_CAPABLE_TABLES = new Set([
   'workspaces',
   'dialogs',
   'items',
-  'artifacts'
+  'artifacts',
+  'messages'
 ])
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -52,7 +54,7 @@ const dexieArtifacts = createDexieRepository<Artifact, string>(t(() => db.artifa
 export const repos = {
   workspaces: routeToServer('workspaces') ? serverWorkspacesRepository : dexieWorkspaces,
   dialogs: routeToServer('dialogs') ? serverDialogsRepository : dexieDialogs,
-  messages: createDexieRepository<Message, string>(t(() => db.messages)) as Repository<Message, string>,
+  messages: routeToServer('messages') ? serverMessagesRepository : (createDexieRepository<Message, string>(t(() => db.messages)) as Repository<Message, string>),
   assistants: routeToServer('assistants') ? serverAssistantsRepository : dexieAssistants,
   artifacts: routeToServer('artifacts') ? serverArtifactsRepository : dexieArtifacts,
   installedPlugins: routeToServer('installedPlugins') ? serverInstalledPluginsRepository : dexieInstalledPlugins,

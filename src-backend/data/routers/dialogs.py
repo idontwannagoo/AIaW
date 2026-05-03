@@ -21,6 +21,7 @@ from realtime import broker
 from ..auth import current_user
 from ..db import get_session
 from ..models.dialog import Dialog
+from ..models.message import Message
 from ..models.user import User
 from ..models.workspace import Workspace
 from ..pagination import CursorPage, build_page, normalize_limit
@@ -182,12 +183,57 @@ async def upsert_dialog(
     return _to_row(row)
 
 
+def _message_event(m: Message) -> dict[str, Any]:
+    deleted = m.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'messages',
+        'op': 'delete' if deleted else 'put',
+        'id': m.id,
+        'rev': m.version,
+        'row': None if deleted else {
+            'id': m.id,
+            'version': m.version,
+            'updated_at': m.updated_at.isoformat(),
+            'deleted': False,
+            'data': m.data,
+        },
+    }
+
+
 @router.delete('/{dialog_id}', response_model=DialogRow)
 async def delete_dialog(
     dialog_id: str,
     user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ):
+    # Stage 4 / 批次-4e — application-level cascade: when a dialog is
+    # tombstoned, its messages must also be tombstoned in the same
+    # transaction so live tabs see a consistent batch (per-row LWW
+    # idempotency makes ordering inside the batch immaterial). items also
+    # FK to dialog_id but per 2026-05-03 plan modeling we tombstone items
+    # only via the workspace cascade path (the live UI never deletes a
+    # standalone dialog while keeping items around — items belong to a
+    # dialog, and the user-facing flow that calls dialog delete also wants
+    # those items gone). Symmetric with workspaces.delete_workspace's
+    # cascade chain.
+    cascade_version = (await session.execute(
+        text("SELECT nextval('global_change_seq')")
+    )).scalar_one()
+    msg_stmt = (
+        update(Message)
+        .where(
+            Message.dialog_id == dialog_id,
+            Message.user_id == user_id,
+            Message.deleted_at.is_(None),
+        )
+        .values(version=cascade_version, deleted_at=text('now()'))
+        .returning(Message)
+    )
+    cascaded_messages = list(
+        (await session.execute(msg_stmt)).scalars().all()
+    )
+
     next_version = (await session.execute(
         text("SELECT nextval('global_change_seq')")
     )).scalar_one()
@@ -201,5 +247,7 @@ async def delete_dialog(
     if row is None:
         raise HTTPException(status_code=404, detail='not found')
     await session.commit()
+    for m in cascaded_messages:
+        await broker.publish(user_id, _message_event(m))
     await broker.publish(user_id, _to_event(row))
     return _to_row(row)
