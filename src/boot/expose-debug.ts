@@ -1,8 +1,36 @@
 import { boot } from 'quasar/wrappers'
+import { effectScope, ref } from 'vue'
 import { db } from 'src/utils/db'
 import { authSource } from 'src/data/auth'
 import { repos } from 'src/data'
 import * as blobClient from 'src/data/blob-client'
+import { syncRef, type SyncRefOptions } from 'src/composables/sync-ref'
+
+// Test-only harness: wrap syncRef in an effectScope so onScopeDispose works
+// outside a Vue component. Returns hooks the spec can drive: source ref to
+// simulate server pushes, val ref to read the user-visible state, set spy
+// counter, and cleanup() to tear down.
+function syncRefHarness<T>(initialSource: T, options?: SyncRefOptions<T>) {
+  const scope = effectScope()
+  const source = ref(initialSource)
+  const setCalls: T[] = []
+  let val: { value: T } | undefined
+  scope.run(() => {
+    val = syncRef<T>(
+      () => source.value,
+      v => { setCalls.push(JSON.parse(JSON.stringify(v))) },
+      options
+    )
+  })
+  return {
+    get value() { return val!.value },
+    set value(v: T) { val!.value = v },
+    pushSource(v: T) { source.value = v },
+    setCalls,
+    setCallCount: () => setCalls.length,
+    cleanup: () => scope.stop()
+  }
+}
 
 declare global {
   interface Window {
@@ -10,6 +38,7 @@ declare global {
     __authSource__?: typeof authSource
     __repos__?: typeof repos
     __blobClient__?: typeof blobClient
+    __syncRefHarness__?: typeof syncRefHarness
     __exposeDebugReady__?: true
   }
 }
@@ -21,6 +50,7 @@ export default boot(() => {
   window.__authSource__ = authSource
   window.__repos__ = repos
   window.__blobClient__ = blobClient
+  window.__syncRefHarness__ = syncRefHarness
   window.__exposeDebugReady__ = true
-  console.warn('[expose-debug] window.__db__ / __authSource__ / __repos__ / __blobClient__ exposed — test/dev only')
+  console.warn('[expose-debug] window.__db__ / __authSource__ / __repos__ / __blobClient__ / __syncRefHarness__ exposed — test/dev only')
 })
