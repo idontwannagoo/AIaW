@@ -4,6 +4,7 @@ import { RealtimeTransport } from 'src/utils/config'
 import type { AvatarImage } from 'src/utils/types'
 import { http, HttpError } from '../http'
 import { realtime } from '../realtime'
+import { subscribeAuthChange } from '../auth-events'
 import type { QuerySpec, Repository } from '../types'
 import { createDexieRepository } from './dexie'
 
@@ -92,6 +93,16 @@ function ensureRealtimeSubscription(): void {
     })()
   })
 }
+
+// Bug 1/2/3/4 fix — see providers.server.ts for the rationale.
+subscribeAuthChange(() => {
+  if (realtimeUnsubscribe) {
+    try { realtimeUnsubscribe() } catch { /* ignore */ }
+    realtimeUnsubscribe = null
+  }
+  inflight = null
+  lastVersion = 0
+})
 
 async function pull(): Promise<void> {
   if (inflight) return inflight

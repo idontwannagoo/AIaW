@@ -287,4 +287,13 @@ async def bootstrap(
     # without bothering the backend; cross-account isolation is preserved
     # by `private` (no shared cache may store this).
     response.headers['Cache-Control'] = 'private, max-age=10'
+    # Bug 2 same-tab cross-account leak fix: `private` only blocks shared
+    # caches; the browser cache is keyed on URL (not the Authorization
+    # header) by default, so a logout-then-login-as-different-user inside
+    # the 10s window would otherwise serve account A's response to
+    # account B. `Vary: Authorization` forces the browser to treat
+    # responses with different bearers as distinct cache entries, killing
+    # the cross-account leak without disabling the cache for the common
+    # single-user remount case.
+    response.headers['Vary'] = 'Authorization'
     return base_payload

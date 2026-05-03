@@ -4,6 +4,7 @@ import { RealtimeTransport } from 'src/utils/config'
 import type { Dialog } from 'src/utils/types'
 import { http, HttpError } from '../http'
 import { realtime } from '../realtime'
+import { subscribeAuthChange } from '../auth-events'
 import type { QuerySpec, Repository } from '../types'
 import { createDexieRepository } from './dexie'
 import { createScopedPull, extractScopeId } from './scoped-pull'
@@ -90,6 +91,20 @@ function ensureRealtimeSubscription(): void {
     })()
   })
 }
+
+// Bug 1/2/3/4 fix — see providers.server.ts. dialogs additionally has
+// scoped-pull state (per-workspaceId cursors) that must be reset, otherwise
+// the next account's first observeFind({where:{workspaceId}}) treats the
+// previous user's scope cursor as cached and skips the pull.
+subscribeAuthChange(() => {
+  if (realtimeUnsubscribe) {
+    try { realtimeUnsubscribe() } catch { /* ignore */ }
+    realtimeUnsubscribe = null
+  }
+  inflight = null
+  lastVersion = 0
+  scopedPull.reset()
+})
 
 async function pull(): Promise<void> {
   if (inflight) return inflight

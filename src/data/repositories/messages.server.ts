@@ -4,6 +4,7 @@ import { RealtimeTransport } from 'src/utils/config'
 import type { Message, MessageContent } from 'src/utils/types'
 import { http, HttpError } from '../http'
 import { realtime } from '../realtime'
+import { subscribeAuthChange } from '../auth-events'
 import {
   serializeAttachment,
   materializeAttachment,
@@ -215,6 +216,18 @@ function ensureRealtimeSubscription(): void {
     })()
   })
 }
+
+// Bug 1/2/3/4 fix — messages has no full-table `inflight` (un-scoped pulls
+// 422 server-side), but it owns `lastVersion` + `realtimeUnsubscribe` +
+// per-dialogId scopedPull state, all of which must reset on auth flip.
+subscribeAuthChange(() => {
+  if (realtimeUnsubscribe) {
+    try { realtimeUnsubscribe() } catch { /* ignore */ }
+    realtimeUnsubscribe = null
+  }
+  lastVersion = 0
+  scopedPull.reset()
+})
 
 // Full-table pull is a no-go for messages — backend requires `?dialogId=`
 // (returns 422 otherwise) because un-scoped messages reads are too

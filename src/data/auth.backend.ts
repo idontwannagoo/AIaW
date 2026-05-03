@@ -1,6 +1,8 @@
 import { shallowRef, type ShallowRef } from 'vue'
 import { BackendApiBaseURL } from 'src/utils/config'
 import type { AuthSource, CloudUser, UserInteraction } from './types'
+import { emitAuthChange } from './auth-events'
+import { clearAllSyncedTables } from './local-cache'
 
 interface BackendUser {
   id: string
@@ -112,22 +114,45 @@ async function postJson<T>(path: string, body: unknown, withAuth = false): Promi
   return res.status === 204 ? (undefined as T) : await res.json()
 }
 
+function isLoggedInUser(u: CloudUser | null | undefined): boolean {
+  return !!u && u.isLoggedIn === true
+}
+
 function applyTokenPair(pair: TokenPair) {
+  // Bug 1/3/4 fix: emit 'login' only on the null/undefined → truthy
+  // transition. `applyTokenPair` is also called by `runRefresh` while the
+  // user is already logged in (silent token rotation); that path must NOT
+  // emit so we don't spuriously re-bootstrap and reset module cursors
+  // every 29min.
+  const wasLoggedIn = isLoggedInUser(userRef.value)
   accessToken = pair.access_token
   refreshToken = pair.refresh_token
   persistRefresh(refreshToken)
   persistUser(pair.user)
   userRef.value = toCloudUser(pair.user, accessToken)
   scheduleRefresh()
+  if (!wasLoggedIn) {
+    emitAuthChange('login')
+  }
 }
 
 function clearAuth() {
+  // Bug 2 fix: emit 'logout' BEFORE wiping in-memory state so any sync
+  // listener can read userRef one last time if it needs to (currently no
+  // listener does, but the contract is more robust this way). We also
+  // capture the prior login state to suppress redundant emits — boot()'s
+  // "no stored user" cold path calls clearAuth() and we don't want a
+  // 'logout' fired when nobody was logged in to begin with.
+  const wasLoggedIn = isLoggedInUser(userRef.value)
   accessToken = null
   refreshToken = null
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null }
   persistRefresh(null)
   persistUser(null)
   userRef.value = null
+  if (wasLoggedIn) {
+    emitAuthChange('logout')
+  }
 }
 
 async function runRefresh(): Promise<void> {
@@ -214,6 +239,32 @@ export const backendAuthSource: AuthSource = {
     if (!enabled) return
     if (refreshToken) {
       try { await postJson<void>('/api/v1/auth/logout', { refresh_token: refreshToken }) } catch { /* best effort; revoke locally regardless */ }
+    }
+    // Bug 2 fix — three-step ordered teardown:
+    //   1. emit 'logout' first so each `<table>.server.ts` listener
+    //      synchronously unsubscribes its realtime channel + zeros out
+    //      `lastVersion` / scoped cursors. This closes the window where
+    //      a late-arriving WS event could write into IDB right after
+    //      we wipe it in step 2.
+    //   2. await `clearAllSyncedTables()` to wipe all 10 server-routed
+    //      Dexie tables in a single rw transaction. liveQuery fires
+    //      empty arrays to subscribed stores so the UI flips to "no
+    //      data" before the user is shown a non-auth page.
+    //   3. `clearAuth()` clears in-memory token + persisted localStorage
+    //      keys + sessionStorage bootstrap flag (via the listener
+    //      registered in `router/index.ts`). It re-emits 'logout' but
+    //      the listeners are idempotent (resetting `lastVersion=0`,
+    //      already-null `realtimeUnsubscribe`, etc) so the second pass
+    //      is a no-op.
+    //
+    // Best-effort wrapping on the IDB step: even if Dexie is in a bad
+    // state we still want the auth side to clear, otherwise the user
+    // is stuck "kind of logged out".
+    emitAuthChange('logout')
+    try {
+      await clearAllSyncedTables()
+    } catch (err) {
+      console.warn('[auth.backend] clearAllSyncedTables failed', err)
     }
     clearAuth()
   },

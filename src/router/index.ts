@@ -9,6 +9,7 @@ import { authSource } from 'src/data/auth'
 import { BackendApiBaseURL } from 'src/utils/config'
 import { fetchBootstrap } from 'src/data/bootstrap-client'
 import { applyBootstrap } from 'src/data/bootstrap-apply'
+import { subscribeAuthChange } from 'src/data/auth-events'
 
 /*
  * If not building with SSR mode, you can
@@ -134,5 +135,60 @@ export function _resetBootstrapForTests(): void {
   } catch { /* ignore */ }
   bootstrapInflight = null
 }
+
+// Bug 1/3/4 fix: invoked after a fresh login (auth-events 'login') to
+// force a bootstrap pass even though the route already resolved before
+// the user was authenticated. Procedure:
+//   1. await any inflight bootstrap (defensive — logout's reset usually
+//      already left it null, but a misbehaving listener that double-
+//      logged-in could race)
+//   2. clear the once-per-session sentinel + inflight slot so the next
+//      runBootstrapOnce really does a fresh pass instead of short-
+//      circuiting on the prior tab's flag
+//   3. await runBootstrapOnce (errors / timeouts are absorbed by it
+//      via the same fallback path the router guard uses)
+//
+// Failure mode: if the backend / network is down, runBootstrapOnce sets
+// the FALLBACK_FLAG_KEY and the per-table progressive load takes over —
+// same recovery posture as the cold-tab path. The user sees the banner
+// instead of a hard error.
+export async function triggerBootstrapNow(): Promise<void> {
+  if (!BackendApiBaseURL) return
+  if (!authSource.enabled) return
+  if (!authSource.user.value) return
+  if (bootstrapInflight) {
+    try { await bootstrapInflight } catch { /* swallow — fresh attempt below */ }
+  }
+  try {
+    sessionStorage.removeItem(SESSION_FLAG_KEY)
+    sessionStorage.removeItem(FALLBACK_FLAG_KEY)
+  } catch { /* ignore */ }
+  bootstrapInflight = null
+  await runBootstrapOnce()
+}
+
+// Bug 1/2/3/4 fix: react to auth state flips outside the per-navigation
+// guard. On 'login' a tab that's already settled on a route (the dialog
+// opened above the existing layout) needs to be told to bootstrap now —
+// the next route change might never come. On 'logout' we drop the
+// sentinel so the next login (potentially a different account in the
+// same tab) doesn't see a stale "already attempted" flag and skip its
+// own bootstrap.
+subscribeAuthChange((reason) => {
+  if (reason === 'login') {
+    // Fire-and-forget — the dialog success callback shouldn't block on
+    // the network. If bootstrap takes its full 2s timeout the UI just
+    // hydrates progressively from per-table pulls in the meantime.
+    void triggerBootstrapNow().catch((err) => {
+      console.warn('[router] bootstrap on login failed', err)
+    })
+  } else if (reason === 'logout') {
+    try {
+      sessionStorage.removeItem(SESSION_FLAG_KEY)
+      sessionStorage.removeItem(FALLBACK_FLAG_KEY)
+    } catch { /* ignore */ }
+    bootstrapInflight = null
+  }
+})
 
 export default router

@@ -4,6 +4,7 @@ import { RealtimeTransport } from 'src/utils/config'
 import type { Artifact, ArtifactVersion } from 'src/utils/types'
 import { http, HttpError } from '../http'
 import { realtime } from '../realtime'
+import { subscribeAuthChange } from '../auth-events'
 import {
   serializeAttachment,
   materializeAttachment,
@@ -211,6 +212,17 @@ function ensureRealtimeSubscription(): void {
     })()
   })
 }
+
+// Bug 1/2/3/4 fix — same pattern as dialogs.server.ts (full + scoped reset).
+subscribeAuthChange(() => {
+  if (realtimeUnsubscribe) {
+    try { realtimeUnsubscribe() } catch { /* ignore */ }
+    realtimeUnsubscribe = null
+  }
+  inflight = null
+  lastVersion = 0
+  scopedPull.reset()
+})
 
 async function pull(): Promise<void> {
   if (inflight) return inflight
