@@ -20,6 +20,11 @@ export default configure((ctx) => {
       'unocss',
       'global-components',
       'backend-auth',
+      // Stage 4.5 / Step 7: wire the global active-ImportJob watcher at
+      // startup so a fresh-tab login picks up an in-progress import (started
+      // from another device / tab) without waiting for navigation to a page
+      // that uses the composable. No-ops when BACKEND_DATA_API_URL is empty.
+      'import-job',
       // Test-only debug surface: exposes window.__db__ / __authSource__ for e2e.
       // Always listed; the boot body itself no-ops unless EXPOSE_DB === 'true'
       // at build time (vite inlines process.env.EXPOSE_DB so the early-return

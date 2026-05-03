@@ -43,8 +43,9 @@ export E2E_BUILD_DIR_REALTIME_WS="$(build_profile realtime-ws)"
 export E2E_BUILD_DIR_REALTIME_SSE="$(build_profile realtime-sse)"
 export E2E_BUILD_DIR_REALTIME_POLL="$(build_profile realtime-poll)"
 export E2E_BUILD_DIR_REALTIME_AUTO="$(build_profile realtime-auto)"
+export E2E_BUILD_DIR_IMPORT_JOB="$(build_profile import-job)"
 
-for var in E2E_BUILD_DIR_BASELINE E2E_BUILD_DIR_PROVIDERS_REST E2E_BUILD_DIR_REALTIME_WS E2E_BUILD_DIR_REALTIME_SSE E2E_BUILD_DIR_REALTIME_POLL E2E_BUILD_DIR_REALTIME_AUTO; do
+for var in E2E_BUILD_DIR_BASELINE E2E_BUILD_DIR_PROVIDERS_REST E2E_BUILD_DIR_REALTIME_WS E2E_BUILD_DIR_REALTIME_SSE E2E_BUILD_DIR_REALTIME_POLL E2E_BUILD_DIR_REALTIME_AUTO E2E_BUILD_DIR_IMPORT_JOB; do
   v="${!var}"
   if [ -z "$v" ] || [ ! -d "$v" ]; then
     echo "ERROR: $var=$v is not a valid build dir" >&2

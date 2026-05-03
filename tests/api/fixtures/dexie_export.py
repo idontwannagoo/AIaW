@@ -186,6 +186,50 @@ def make_small_export() -> dict[str, Any]:
     )
 
 
+def make_medium_export(
+    *,
+    messages: int = 5,
+    attachment_size_mb: int = 1,
+) -> bytes:
+    """1 workspace + 1 dialog + N messages each with `attachment_size_mb`-MB
+    attachment, returned as raw dexie-export-import bytes ready for BlobStore
+    upload.
+
+    Sized for Stage 4.5 / Step 7 `test_phase_d_complete_makes_attachment_renderable`:
+    we want enough rows to produce real Phase B/C/D progress events and at
+    least one `≥ 64KB` attachment so Phase D actually exercises the BlobStore
+    upload path. Default 5 × 1MB = ~5-7MB total payload (1.33x base64 overhead),
+    which fits comfortably in two 5MB multipart parts.
+
+    Returned as bytes (not Iterator[bytes]) because medium fixtures are small
+    enough to materialize once and keep around for the test duration. Callers
+    that want streaming should use `iter_huge_export_bytes` instead.
+    """
+    ws = _workspace_row(0)
+    dlg = _dialog_row(0, ws['id'])
+    bytes_per_attachment = attachment_size_mb * 1024 * 1024
+
+    msg_rows: list[dict[str, Any]] = []
+    for i in range(messages):
+        # Distinct random bytes per attachment so dedupe doesn't collapse to
+        # one — Phase D test wants to verify each attachment is independently
+        # uploaded + assignable, and dedupe logic is its own test.
+        raw = os.urandom(bytes_per_attachment)
+        b64 = base64.b64encode(raw).decode('ascii')
+        msg_rows.append(_message_row(i, dlg['id'], attachment_b64=b64))
+
+    export = _envelope(
+        [
+            {'tableName': 'workspaces', 'rows': [ws]},
+            {'tableName': 'dialogs', 'rows': [dlg]},
+            {'tableName': 'messages', 'rows': msg_rows},
+        ]
+    )
+    # Single allocation is fine here — even at 5 × 1MB the JSON string is
+    # ~7MB which is small relative to pytest worker RSS budget.
+    return json.dumps(export, separators=(',', ':')).encode('utf-8')
+
+
 # Huge fixture knobs — exposed so tests can override for faster runs without
 # editing this module. Defaults aim for ~200MB.
 HUGE_MESSAGE_COUNT = int(os.environ.get('IMPORT_HUGE_MESSAGES', '10000'))

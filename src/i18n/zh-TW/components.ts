@@ -106,14 +106,21 @@ export default {
   },
   importDataDialog: {
     title: '導入使用者資料',
+    description: '上傳從舊版匯出的 aiaw_user_db.json。檔案會分片上傳到伺服端處理，處理過程中可關閉瀏覽器。',
     fileLabel: '資料檔案',
-    overwrite: '覆蓋已有資料',
-    force: '強制寫入',
-    clear: '導入前清空現有資料',
     cancel: '取消',
-    import: '導入',
-    importSuccess: '導入成功',
-    importFailed: '導入失敗：{message}'
+    import: '開始導入',
+    creating: '正在建立任務...',
+    completing: '上傳完成，正在彙整分片...',
+    phaseCreating: '準備',
+    phaseUploading: '上傳中',
+    phaseCompleting: '收尾',
+    uploadStats: '已上傳 {uploaded} / {total}（剩餘約 {eta}）',
+    etaSeconds: '{s} 秒',
+    etaMinutes: '{m} 分 {s} 秒',
+    etaCalculating: '計算中...',
+    uploadDoneNotice: '上傳完成，伺服端正在背景導入。可關閉瀏覽器，狀態可在帳號頁面檢視。',
+    uploadFailed: '導入失敗：{message}'
   },
   exportDataDialog: {
     title: '導出使用者資料',

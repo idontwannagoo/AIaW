@@ -106,14 +106,21 @@ export default {
   },
   importDataDialog: {
     title: 'Import User Data',
+    description: 'Upload aiaw_user_db.json exported from the legacy version. The file is uploaded in chunks and processed server-side; you may close the browser while it runs.',
     fileLabel: 'Data File',
-    overwrite: 'Overwrite Existing Data',
-    force: 'Force Write',
-    clear: 'Clear Existing Data Before Import',
     cancel: 'Cancel',
-    import: 'Import',
-    importSuccess: 'Import success',
-    importFailed: 'Import failed: {message}'
+    import: 'Start Import',
+    creating: 'Creating job...',
+    completing: 'Upload complete, finalizing parts...',
+    phaseCreating: 'Preparing',
+    phaseUploading: 'Uploading',
+    phaseCompleting: 'Finalizing',
+    uploadStats: 'Uploaded {uploaded} / {total} (about {eta} remaining)',
+    etaSeconds: '{s} s',
+    etaMinutes: '{m} m {s} s',
+    etaCalculating: 'calculating...',
+    uploadDoneNotice: 'Upload finished. The server is processing in the background — you may close the browser; status is visible on the Account page.',
+    uploadFailed: 'Import failed: {message}'
   },
   exportDataDialog: {
     title: 'Export User Data',

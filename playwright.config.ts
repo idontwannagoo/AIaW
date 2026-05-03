@@ -39,7 +39,14 @@ const PROFILES: Profile[] = [
   { name: 'realtime-ws', port: 9009, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_WS') },
   { name: 'realtime-sse', port: 9012, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_SSE') },
   { name: 'realtime-poll', port: 9013, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_POLL') },
-  { name: 'realtime-auto', port: 9014, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_AUTO') }
+  { name: 'realtime-auto', port: 9014, buildDir: requireEnv('E2E_BUILD_DIR_REALTIME_AUTO') },
+  // Stage 4.5 / Step 7 — ImportJob multipart upload + Phase A-D end-to-end.
+  // Same flag set as realtime-ws but pinned to its own port so Step 7 specs
+  // can run in parallel with the rest of the matrix (workers=1 still
+  // serializes them across profiles, but giving the build a distinct dir
+  // means the cache slot is independent, so changing this profile's env
+  // doesn't bust realtime-ws's cache).
+  { name: 'import-job', port: 9015, buildDir: requireEnv('E2E_BUILD_DIR_IMPORT_JOB') }
 ]
 
 export default defineConfig({

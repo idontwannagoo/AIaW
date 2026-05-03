@@ -18,6 +18,107 @@
   </q-header>
   <q-page-container>
     <q-page :style-fn="pageFhStyle">
+      <q-card
+        v-if="user?.isLoggedIn && importJob"
+        max-w="1000px"
+        mx-a
+        my-4
+        flat
+        bordered
+        data-testid="import-status-card"
+      >
+        <q-card-section>
+          <div
+            class="text-h6"
+            data-testid="import-status-header"
+          >
+            {{ $t('accountPage.importStatusHeader') }}
+          </div>
+          <div
+            text-sm
+            mt-1
+            data-testid="import-status-phase"
+          >
+            {{ importPhaseLabel }}
+          </div>
+        </q-card-section>
+        <q-card-section py-0>
+          <q-linear-progress
+            v-if="importProgressFraction !== null"
+            :value="importProgressFraction"
+            size="md"
+            rounded
+            color="primary"
+          />
+          <q-linear-progress
+            v-else
+            indeterminate
+            size="md"
+            rounded
+            color="primary"
+          />
+          <div
+            text-xs
+            mt-2
+            text-on-sur-var
+          >
+            <div
+              v-if="importJob.total_rows"
+              data-testid="import-status-rows"
+            >
+              {{ $t('accountPage.importRowsProgress', {
+                processed: importJob.processed_rows,
+                total: importJob.total_rows
+              }) }}
+            </div>
+            <div
+              v-if="importJob.total_blobs"
+              data-testid="import-status-blobs"
+            >
+              {{ $t('accountPage.importBlobsProgress', {
+                processed: importJob.processed_blobs,
+                total: importJob.total_blobs
+              }) }}
+            </div>
+          </div>
+          <div
+            v-if="importJob.error_message"
+            mt-2
+            text-sm
+            text-err
+            data-testid="import-status-error"
+          >
+            {{ $t('accountPage.importErrorPrefix') }}{{ importJob.error_message }}
+          </div>
+          <div
+            mt-2
+            text-xs
+            text-on-sur-var
+            v-if="importIsActive"
+          >
+            {{ $t('accountPage.importBackgroundNotice') }}
+          </div>
+        </q-card-section>
+        <q-card-actions align="right">
+          <q-btn
+            v-if="importIsActive"
+            flat
+            color="negative"
+            :label="$t('accountPage.importCancelButton')"
+            :loading="cancelInflight"
+            data-testid="import-cancel-button"
+            @click="cancelActiveImport"
+          />
+          <q-btn
+            v-else
+            flat
+            color="primary"
+            :label="$t('accountPage.importDismissButton')"
+            data-testid="import-dismiss-button"
+            @click="dismissImportCard"
+          />
+        </q-card-actions>
+      </q-card>
       <q-list
         pb-2
         v-if="user?.isLoggedIn && !user.license"
@@ -251,6 +352,12 @@ import PayDialog from 'src/components/PayDialog.vue'
 import { useUserPerfsStore } from 'src/stores/user-perfs'
 import { localePrice, pageFhStyle } from 'src/utils/functions'
 import { useI18n } from 'vue-i18n'
+import {
+  useActiveImportJob,
+  clearActiveImportJob,
+  reloadActiveImportJob
+} from 'src/composables/import-job'
+import { cancelImport } from 'src/data/import-client'
 
 const { t } = useI18n()
 
@@ -342,4 +449,67 @@ const orderHistoryColumns = [
 ]
 
 const { perfs } = useUserPerfsStore()
+
+// Stage 4.5 / Step 7 — global active ImportJob banner. The composable
+// handles the realtime subscription + initial fetch on mount; we just bind
+// to the shared ref. Card auto-shows whenever the user has any non-null
+// active job (including terminal states until dismissed).
+const importJob = useActiveImportJob()
+const cancelInflight = ref(false)
+const ACTIVE_PHASES = new Set([
+  'queued', 'uploading', 'assembling', 'parsing', 'phase_b', 'phase_c', 'phase_d'
+])
+const importIsActive = computed(() => {
+  const j = importJob.value
+  return !!j && ACTIVE_PHASES.has(j.status)
+})
+const importPhaseLabel = computed(() => {
+  const j = importJob.value
+  if (!j) return ''
+  switch (j.status) {
+    case 'queued': return t('accountPage.importPhaseQueued')
+    case 'uploading': return t('accountPage.importPhaseUploading')
+    case 'assembling': return t('accountPage.importPhaseAssembling')
+    case 'parsing': return t('accountPage.importPhaseParsing')
+    case 'phase_b': return t('accountPage.importPhasePhaseB')
+    case 'phase_c': return t('accountPage.importPhasePhaseC')
+    case 'phase_d': return t('accountPage.importPhasePhaseD')
+    case 'done': return t('accountPage.importPhaseDone')
+    case 'failed': return t('accountPage.importPhaseFailed')
+    case 'cancelled': return t('accountPage.importPhaseCancelled')
+    default: return j.status
+  }
+})
+const importProgressFraction = computed<number | null>(() => {
+  const j = importJob.value
+  if (!j) return null
+  // Pick the phase-appropriate denominator. During Phase D we display blob
+  // progress; during Phase B/C we display row progress; while uploading we
+  // can't see server-side rows yet so fall back to indeterminate (null).
+  if (j.status === 'phase_d' && j.total_blobs && j.total_blobs > 0) {
+    return Math.min(1, j.processed_blobs / j.total_blobs)
+  }
+  if ((j.status === 'phase_b' || j.status === 'phase_c' || j.status === 'parsing') &&
+      j.total_rows && j.total_rows > 0) {
+    return Math.min(1, j.processed_rows / j.total_rows)
+  }
+  if (j.status === 'done') return 1
+  return null
+})
+async function cancelActiveImport(): Promise<void> {
+  const j = importJob.value
+  if (!j || cancelInflight.value) return
+  cancelInflight.value = true
+  try {
+    await cancelImport(j.job_id)
+    await reloadActiveImportJob()
+  } catch (e) {
+    console.error('[AccountPage] cancel import failed', e)
+  } finally {
+    cancelInflight.value = false
+  }
+}
+function dismissImportCard(): void {
+  clearActiveImportJob()
+}
 </script>

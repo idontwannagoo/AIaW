@@ -45,7 +45,7 @@ pnpm test:down           # docker compose down -v，删 5434 + volume
 |---|---|---|
 | Postgres | 5433 (volume `aiaw-postgres`) | 5434 (volume `aiaw_test_pg`) |
 | Backend (FastAPI) | 9010 | 9011 |
-| 前端 SPA | 9005 / 9006 (PWA) | 9007 (baseline) / 9008 (providers-rest) / 9009 (realtime-ws) / 9012 (realtime-sse) / 9013 (realtime-poll) / 9014 (realtime-auto) |
+| 前端 SPA | 9005 / 9006 (PWA) | 9007 (baseline) / 9008 (providers-rest) / 9009 (realtime-ws) / 9012 (realtime-sse) / 9013 (realtime-poll) / 9014 (realtime-auto) / 9015 (import-job) |
 
 profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 - **baseline** — 全 flag 关，行为等同 Stage 0 (Dexie-only)
@@ -54,6 +54,7 @@ profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 - **realtime-sse** — 上面 flag + `REALTIME_TRANSPORT=sse`（SSE 单向流降级）
 - **realtime-poll** — 上面 flag + `REALTIME_TRANSPORT=poll`（5s 轮询，最低保证最终一致）
 - **realtime-auto** — 上面 flag + `REALTIME_TRANSPORT=auto`（先试 ws → sse → poll，运行时降级）
+- **import-job** — 与 realtime-ws 同 flag 集（含 `BACKEND_DATA_TABLES` 全 10 张表 + `REALTIME_TRANSPORT=ws`），独立端口 + 独立 build cache slot 给 Stage 4.5 / Step 7+ 的 ImportJob multipart 上传 + Phase A-D end-to-end specs 用
 
 `process.env.*` 是构建期内联 → 不能 runtime 切 flag → 每 profile 必须独立 build。
 `build-frontend-profile.mjs` 按 `(env-sha256, git rev, package.json hash)` 联合 cache key 命中 `tests/.builds/<profile>/<key>/`，二次命中 < 1s。
@@ -89,6 +90,7 @@ profile 是 flag 组合，每 profile 一份独立 `quasar build`：
 | Stage 4.5 / Step 4 Phase C messages 文字写入 + `_pending_blob_extraction` 标记 + dead_letter array-concat | `api: tests/api/test_import_phase_c.py` (14 case：1500 行 / 500 行/批 + processed_rows 累计 + PHASE_C_BATCH_SIZE 静态断言 + size 64KB / envelope 双 prong 标记 + recursive envelope 深嵌套扫 + size unit test + orphan FK 入 dead_letter 含 `error: 'orphan: dialog ... not found'` + 25ms 高频 poll 抓 ≥3 distinct progress checkpoints batch_size 倍数对齐 + phase_c→phase_d→done 状态转移（Step 5 落地后 reach done）+ LWW message text skip 旧版 + 0/500/501/1499 行四档 batch boundary + 同 ndjson 二跑 LWW WHERE FALSE 路径 idempotent + partial index ix_messages_pending_blob_extraction WHERE \_pending\_blob\_extraction=TRUE pg_indexes 校验 + imported_from_job_id 全行打标 + dead_letter JSONB array-concat 长度 2 + 顺序保留) |
 | Stage 4.5 / Step 5 Phase D attachments → 对象存储 | `api: tests/api/test_import_phase_d.py` (13 case：< 64KB inline 留存 / ≥ 64KB → ref envelope + BlobStore 文件 + blob_refs 行 / 同 sha dedup（call_count=2 unique=1）/ 4 attempts 重试后 dead_letter（envelope 留 inline + flag cleared）/ done 后 tmp dir + raw upload 清理 / 16 attachment + 0.1s sleep 验 peak 并发 = 4（slow）/ crash idempotent（recovery 不二次 put）/ progress 跨 batch_size=16 边界 publish + processed_blobs 单调 / `_walk_attachments` 深嵌套 path tuple 精确 / 5 个 1KB 全 inline 不调用 put / 单 row 多 attachment 中间失败不阻塞两侧 + dead_letter 单条 / actual_size 100KB 胜 declared_size=10 / `_PHASE_D_INLINE_MAX_BYTES == BLOB_INLINE_MAX_BYTES` 两端不漂移 grep 校验) + 新 helper `tests/api/helpers/blob_mocks.py`（`patch_put_with_counter` / `patch_put_with_delay` / `patch_put_always_fails` / `patch_put_fails_for_sha` 4 个 ctx-mgr）+ `fresh_engine_loop` async fixture（dispose data.db.engine 让 asyncpg pool 在新 loop 重建）|
 | Stage 4.5 / Step 6 import_jobs 注册为 read-only realtime channel + 405 client-write reject | `api: tests/api/test_import_realtime.py` (8 case：端到端 multipart + WS subscribe 抓 status 序列 superset {queued, phase_b, done} + monotonic rev / envelope 形态契约 14 data keys 子集 + Phase B 注 `phase_b_table` 额外字段用 superset / B 端 2.5s 0 events leaked cross-user 隔离 / `GET ?status=active` cross-user 隔离 / PUT/PATCH/POST/DELETE 4 method 全 405 + 'read-only' + Allow / GET 路径 405 + 业务路径 200 / SSE channel 同模板支持 import_jobs / since=max_rev_seen reconnect 拿漏掉的 events 末尾 status='done')。复用 `tests/api/test_realtime_sse.py::SseReader` + `_open_sse` |
+| Stage 4.5 / Step 7 前端 ImportDataDialog 重写 + multipart upload helper + AccountPage 迁移状态卡片 | `spec: tests/e2e/stage4_5/step7-import-flow.spec.ts` (6 case · profile import-job：① upload + close tab + reopen sees progress（fixture 5×1MB attachments / 跨 context 同 user / 等 composable.value.status==='done' 验 REST + WS 端到端连通）/ ② upload resumes after simulated network drop @slow（7MB / 2.5MB part = 3 parts / setOffline 中断 → cursor 留前缀 → setOnline 续传 仅 PUT 缺失 part / `seenPartUrls` 不含 cursor 部分）/ ③ cancel button aborts job and clears state（不 complete 让 job 停 'uploading' active 态 / Cancel 按钮 dispatchEvent('click') 绕 backdrop / 验 server status='cancelled' + cursor=null + Dismiss 出现）/ ④ phase B complete makes workspaces visible（pgQuery 验 server 真值）/ ⑤ phase C complete makes message text readable（pgQuery 验 3 messages text + `_pending_blob_extraction=false`）/ ⑥ phase D complete makes attachment renderable @slow（5×1MB attachments / pgQuery `blob_refs` ≥5 distinct sha + 5 messages 各 `data.attachment.type='ref'` + url/sha256 非空 + flag clear）)。fixture builder 内嵌 spec（buildDexieExport / buildPaddedFileInPage / page-context attachment generator），不需新 helper |
 
 ---
 

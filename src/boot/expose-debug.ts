@@ -4,6 +4,12 @@ import { db } from 'src/utils/db'
 import { authSource } from 'src/data/auth'
 import { repos } from 'src/data'
 import * as blobClient from 'src/data/blob-client'
+import * as importClient from 'src/data/import-client'
+import {
+  useActiveImportJob,
+  reloadActiveImportJob,
+  clearActiveImportJob
+} from 'src/composables/import-job'
 import { syncRef, type SyncRefOptions } from 'src/composables/sync-ref'
 import {
   createMessageStreamFlush,
@@ -47,12 +53,39 @@ const messageStreamFlushHook = {
   byteThreshold: STREAM_FLUSH_BYTE_THRESHOLD
 }
 
+// Stage 4.5 / Step 7 — ImportJob client + global active-job composable.
+// Specs use this to:
+//   - drive end-to-end multipart uploads from the page context
+//     (createImportJob → uploadParts → completeImport)
+//   - inspect/clear localStorage cursor (`import.<jobId>.parts`) to verify
+//     resume semantics
+//   - read/refresh the global activeJob ref from any test profile
+//
+// `useActiveImportJob()` returns a Vue Ref — specs `await page.evaluate`
+// it via `.value` to read the current snapshot.
+const importClientHook = {
+  ...importClient,
+  useActiveImportJob,
+  reloadActiveImportJob,
+  clearActiveImportJob,
+  // Helpers for specs that need to inspect the localStorage cursor without
+  // hardcoding key shape.
+  cursorKey: (jobId: string) => `import.${jobId}.parts`,
+  readCursor: (jobId: string) => {
+    try {
+      const raw = localStorage.getItem(`import.${jobId}.parts`)
+      return raw ? JSON.parse(raw) : null
+    } catch { return null }
+  }
+}
+
 declare global {
   interface Window {
     __db__?: typeof db
     __authSource__?: typeof authSource
     __repos__?: typeof repos
     __blobClient__?: typeof blobClient
+    __importClient__?: typeof importClientHook
     __syncRefHarness__?: typeof syncRefHarness
     __messageStreamFlush__?: typeof messageStreamFlushHook
     __exposeDebugReady__?: true
@@ -66,8 +99,9 @@ export default boot(() => {
   window.__authSource__ = authSource
   window.__repos__ = repos
   window.__blobClient__ = blobClient
+  window.__importClient__ = importClientHook
   window.__syncRefHarness__ = syncRefHarness
   window.__messageStreamFlush__ = messageStreamFlushHook
   window.__exposeDebugReady__ = true
-  console.warn('[expose-debug] window.__db__ / __authSource__ / __repos__ / __blobClient__ / __syncRefHarness__ / __messageStreamFlush__ exposed — test/dev only')
+  console.warn('[expose-debug] window.__db__ / __authSource__ / __repos__ / __blobClient__ / __importClient__ / __syncRefHarness__ / __messageStreamFlush__ exposed — test/dev only')
 })

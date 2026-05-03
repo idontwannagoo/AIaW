@@ -106,14 +106,21 @@ export default {
   },
   importDataDialog: {
     title: '导入用户数据',
+    description: '上传从旧版导出的 aiaw_user_db.json。文件会切片上传到服务端处理，处理过程中可以关闭浏览器。',
     fileLabel: '数据文件',
-    overwrite: '覆盖已有数据',
-    force: '强制写入',
-    clear: '导入前清空现有数据',
     cancel: '取消',
-    import: '导入',
-    importSuccess: '导入成功',
-    importFailed: '导入失败：{message}'
+    import: '开始导入',
+    creating: '正在创建任务...',
+    completing: '上传完成，正在汇总分片...',
+    phaseCreating: '准备',
+    phaseUploading: '上传中',
+    phaseCompleting: '收尾',
+    uploadStats: '已上传 {uploaded} / {total}（剩余约 {eta}）',
+    etaSeconds: '{s} 秒',
+    etaMinutes: '{m} 分 {s} 秒',
+    etaCalculating: '计算中...',
+    uploadDoneNotice: '上传完成，服务端正在后台导入。可关闭浏览器，状态可在账号页面查看。',
+    uploadFailed: '导入失败：{message}'
   },
   exportDataDialog: {
     title: '导出用户数据',
