@@ -326,3 +326,159 @@ async def test_cross_user_cannot_delete(
     r = await client_a.get('/api/v1/dialogs/d-shared')
     assert r.status_code == 200
     assert r.json()['deleted'] is False
+
+
+# ---- Stage 4 / 硬前置 3 — scope-aware list (`?workspaceId=`) ---------------
+#
+# The list endpoint accepts an optional `workspaceId=` query (alias for
+# `workspace_id`) so the client can pull a single workspace's dialogs in
+# one round-trip instead of the user's entire dialogs table. Mirrors the
+# items.py `dialogId=` retrofit. Combinable with `since=` and `limit=`.
+
+
+async def test_list_with_workspace_id_filters_to_scope(
+    client_a: httpx.AsyncClient,
+) -> None:
+    """Build two workspaces with 5 dialogs each. `?workspaceId=ws1` must
+    return exactly the 5 dialogs whose workspace_id matches; rows from the
+    other workspace must not leak through (the user_id predicate alone
+    would still let them through, so the scope filter is the load-bearing
+    part)."""
+    ws1 = await _seed_workspace(client_a, 'ws1')
+    ws2 = await _seed_workspace(client_a, 'ws2')
+    for i in range(5):
+        await client_a.put(
+            f'/api/v1/dialogs/ws1-d{i}', json=_dialog_body(ws1, name=f'd{i}'),
+        )
+        await client_a.put(
+            f'/api/v1/dialogs/ws2-d{i}', json=_dialog_body(ws2, name=f'd{i}'),
+        )
+
+    r = await client_a.get('/api/v1/dialogs?workspaceId=ws1')
+    assert r.status_code == 200, r.text
+    rows = r.json()
+    ids = sorted(row['id'] for row in rows)
+    assert ids == sorted(f'ws1-d{i}' for i in range(5)), (
+        f'expected only ws1 dialogs, got {ids!r}'
+    )
+    for row in rows:
+        assert row['data']['workspaceId'] == 'ws1', (
+            f'leaked row from another workspace: {row!r}'
+        )
+
+
+async def test_workspace_id_combined_with_since_and_limit(
+    client_a: httpx.AsyncClient,
+) -> None:
+    """When the client passes `limit=`, the response shape switches to the
+    cursor envelope `{rows, next_cursor}`. Combine `?workspaceId=&since=&
+    limit=` and verify the page is filtered, ordered by version, and the
+    cursor advances correctly across pages."""
+    ws1 = await _seed_workspace(client_a, 'ws-paged')
+    ws2 = await _seed_workspace(client_a, 'ws-noise')
+    # Interleave writes between the two workspaces so the version sequence
+    # for ws-paged is non-contiguous (real-world shape) — this catches a
+    # bug where the limit clamps before the WHERE filter.
+    for i in range(6):
+        await client_a.put(
+            f'/api/v1/dialogs/p{i}', json=_dialog_body(ws1, name=f'p{i}'),
+        )
+        await client_a.put(
+            f'/api/v1/dialogs/n{i}', json=_dialog_body(ws2, name=f'n{i}'),
+        )
+
+    r = await client_a.get(
+        '/api/v1/dialogs?workspaceId=ws-paged&since=0&limit=4'
+    )
+    assert r.status_code == 200, r.text
+    page1 = r.json()
+    assert isinstance(page1, dict), (
+        f'limit= must yield CursorPage envelope, got {type(page1).__name__}: {page1!r}'
+    )
+    assert {'rows', 'next_cursor'} <= page1.keys(), page1
+    rows1 = page1['rows']
+    assert len(rows1) == 4
+    ids1 = [row['id'] for row in rows1]
+    assert ids1 == sorted(ids1, key=lambda i: rows1[ids1.index(i)]['version']), (
+        f'rows not ordered by version: {[(r["id"], r["version"]) for r in rows1]}'
+    )
+    for row in rows1:
+        assert row['data']['workspaceId'] == 'ws-paged', (
+            f'leaked row from ws-noise into page1: {row!r}'
+        )
+    cursor = page1['next_cursor']
+    assert cursor is not None and cursor > 0, (
+        f'page is full ({len(rows1)} == limit), expected next_cursor, got {cursor!r}'
+    )
+
+    # Resume with the cursor — should yield the remaining 2 ws-paged rows.
+    r2 = await client_a.get(
+        f'/api/v1/dialogs?workspaceId=ws-paged&since={cursor}&limit=4'
+    )
+    assert r2.status_code == 200
+    page2 = r2.json()
+    assert isinstance(page2, dict), page2
+    rows2 = page2['rows']
+    ids2 = [row['id'] for row in rows2]
+    assert len(rows2) == 2, (
+        f'expected last 2 ws-paged rows, got {ids2!r} (page1 was {ids1!r})'
+    )
+    for row in rows2:
+        assert row['data']['workspaceId'] == 'ws-paged'
+    # Page wasn't full → cursor cleared (one extra empty page protocol).
+    assert page2['next_cursor'] is None, (
+        f'partial page must have null cursor, got {page2["next_cursor"]!r}'
+    )
+
+    # Together page1 + page2 must equal the full 6 ws-paged dialogs.
+    all_ids = set(ids1) | set(ids2)
+    assert all_ids == {f'p{i}' for i in range(6)}, all_ids
+
+
+async def test_workspace_id_account_isolation(
+    client_a: httpx.AsyncClient, client_b: httpx.AsyncClient,
+) -> None:
+    """User B asks for User A's workspaceId. The user_id predicate already
+    isolates accounts, so the WHERE workspace_id filter just lands on an
+    empty set rather than 403. Status must be 200 with `[]` — we don't
+    leak ownership signal via 403/404."""
+    ws_a = await _seed_workspace(client_a, 'ws-a-private')
+    for i in range(3):
+        await client_a.put(
+            f'/api/v1/dialogs/a-d{i}', json=_dialog_body(ws_a, name=f'd{i}'),
+        )
+
+    # B has no workspaces but tries to query A's workspaceId.
+    r = await client_b.get(f'/api/v1/dialogs?workspaceId={ws_a}')
+    assert r.status_code == 200, (
+        f'cross-user scopeId must filter to [], not error; got {r.status_code}: {r.text}'
+    )
+    rows = r.json()
+    assert rows == [], (
+        f'B leaked A rows via workspaceId scope: {rows!r}'
+    )
+
+    # Sanity: A still sees their rows.
+    r_a = await client_a.get(f'/api/v1/dialogs?workspaceId={ws_a}')
+    assert len(r_a.json()) == 3
+
+
+async def test_no_scope_param_returns_full_user_table(
+    client_a: httpx.AsyncClient,
+) -> None:
+    """Backwards compatibility: no `?workspaceId=` returns the same shape
+    as before (bare list, all of the user's dialogs across all
+    workspaces). Stage 1-3 list consumers must keep working."""
+    ws1 = await _seed_workspace(client_a, 'ws-back-1')
+    ws2 = await _seed_workspace(client_a, 'ws-back-2')
+    await client_a.put('/api/v1/dialogs/d1', json=_dialog_body(ws1, name='d1'))
+    await client_a.put('/api/v1/dialogs/d2', json=_dialog_body(ws2, name='d2'))
+
+    r = await client_a.get('/api/v1/dialogs')
+    assert r.status_code == 200
+    rows = r.json()
+    assert isinstance(rows, list), (
+        f'no `limit=` → bare list, not CursorPage envelope; got {type(rows).__name__}'
+    )
+    ids = sorted(row['id'] for row in rows)
+    assert ids == ['d1', 'd2'], ids

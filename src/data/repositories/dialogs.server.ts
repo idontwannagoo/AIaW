@@ -6,6 +6,7 @@ import { http, HttpError } from '../http'
 import { realtime } from '../realtime'
 import type { QuerySpec, Repository } from '../types'
 import { createDexieRepository } from './dexie'
+import { createScopedPull, extractScopeId } from './scoped-pull'
 
 // Stage 4 / 批次-4b — server-routed dialogs. id-PK envelope mirrors
 // workspaces.server.ts; the only differences are the table name, the
@@ -19,6 +20,14 @@ import { createDexieRepository } from './dexie'
 // workspace before the workspace's own tombstone event. Live tabs receive
 // each event and reapply the same idempotent delete path the frontend uses
 // for explicit dialogs.delete() calls.
+//
+// Stage 4 / 硬前置 3 — scoped pull. `observeFind / find / findFirst /
+// findKeys / count` inspect `spec.where.workspaceId`; if a single scalar
+// scopeId is present, the read goes through `scopedPull` which fetches
+// `?workspaceId=X&since=<scope-cursor>` and bumps that scope's cursor in
+// isolation from the full-table cursor. Spec-less or multi-value reads
+// fall back to the full-table `pull()` for compatibility (some stores
+// still call `repos.dialogs.list()` to enumerate everything).
 interface DialogRow {
   id: string
   version: number
@@ -30,6 +39,35 @@ interface DialogRow {
 let lastVersion = 0
 let inflight: Promise<void> | null = null
 let realtimeUnsubscribe: (() => void) | null = null
+
+const scopedPull = createScopedPull<Dialog>({
+  tableName: 'dialogs',
+  scopeField: 'workspaceId',
+  fetchFn: async (workspaceId, since) => {
+    const rows = await http.get<DialogRow[]>('/api/v1/dialogs', {
+      query: { workspaceId, since }
+    })
+    if (!rows.length) return { maxVersion: 0 }
+    let maxVersion = 0
+    await db.transaction('rw', db.dialogs, async () => {
+      for (const row of rows) {
+        if (row.deleted) {
+          await db.dialogs.delete(row.id)
+        } else if (row.data) {
+          await db.dialogs.put(row.data)
+        }
+        if (row.version > maxVersion) maxVersion = row.version
+        // Also advance the full-table cursor when scoped pulls observe a
+        // higher version than full-table pulls have seen — the global
+        // cursor is monotonic across all scopes (versions come from the
+        // shared `global_change_seq`), so refusing to advance it would
+        // force an unnecessary re-pull of rows we've already cached.
+        if (row.version > lastVersion) lastVersion = row.version
+      }
+    })
+    return { maxVersion }
+  }
+})
 
 function ensureRealtimeSubscription(): void {
   if (!RealtimeTransport) return
@@ -43,6 +81,9 @@ function ensureRealtimeSubscription(): void {
           await db.dialogs.put(e.row.data)
         }
         if (e.rev > lastVersion) lastVersion = e.rev
+        // Forward to scopedPull AFTER cache write so scope cursors only
+        // advance for events that have actually been applied locally.
+        scopedPull.applyEvent(e)
       } catch (err) {
         console.warn('[dialogs.server] realtime apply failed', err)
       }
@@ -55,7 +96,10 @@ async function pull(): Promise<void> {
   inflight = (async () => {
     try {
       const cached = await db.dialogs.count()
-      if (cached === 0) lastVersion = 0
+      if (cached === 0) {
+        lastVersion = 0
+        scopedPull.reset()
+      }
 
       const rows = await http.get<DialogRow[]>('/api/v1/dialogs', {
         query: { since: lastVersion }
@@ -78,8 +122,16 @@ async function pull(): Promise<void> {
   return inflight
 }
 
-function shallowMerge<T>(base: T, changes: Partial<T> | Record<string, unknown>): T {
-  return { ...(base as object), ...(changes as object) } as T
+async function pullForSpec(spec: QuerySpec<Dialog> | undefined): Promise<void> {
+  const scopeId = extractScopeId(
+    spec?.where as Record<string, unknown> | undefined,
+    'workspaceId'
+  )
+  if (scopeId) {
+    await scopedPull.pullScope(scopeId)
+    return
+  }
+  await pull()
 }
 
 export const serverDialogsRepository: Repository<Dialog, string> = (() => {
@@ -105,6 +157,10 @@ export const serverDialogsRepository: Repository<Dialog, string> = (() => {
     await db.dialogs.delete(id)
   }
 
+  function shallowMerge<T>(base: T, changes: Partial<T> | Record<string, unknown>): T {
+    return { ...(base as object), ...(changes as object) } as T
+  }
+
   return {
     table: cache.table,
 
@@ -124,10 +180,10 @@ export const serverDialogsRepository: Repository<Dialog, string> = (() => {
       }
     },
     async list() { await pull(); return cache.list() },
-    async find(spec) { await pull(); return cache.find(spec) },
-    async findFirst(spec) { await pull(); return cache.findFirst(spec) },
-    async findKeys(spec) { await pull(); return cache.findKeys(spec) },
-    async count(spec) { await pull(); return cache.count(spec) },
+    async find(spec) { await pullForSpec(spec); return cache.find(spec) },
+    async findFirst(spec) { await pullForSpec(spec); return cache.findFirst(spec) },
+    async findKeys(spec) { await pullForSpec(spec); return cache.findKeys(spec) },
+    async count(spec) { await pullForSpec(spec); return cache.count(spec) },
 
     add: putOne,
     put: putOne,
@@ -147,13 +203,13 @@ export const serverDialogsRepository: Repository<Dialog, string> = (() => {
       for (const id of ids) await deleteOne(id)
     },
     async deleteWhere(spec: QuerySpec<Dialog>) {
-      await pull()
+      await pullForSpec(spec)
       const ids = await cache.findKeys(spec)
       for (const id of ids) await deleteOne(id)
       return ids.length
     },
     async modifyWhere(spec: QuerySpec<Dialog>, changes) {
-      await pull()
+      await pullForSpec(spec)
       const rows = await cache.find(spec)
       for (const r of rows) await putOne(shallowMerge(r, changes))
       return rows.length
@@ -172,6 +228,13 @@ export const serverDialogsRepository: Repository<Dialog, string> = (() => {
     }) as typeof cache.observeList,
     observeFind: ((spec, options) => {
       ensureRealtimeSubscription()
+      // Kick off a scope-aware pull on mount so the first render isn't
+      // empty for scopes we haven't seen yet. Errors are swallowed; the
+      // observe ref will repopulate as the cache catches up via realtime.
+      const initial = typeof spec === 'function' ? spec() : spec
+      void pullForSpec(initial).catch((err) => {
+        console.warn('[dialogs.server] observeFind initial pull failed', err)
+      })
       return cache.observeFind(spec, options)
     }) as typeof cache.observeFind,
     observeOne: ((id, options) => {

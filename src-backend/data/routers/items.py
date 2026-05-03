@@ -14,9 +14,9 @@ envelope (`{type:'inline', data:base64, ...}` or `{type:'ref', url,
 sha256, ...}`) just rides along inside JSONB. Bytes for ref-mode
 attachments are uploaded separately via `/api/v1/blobs`.
 """
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -30,6 +30,7 @@ from ..db import get_session
 from ..models.dialog import Dialog
 from ..models.item import Item
 from ..models.user import User
+from ..pagination import CursorPage, build_page, normalize_limit
 
 router = APIRouter(prefix='/api/v1/items', tags=['items'])
 
@@ -74,19 +75,40 @@ def _to_event(it: Item) -> dict[str, Any]:
     }
 
 
-@router.get('', response_model=list[ItemRow])
+@router.get(
+    '',
+    response_model=Union[list[ItemRow], CursorPage[ItemRow]],
+)
 async def list_items(
     since: int = 0,
+    limit: Optional[int] = None,
+    dialog_id: Optional[str] = Query(None, alias='dialogId'),
     user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ):
+    """List items for the authed user.
+
+    Stage 4 / 硬前置 3: when `dialogId=` is provided, the query is scoped to
+    that dialog via `WHERE dialog_id = :dlg`. Cross-user scopeIds silently
+    filter to the empty set (the user_id predicate already isolates accounts;
+    we don't 403 because the scope id is just a `WHERE` value, not an
+    explicit ownership claim). Combinable with `since=` and `limit=`.
+    """
+    fetch_limit = normalize_limit(limit)
     stmt = (
         select(Item)
         .where(Item.user_id == user_id, Item.version > since)
         .order_by(Item.version)
     )
+    if dialog_id is not None:
+        stmt = stmt.where(Item.dialog_id == dialog_id)
+    if fetch_limit is not None:
+        stmt = stmt.limit(fetch_limit)
     result = await session.execute(stmt)
-    return [_to_row(it) for it in result.scalars()]
+    rows = [_to_row(it) for it in result.scalars()]
+    if fetch_limit is None:
+        return rows
+    return build_page(rows, fetch_limit)
 
 
 @router.get('/{item_id}', response_model=ItemRow)

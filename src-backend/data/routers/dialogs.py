@@ -7,9 +7,9 @@ the workspace exists and is owned by the same user, otherwise the FK
 violation surfaces as a 409 (rather than letting Postgres raise a raw
 IntegrityError that becomes a 500).
 """
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -23,6 +23,7 @@ from ..db import get_session
 from ..models.dialog import Dialog
 from ..models.user import User
 from ..models.workspace import Workspace
+from ..pagination import CursorPage, build_page, normalize_limit
 
 router = APIRouter(prefix='/api/v1/dialogs', tags=['dialogs'])
 
@@ -67,19 +68,40 @@ def _to_event(d: Dialog) -> dict[str, Any]:
     }
 
 
-@router.get('', response_model=list[DialogRow])
+@router.get(
+    '',
+    response_model=Union[list[DialogRow], CursorPage[DialogRow]],
+)
 async def list_dialogs(
     since: int = 0,
+    limit: Optional[int] = None,
+    workspace_id: Optional[str] = Query(None, alias='workspaceId'),
     user_id: str = Depends(_user_id),
     session: AsyncSession = Depends(get_session),
 ):
+    """List dialogs for the authed user.
+
+    Stage 4 / 硬前置 3: when `workspaceId=` is provided, the query is scoped
+    to that workspace via `WHERE workspace_id = :ws`. Cross-user scopeIds
+    silently filter to the empty set (the user_id predicate already isolates
+    accounts; we don't 403 because the scope id is just a `WHERE` value, not
+    an explicit ownership claim). Combinable with `since=` and `limit=`.
+    """
+    fetch_limit = normalize_limit(limit)
     stmt = (
         select(Dialog)
         .where(Dialog.user_id == user_id, Dialog.version > since)
         .order_by(Dialog.version)
     )
+    if workspace_id is not None:
+        stmt = stmt.where(Dialog.workspace_id == workspace_id)
+    if fetch_limit is not None:
+        stmt = stmt.limit(fetch_limit)
     result = await session.execute(stmt)
-    return [_to_row(d) for d in result.scalars()]
+    rows = [_to_row(d) for d in result.scalars()]
+    if fetch_limit is None:
+        return rows
+    return build_page(rows, fetch_limit)
 
 
 @router.get('/{dialog_id}', response_model=DialogRow)

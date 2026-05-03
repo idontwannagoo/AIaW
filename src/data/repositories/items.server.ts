@@ -11,6 +11,7 @@ import {
 } from '../blob-client'
 import type { QuerySpec, Repository } from '../types'
 import { createDexieRepository } from './dexie'
+import { createScopedPull, extractScopeId } from './scoped-pull'
 
 // Stage 4 / 批次-4c — server-routed items.
 //
@@ -38,6 +39,14 @@ import { createDexieRepository } from './dexie'
 // AND every item under those dialogs before the workspace's own
 // tombstone event (all sharing one cascade_version). Live tabs receive
 // each event and reapply the same idempotent delete path.
+//
+// Stage 4 / 硬前置 3 — scoped pull. `observeFind / find / findFirst /
+// findKeys / count` inspect `spec.where.dialogId`; if a single scalar
+// dialogId is present, the read goes through `scopedPull` which fetches
+// `?dialogId=Y&since=<scope-cursor>` and bumps that scope's cursor in
+// isolation from the full-table cursor. Spec-less or multi-value reads
+// fall back to the full-table `pull()` for compatibility (e.g. a legacy
+// `repos.items.list()` call that wants to enumerate everything).
 
 interface WireItem {
   id: string
@@ -108,6 +117,40 @@ async function decodeFromWire(wire: WireItem): Promise<StoredItem> {
   return item
 }
 
+const scopedPull = createScopedPull<WireItem>({
+  tableName: 'items',
+  scopeField: 'dialogId',
+  fetchFn: async (dialogId, since) => {
+    const rows = await http.get<ItemRow[]>('/api/v1/items', {
+      query: { dialogId, since }
+    })
+    if (!rows.length) return { maxVersion: 0 }
+    // Decode (which may hit network for ref-mode rows) BEFORE entering
+    // the dexie transaction — Dexie auto-aborts if a callback awaits on
+    // a non-Dexie promise.
+    const prepared = await Promise.all(
+      rows.map(async (row) => {
+        if (row.deleted) return { row, decoded: null as StoredItem | null }
+        if (row.data) return { row, decoded: await decodeFromWire(row.data) }
+        return { row, decoded: null as StoredItem | null }
+      })
+    )
+    let maxVersion = 0
+    await db.transaction('rw', db.items, async () => {
+      for (const { row, decoded } of prepared) {
+        if (row.deleted) {
+          await db.items.delete(row.id)
+        } else if (decoded) {
+          await db.items.put(decoded)
+        }
+        if (row.version > maxVersion) maxVersion = row.version
+        if (row.version > lastVersion) lastVersion = row.version
+      }
+    })
+    return { maxVersion }
+  }
+})
+
 function ensureRealtimeSubscription(): void {
   if (!RealtimeTransport) return
   if (realtimeUnsubscribe) return
@@ -121,6 +164,9 @@ function ensureRealtimeSubscription(): void {
           await db.items.put(decoded)
         }
         if (e.rev > lastVersion) lastVersion = e.rev
+        // Forward to scopedPull AFTER cache write so scope cursors only
+        // advance for events that have actually been applied locally.
+        scopedPull.applyEvent(e)
       } catch (err) {
         console.warn('[items.server] realtime apply failed', err)
       }
@@ -133,7 +179,10 @@ async function pull(): Promise<void> {
   inflight = (async () => {
     try {
       const cached = await db.items.count()
-      if (cached === 0) lastVersion = 0
+      if (cached === 0) {
+        lastVersion = 0
+        scopedPull.reset()
+      }
 
       const rows = await http.get<ItemRow[]>('/api/v1/items', {
         query: { since: lastVersion }
@@ -164,6 +213,18 @@ async function pull(): Promise<void> {
     }
   })()
   return inflight
+}
+
+async function pullForSpec(spec: QuerySpec<StoredItem> | undefined): Promise<void> {
+  const scopeId = extractScopeId(
+    spec?.where as Record<string, unknown> | undefined,
+    'dialogId'
+  )
+  if (scopeId) {
+    await scopedPull.pullScope(scopeId)
+    return
+  }
+  await pull()
 }
 
 function shallowMerge<T>(base: T, changes: Partial<T> | Record<string, unknown>): T {
@@ -217,10 +278,10 @@ export const serverItemsRepository: Repository<StoredItem, string> = (() => {
       }
     },
     async list() { await pull(); return cache.list() },
-    async find(spec) { await pull(); return cache.find(spec) },
-    async findFirst(spec) { await pull(); return cache.findFirst(spec) },
-    async findKeys(spec) { await pull(); return cache.findKeys(spec) },
-    async count(spec) { await pull(); return cache.count(spec) },
+    async find(spec) { await pullForSpec(spec); return cache.find(spec) },
+    async findFirst(spec) { await pullForSpec(spec); return cache.findFirst(spec) },
+    async findKeys(spec) { await pullForSpec(spec); return cache.findKeys(spec) },
+    async count(spec) { await pullForSpec(spec); return cache.count(spec) },
 
     add: putOne,
     put: putOne,
@@ -243,13 +304,13 @@ export const serverItemsRepository: Repository<StoredItem, string> = (() => {
       for (const id of ids) await deleteOne(id)
     },
     async deleteWhere(spec: QuerySpec<StoredItem>) {
-      await pull()
+      await pullForSpec(spec)
       const ids = await cache.findKeys(spec)
       for (const id of ids) await deleteOne(id)
       return ids.length
     },
     async modifyWhere(spec: QuerySpec<StoredItem>, changes) {
-      await pull()
+      await pullForSpec(spec)
       const rows = await cache.find(spec)
       for (const r of rows) await putOne(shallowMerge(r, changes))
       return rows.length
@@ -268,6 +329,13 @@ export const serverItemsRepository: Repository<StoredItem, string> = (() => {
     }) as typeof cache.observeList,
     observeFind: ((spec, options) => {
       ensureRealtimeSubscription()
+      // Kick off a scope-aware pull on mount so the first render isn't
+      // empty for scopes we haven't seen yet. Errors are swallowed; the
+      // observe ref will repopulate as the cache catches up via realtime.
+      const initial = typeof spec === 'function' ? spec() : spec
+      void pullForSpec(initial).catch((err) => {
+        console.warn('[items.server] observeFind initial pull failed', err)
+      })
       return cache.observeFind(spec, options)
     }) as typeof cache.observeFind,
     observeOne: ((id, options) => {

@@ -17,6 +17,7 @@
 > **术语说明**：plan 中"批次" / "批次-Xx"指**一组原子的、可整体回滚的提交集合**——本仓库是单人 + AI 开发，没有 GitHub PR 流程，"批次"对应"一次落地的 commit 序列"，不暗示 review / merge 流程。批次代号仍按字母分组方便引用（如 `批次-3a` / `批次-4b`）。
 
 - **2026-05-03 · plan 自洽刷新 + lazy 路径补齐 + 流式节流前置 + outbox 落 Stage**
+
   - **背景**：用户复盘三大产品需求时复核 plan——① 登录后立刻看到 workspaces / 点 dialog 立刻看到对话/消息（**服务端优先 / 即点即看**）；② 流式输出能跨 tab / 跨设备实时同步；③ 所有增删改正确同步（含离线场景）。逐条核 plan 后发现：
     1. **plan 内部不自洽**：line 236 旧总策略段写「IndexedDB 角色降级。Stage 0–4 仍是首屏读源，Stage 5 起退化为缓存 + 离线 outbox」，按字面读 Stage 5 才退化；但 Stage 4.5 Step 8 (line 1051+) 已规划 `GET /api/v1/bootstrap` 解决"首登 1.5s 内看到 workspaces"，4.9 (line 1117) 写「IndexedDB 缓存机制保留作为离线 / 弱网下的本地缓存层，server 是权威」。两处描述矛盾，line 236 是 stale 旧文字
     2. **lazy 路径未规划**：当前所有 server-routed 表的 `pull()` 都是「全 user 单表 since=N 全量增量」（参考 `items.server.ts::pull` / `dialogs.server.ts::pull`），后端 `list_<table>` endpoint 也只接 `?since=N`，**不支持作用域过滤**（`?workspaceId=` / `?dialogId=`）。bootstrap 只解决"首登小表全量"，不解决"打开某个 dialog 时只拉这个 dialog 的 items / messages / artifacts"。一个常用用户单 user items 上千、messages 上万是常态，按现有 pull 模式打开任何 dialog 都会全表拉一遍 → 跟旧 Dexie Cloud 全量拉本质相同
@@ -34,8 +35,8 @@
     - 流式节流的 200ms 时间窗实现要在 `composables/call-api.ts` / `utils/middlewares.ts`（流式 token 入口）做 batch，不是在 `messages.server.ts::putOne` 做——后者粒度太细看不到流式上下文。具体钩点 4e 落地时确定，本修订只敲定策略
     - 离线 outbox 不要复用 dexie 的 `db.transaction` 事务模型——4.9 之后 dexie repo 实现已删，outbox 表只是 IDB schema，操作走 `db.outbox.put / delete`，flush 逻辑跑在 `realtime` 重连回调里
     - bootstrap response 不含 items / artifacts 这点要在 `tests/api/test_bootstrap.py::test_returns_all_small_tables_in_one_response` 显式断言（response 字段 set 不含 `items` / `artifacts`），否则未来误加进去会撑爆 1MB 上限
-
 - **2026-05-03 · 4c items 重新归类为「依赖硬前置 2 的附件载体表」**
+
   - **背景**：上一轮规划 4c 把 items 当"独立简单叶子表"，schema 决策段写为「`type` 联合；`dialogId` 可为 null（工作区级 item vs 对话级 item）」，并在 line 38 依赖排序中把 items 与 dialogs 并列为"可并行的简单表"。复盘发现两处错：① **代码事实**：`StoredItem` 形态是 `{id, dialogId:string(必填), type:'text'|'file'|'quote', references:number, contentBuffer?:ArrayBuffer, mimeType?, name?, contentText?}`，`dialogId` 必填不可 null；`contentBuffer` 是用户上传的真附件 bytes（`DialogView.vue::949` 的 `repos.items.bulkPut(items)` 就是处理用户拖文件 / 上传图片 / 引用大段文字的入口，`type:'file'` 的 contentBuffer 可达 5MB+）。② **未来一致性**：plan 4e messages 端到端判据写"5MB attachment 端到端 → ref URL 下载 blob"，实际数据流走 items（message 只持 `StoredItemId[]`），所以**items 必须支持 blob ref 才能让 4e 跑通**，否则 4e 落地时回头改 items 污染历史
   - **未来约束**：
     - **4c items 重新归类为依赖硬前置 2**（与 4d/4e 同档），不再是"独立简单"；硬前置 2 已落地故不阻塞，仅排序约束改变
@@ -52,8 +53,8 @@
     - `serializeAttachment` 是 async + 走网络（ref 模式时），调用点 `repos.items.put` 必须 await；`bulkPut` 必须 sequential 调用 putOne（与 dialogs 模板一致），不能 Promise.all 并行——多 sha256 同时 putBlob 会撞 ref 唯一约束 race
     - 跨 tab realtime apply ref item 时 `materializeAttachment` 也走网络，apply 链路必须容忍 fetchBlob 失败（presigned URL 1h 过期 / 网络抖动）：失败时 row 仍写入 IndexedDB 但 contentBuffer 留 undefined，UI 渲染时再按需 retry。**这条 4c 落地时必须有专门 spec 验证**
     - 4c 落地时 `routers/workspaces.py::delete_workspace` 的 cascade 分支按 dialogs 模板加 items update-tombstone 链路，与 dialogs cascade 共用同一 `cascade_version`（前端按 LWW 处理，跨 tab 收到一组事件无序也无所谓）
-
 - **2026-05-02 · 硬前置 1 收窄：保留 inline envelope 流式同步 + cursor 分页（砍掉 notify-only 协议）**
+
   - **背景**：硬前置 1 原设计含两块——① WS / SSE event 改 notify-only（去 `row` 字段，客户端 GET row 按需拉）+ ② `?since=N` 加 cursor 续拉。实施一半发现 ① 当前朴素实现对**流式云同步**场景**零正收益、负 RTT**：bytes-on-wire 仍是 O(N²)（GET 拉的也是当前累积 row），多 N 个 RTT + N 次 PG 查询。要让 notify-only 真省带宽必须配合客户端 event coalesce/dedup + 服务端 ETag/304，~200–300 行额外异步逻辑。broker 队列内存优势（10MB → 20KB / 活跃 sub）只有大规模 SaaS 才兑现，本项目（个人 / 小规模独立部署）触不到。同时 notify-only 引入「event 到了 row 没到」中间态 + race condition + 404-as-tombstone 启发式，让多 tab / 跨设备流式同步在弱网下反而 UX 变差（断断续续 / 偶尔倒退 / 帧缺失）。
   - **未来约束**：
     - **硬前置 1 收窄为「仅 cursor 分页」**：保留 `?since=N&limit=200&next_cursor=…` 续拉协议（`pagination.py` + `providers.py` 改动）；删除 notify-only 协议设计 + per-table payload-mode 配置位 + 客户端 fetchAndDispatch 路径 + `_test/payload-mode` admin endpoint + `BACKEND_TEST_HOOKS_ENABLED` env
@@ -66,8 +67,8 @@
     - **删 notify-only 时连带删 `BACKEND_TEST_HOOKS_ENABLED` env + `_test/payload-mode` admin endpoint + `notify-only-dispatcher.spec.ts` + `test_payload_mode.py`**；但 `tests/api/conftest.py` 的 payload-mode reset 是为 admin endpoint 服务的，连带删
     - **不要回退 broker 现有 close-on-overflow**：那是 Stage 2 已有的、与 notify-only 无关的兜底机制
     - **inline 流式同步的 broker 内存可观察性**：messages / artifacts 落地后 soak.sh 的「100 条大 message 连续 PUT」结果是早期信号 —— 涨幅明显超出 50MB 时说明硬前置 2 阈值（64KB）需要调低，或真到了该补 notify-only 的规模
-
 - **2026-05-02 · 方向调整：砍 flag 灰度机制 + 折中 批次拆分 + 引入「分水岭」端到端测试分工**
+
   - **背景**：new-deploy 是空库新实例 + my-deploy 是天然回滚通道（用户回退 = 用回 my-deploy URL），原 plan「flag 默认关 + 字节级一致 + dexie 双实现 + 上线但不启用」整套机制（为"无感灰度"设计）在新方向下是 dead weight。同时复盘「逐表分批」真实价值不在灰度而在「切碎不可逆 schema 决策 + alembic 颗粒度 + bisect 定位 + TDD 反馈环」，可按表组 schema 决策大小折中拆分。
   - **未来约束**：
     - **① 砍 flag 默认关上线节奏**：Stage 3+ 每张表落地时同一批 commit 内直接把表名加进 `.env.docker` 的 `BACKEND_DATA_TABLES` CSV 并 push 触发重 build，不再走「先关 flag → 后续批次再翻 flag」两步。**flag 机制本身保留到 Stage 4.9** 一次性删除（用作 server.ts 写炸时秒级 disable 单表的应急开关）
@@ -81,16 +82,16 @@
     - 砍上线节奏 ≠ 砍测试：每张表对应的批次仍须**同批次落 spec/api + 本地真跑过 `pnpm test:api && pnpm test:e2e` + 必须真跑红一次再绿**（CLAUDE.md 工作流契约不变）
     - Stage 4.9 删 flag 路由前必须先做 Stage 4.5 端到端验收：万一 ImportJob 写错数据，删之前还能 flag 翻 dexie 救场；删后救不了
     - Stage 4.9 删 dexie 实现连带删 IndexedDB 缓存路径要谨慎：当前倾向 IndexedDB 保留作为纯本地缓存（server 是权威），决策细节留 Stage 4.9 这批 commit时确认
-
 - **2026-05-02 · Stage 2.5 摘双登录 UI + dexie-cloud-addon**
+
   - **背景**：new-deploy 是空库新实例 + 走"导入导出 only"路径，旧 Stage 1.5 设计的双登录 + `linked_dexie_email` mapping + `dexie-cloud-addon` 都成了误导，前置到 Stage 2.5 一次性清完，不等 Stage 5
   - **未来约束**：
     - 所有"是否启用账号系统"的 UI gate 用 `BackendAuth` 判断，**不再用 `DexieDBURL` 当代理变量**
     - AccountPage 单一登录入口（自家 JWT），不存在"原 Dexie 账号"区块
     - new-deploy 镜像不再依赖 `dexie-cloud-addon` 包；new-deploy 不连任何外部 Dexie SaaS
     - Stage 5 不再有"卸 addon"工作，收窄为"导入导出端到端验证"
-
 - **2026-05-02 · 部署分支拓扑硬切：双实例 my-deploy / new-deploy**
+
   - **背景**：「导入导出 only」迁移路径下 my-deploy 是老用户兜底实例、new-deploy 是新版独立实例，云同步重构代码不应同时进两个分支
   - **未来约束**：
     - **Stage 3+ 所有代码 / plan / spec 只合 `new-deploy`**，不再触碰 my-deploy
@@ -98,8 +99,8 @@
     - Northflank 服务 1 → my-deploy（老用户兜底，env 不开任何 backend flag），服务 2 → new-deploy（独立 Postgres + 全档 flag 开）
     - `backup/my-deploy-pre-reset` 远端永久保留 6 个月+，作为整体回滚逃生通道
     - force-push deploy 分支必须按 4 步走：① 建 `backup/<branch>-pre-reset` safety net；② 建承接代码的新分支；③ 本地 reset；④ `git push --force-with-lease`（不是 `--force`）
-
 - **2026-05-02 · 服务端 Import Job 设计敲定（Stage 4.5）**
+
   - **背景**：客户端跑全套 import（parse / 写 IndexedDB / push backend / 上传 attachment）在 200MB 数据 + 弱网场景下 OOM、tab 不能关、断网状态全丢
   - **未来约束**：
     - Stage 4.5 含 8 个 Step：ImportJob 模型 + S3 multipart 上传 5 个 endpoint + Phase A（解析）+ B（结构表）+ C（messages 文字）+ D（attachments → 对象存储）worker + WS 进度推送 + ImportDataDialog 重写（5MB 切片直传）+ `GET /api/v1/bootstrap` 首屏路由 guard
@@ -107,8 +108,8 @@
     - 200MB 用户体感"卡住"时间从 30-60min 降到 3-10min
     - 测试脚手架增量：MinIO 容器（端口 9100）+ `import-job` profile（端口 9015）+ helper `import-job.ts` + fixture `dexie_export.py`（small/medium/large/huge=200MB 四档）
     - DB 唯一约束保证每用户同一时刻只有 1 个 active job（partial unique index）
-
 - **2026-05-02 · 迁移路径转向：导入导出 only + 对象存储升格 Stage 4 硬前置**
+
   - **背景**：「客户端驱动一次性 push」路径在 200MB 老用户场景三处崩——WS event 带完整 row → broker `maxsize=200` 队列秒爆；`?since=N` 全 row 返回 → fetch 几十 MB；PG TEXT 列存 base64 attachment → 表线性膨胀
   - **未来约束**：
     - 「现有用户数据迁移」单一路径 = 老用户在 my-deploy ExportDataDialog 导出 → 在 new-deploy ImportDataDialog 导入；不存在自动后台迁移、不存在双写窗口、不存在迁移标记表、不存在 `/api/v1/migrate/status` endpoint
@@ -117,8 +118,8 @@
     - **Stage 4 硬前置 2（同上）**：对象存储分流，阈值 64KB；< 64KB inline 进 PG，≥ 64KB 走 multipart `/api/v1/blobs` 拿 ref；PG 行只存 `{type:'ref', url, sha256, size}`
     - **对外格式纪律**：导出 JSON 永远 base64 内联，**绝不**出现 `{type:'ref', url}` 字段；导出时新版 fetch 所有 ref blob → 重新 base64 内联，与旧版导出字节级互通
     - 失败回退路径 = 用回 my-deploy URL；旧版本地 + Dexie Cloud 数据完整无损（旧版根本不知道新版存在）
-
 - **2026-05-01 · 鉴权方案：JWKS 桥接废弃 → Stage 1.5 自家 JWT**
+
   - **背景**：实测 Dexie Cloud 未公开 JWKS、也无 token introspection 端点，原 Stage 1 计划的「JWKS 桥接鉴权」路径不可行
   - **未来约束**：
     - 所有 `/api/v1/*` 端点统一走自家 JWT 鉴权（`current_user` FastAPI 依赖项），**不再考虑桥接外部身份源**
@@ -148,6 +149,16 @@
 - **Stage 4 硬前置 1** ✅（仅 cursor 分页）`src-backend/data/pagination.py`（`CursorPage` envelope + `normalize_limit` + `build_page` + `CURSOR_MAX_LIMIT=1000`）+ `routers/providers.py` 的 list endpoint 加 `?limit=N` opt-in（不带 limit 维持 `list[Row]` 向后兼容，带 limit 升格为 `{rows, next_cursor}` envelope）+ `tests/api/test_pagination.py`（无 limit / 带 limit / 满页 next_cursor / 边界 / `limit<=0` 拒 / `>CURSOR_MAX_LIMIT` clamp / 续拉到 null 等多 case）。原设计中的 notify-only WS 协议 / per-table payload-mode / fetchAndDispatch 等整体放弃，详见 2026-05-02「硬前置 1 收窄」修订记录。流式云同步走 inline envelope，所有表（含 messages / artifacts）共用 Stage 1–3 现有协议
 - **测试脚手架** ✅ pytest（`tests/api/`，132 case 全绿 ~90s）+ Playwright（`tests/e2e/`，多 profile：baseline / providers-rest / realtime-{ws,sse,poll,auto}，72 passed / 264 skipped ~5 min；偶发 pre-existing flake `scenarioB ws auto-reconnect` + reactives cache-roundtrip race，单跑均稳）+ soak.sh（RSS / p95 / bundle 上线把关脚本）+ build profile cache（key = env-sha256 + git rev + package.json hash）
 - **Stage 4 横切 UX 修复** ✅ syncRef 输入抖动：默认 debounceMs=200 合并连续按键 + suppressSourceWhileEditingMs=1500 编辑期忽略 source echo + `flush:'sync'` watch 防止 source/user 写合并 trigger（Vue 默认 post-flush 会合并同 tick 内多次 ref 写，导致 timestamp echo detection 失效）+ `onScopeDispose` flush pending 不丢字 + EXPOSE_DB 守卫的 `__syncRefHarness__` test hook + `tests/e2e/stage4_pre/sync-ref-flicker.spec.ts` 5 case（debounce 合并 / echo 抑制 / 静默后远端更新生效 / legacy mode 0/0 / rapid edit + 并发 echo）。覆盖现有 5 处调用全部受益：CustomProvider / AssistantView / WorkspaceSettings / PluginAdjust / EnablePluginsItems。修用户报告的"输入服务商名时已输入字符被 server echo 覆盖"现场
+- **Stage 4 硬前置 3** ✅ 作用域过滤 + scoped pull + 4b/4c retrofit（4a workspaces 本身是顶层 scope 不需 retrofit）：
+  - 后端：`routers/dialogs.py::list_dialogs` 加 `workspace_id: Optional[str] = Query(None, alias='workspaceId')` 参数 + `WHERE workspace_id = X` 子句；同款给 `routers/items.py::list_items`（alias=`dialogId`）。两 endpoint response_model 升格为 `Union[list[Row], CursorPage[Row]]`，按是否带 `limit=` 切换 bare list / cursor envelope。与硬前置 1 cursor 协议正交，可 `?dialogId=Y&since=N&limit=200` 组合。无 scope 参数时维持原行为（向后兼容）
+  - 前端新增 `src/data/repositories/scoped-pull.ts`：`createScopedPull<TRow>(opts: {tableName, scopeField, fetchFn})` 返回 `{pullScope(scopeId), lastVersionFor(scopeId), applyEvent(e), scopeKeyFor, reset}`。scopeKey = `<table>:<scopeField>:<scopeId>`（前缀含表名避免跨表撞 key）；`Map<scopeKey, {lastVersion, inflight}>`；inflight 复用 + applyEvent 守卫（未 pull 过的 scope 不写入，不 speculatively create entry）
+  - 前端 retrofit `src/data/repositories/dialogs.server.ts`：scopeField=`workspaceId`，`pullForSpec(spec)` 用 `extractScopeId` 路由：scopeId 存在走 `scopedPull.pullScope`，否则 fallback 全表 `pull()`；`observeFind` mount 时主动 pullForSpec；realtime applyEvent 后顺手 `scopedPull.applyEvent` 双向 bump cursor；scoped fetchFn 内同时 bump 模块级 lastVersion（versions 来自共享 global_change_seq，单调）
+  - 前端 retrofit `src/data/repositories/items.server.ts`：同模板，scopeField=`dialogId`；scoped fetchFn 内 `Promise.all` decode（含 `materializeAttachment`）完毕**再**进 dexie tx（避免 Dexie callback 等非 Dexie promise 自动 abort）
+  - api: `tests/api/test_dialogs.py::test_list_with_workspace_id_filters_to_scope` / `::test_workspace_id_combined_with_since_and_limit`（cursor 续拉 + 跨页拼齐）/ `::test_workspace_id_account_isolation`（B 用 A 的 ws-id 返 200 + `[]`，不返 403）/ `::test_no_scope_param_returns_full_user_table`
+  - api: `tests/api/test_items.py::test_list_with_dialog_id_filters_to_scope` / `::test_dialog_id_combined_with_since_and_limit` / `::test_dialog_id_account_isolation` / `::test_no_dialog_id_param_returns_full_user_table`
+  - spec: `tests/e2e/stage4_pre/scoped-pull.spec.ts`（providers-rest profile 3 case + realtime-ws profile 1 case）：① 清空 IDB → observeFind({where:{dialogId:X}}) → 仅 X 的 items 进 IDB + 网络仅有 `?dialogId=X` 请求，无全表 fetch；② 连开 3 个 dialog → 3 次独立 scoped fetch + 0 全表 fetch；③ 同 scope 反复 mount 4 次 → 第一次 since=0、后续全部 since>0（cursor 单调）+ 总 fetch ≤ 1+follow-up 数；④ A 写 dlgX 的 item，B 仅观察 dlgY，realtime 推到 B，验证 B 后续首次 pullScope(dlgX) 仍 since=0（applyEvent 未 speculatively 给 dlgX 建 state entry）
+  - 测试输出：`pnpm test:api`（162 passed，新增 8 case）+ `pnpm test:e2e`（86 passed / 334 skipped；新增 4 active case）
+  - 故障注入红测：① 注释 `dialogs.py` 的 `if workspace_id is not None: stmt = stmt.where(...)` → `test_list_with_workspace_id_filters_to_scope` / `_combined_with_since_and_limit` 红，stdout 报 leaked row from another workspace（`{... workspaceId: 'ws2'}` 出现在 ws1 期望集中）；恢复后绿。② `items.server.ts::pullForSpec` 改为无条件 `await pull()`（去掉 scopedPull 分支） + `rm -rf tests/.builds/<profile>` 强制 rebuild → 4 e2e 全红，case4 stdout 报 `got 0: [{"url":"…/api/v1/items?since=56","dialogId":null,"since":"56"}]`（看到全表 fetch 而非 scoped）；恢复后绿
 
 ### 部署状态
 
@@ -157,16 +168,15 @@
   - 后端 Northflank 控制台 env：`BACKEND_DATA_API_ENABLED=true` + `JWT_SECRET=<random>` + `DATABASE_URL=<self-hosted PG>` + `ALLOW_REGISTRATION=invite` + `INVITE_CODE=aiaw-2026-beta`（dev preview 不开放注册；详见 CLAUDE.md「Northflank 部署侧约束 / 服务 2 / 注册模式」段）
   - Dockerfile 第二阶段含 `alembic upgrade head` 启动钩子
   - 实测：`/api/v1/health` `{status:"ok",db:"ok"}`、`/api/v1/auth/me` 401、`/api/v1/providers` 401、`/api/v1/reactives` 401、`/api/v1/assistants` 401、`/api/v1/avatar-images` 401、`/api/v1/installed-plugins` 401、`/api/v1/workspaces` 401、`/api/v1/dialogs` 401、`/api/v1/items` 401、`/api/v1/auth/register` 422
-  - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages + workspaces + dialogs + items 跨设备同步可用；workspace 删除时 dialogs + items 走 server 端真二级级联（同事务 tombstone + 各发 WS event，共用 cascade_version）；items.contentBuffer ≥ 64KB 自动走对象存储 ref + 跨 tab `materializeAttachment` 字节级一致；其他 2 张表（messages / artifacts）仍只在本地 IndexedDB，workspace 删除时由前端 `stores/workspaces.ts::deleteItem` 顺序 await 清；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
+  - **当前能用 / 不能用**：providers + reactives + assistants + installedPlugins + avatarImages + workspaces + dialogs + items 跨设备同步可用；dialogs / items 已支持 scoped pull（按 `?workspaceId=` / `?dialogId=` lazy 拉，打开单 dialog 不再触发全表 fetch）；workspace 删除时 dialogs + items 走 server 端真二级级联（同事务 tombstone + 各发 WS event，共用 cascade_version）；items.contentBuffer ≥ 64KB 自动走对象存储 ref + 跨 tab `materializeAttachment` 字节级一致；其他 2 张表（messages / artifacts）仍只在本地 IndexedDB，workspace 删除时由前端 `stores/workspaces.ts::deleteItem` 顺序 await 清；老用户旧数据无法导入（ImportJob 未做）。**仅适合自己 dev preview，不要导入真实数据，也不要邀请他人**
 
-### 下一步：硬前置 3（作用域过滤 + scoped pull）+ 4a/4b/4c retrofit
+### 下一步：批次-4d artifacts
 
-按 2026-05-03 修订记录，4d / 4e 落地前必须先做硬前置 3：① 后端 `list_workspaces` / `list_dialogs` / `list_items` 加 `?workspaceId=` / `?dialogId=` 过滤参数（与硬前置 1 cursor 协议正交，可 `?dialogId=Y&since=N&limit=200` 组合）；② 前端 `<table>.server.ts` 引入 scoped pull——`observeFind(spec)` 把 `spec.where.workspaceId` / `spec.where.dialogId` 解析为 server query，scope 内独立维护 `Map<scopeKey, lastVersion>` cache；③ retrofit 已落地的 dialogs / items（不含 workspaces，workspaces 本身就是顶层 scope）。硬前置 3 是「服务端优先 / 即点即看」三需求第一条的核心兑现路径，比 4d artifacts 优先级更高。落地后再按依赖顺序：4d artifacts（依赖硬前置 2 + 3）→ 4e messages（依赖硬前置 1+2+3，含流式节流策略）。
+硬前置 3（作用域过滤 + scoped pull）已落地，4d / 4e 解封。下一步按依赖顺序：批次-4d `artifacts`（依赖硬前置 2 对象存储 + 硬前置 1 cursor + 硬前置 3 scoped pull）——`workspaceId` / `dialogId` 双 FK，自带 scoped pull（不允许全表 pull 触发场景），≥ 64KB 走对象存储 ref。落地后再做批次-4e `messages`（含流式节流 200ms+1KB+sentence 三触发，`?dialogId=` mandatory）。
 
 ### 未启动（按依赖顺序）
 
-- **Stage 4 硬前置 3** 作用域过滤 + scoped pull + 4a/4b/4c retrofit ⏳ ← **下一步**，4d/4e 强依赖
-- **Stage 4 主体** 批次-4d `artifacts` → 批次-4e `messages`（含流式节流 200ms+1KB+sentence 三触发）⏳
+- **Stage 4 主体** 批次-4d `artifacts` → 批次-4e `messages`（含流式节流 200ms+1KB+sentence 三触发）⏳ ← **下一步从 4d 起**
 - **Stage 4.5** 服务端 Import Job + bootstrap ⏳ ← **可让老用户用的物理分水岭**
 - **Stage 4.7** 离线 outbox（IDB outbox 表 + 重连 flush + LWW）⏳ ← 4.9 前置
 - **Stage 4.9** flag 路由层 + dexie 实现一次性下架 ⏳ ← 需 Stage 4.5 端到端验收通过 + 4.7 稳定运行 ≥ 3 天
@@ -179,6 +189,7 @@
 ### 1.1 同步相关文件（按职能分类）
 
 **前端 — 同步基础设施**
+
 - `src/utils/db.ts` — Dexie schema (v6, 10 张活跃表 + 1 张废弃 `canvases`) + `db.cloud.configure({ databaseUrl: DexieDBURL, requireAuth: false, customLoginGui: true, nameSuffix: false })`，仅当 `DexieDBURL` 非空时才挂载 `dexieCloud` addon
 - `src/utils/config.ts` — 暴露 `DexieDBURL` / `LitellmBaseURL` / `BudgetBaseURL` 等同步/账户/计费相关字段
 - `src/composables/live-query.ts` — `useLiveQuery` / `useLiveQueryWithDeps`（基于 `dexie/liveQuery` + `useObservable`）
@@ -187,6 +198,7 @@
 - `src/composables/sync-ref.ts` — 双向同步 ref
 
 **前端 — 同步状态/账户 UI**（直接依赖 `db.cloud.*`）
+
 - `src/composables/login-dialogs.ts`（`db.cloud.userInteraction` + `db.cloud.currentUser`）
 - `src/composables/first-visit.ts`（`db.cloud.login()`）
 - `src/composables/subscription-notify.ts`、`src/composables/get-model.ts`
@@ -194,11 +206,13 @@
 - `src/router/routes.ts:80-85` — 根据 `DexieDBURL` 是否存在条件性注册 `/account`、`/model-pricing`
 
 **前端 — 业务侧直读直写 db 的位置**（耦合点）
+
 - Pinia stores: `src/stores/{workspaces,assistants,providers,plugins,user-data}.ts`
 - Composables: `src/composables/{create-dialog,create-artifact,close-artifact,workspace-actions}.ts`
 - View: `src/views/DialogView.vue` 大量 inline `db.<table>.*` + `db.transaction()`
 
 **后端**
+
 - `src-backend/app.py` — 仅 `/cors/proxy`、`/doc-parse/parse`、`/searxng`、`/`（静态）。**不涉及同步**。
 - 同步走 Dexie 官方 SaaS，仓库未自部署同步服务器；`package.json`: `dexie@^4.0.11` + `dexie-cloud-addon@^4.0.11`。
 
@@ -231,6 +245,7 @@ UI 组件 ──→ Pinia store / composable ──→ db.<table>.add/put/update
 ### 1.3 同步逻辑 ↔ 业务逻辑耦合点
 
 无中间层。**32 个文件直接 `import { db }`** 并调用 `db.<table>.*` 或 `db.cloud.*`。具体高耦合区：
+
 - `src/stores/workspaces.ts:12-65` — store 既存数据又写数据；删除工作区时直接 `db.transaction` 级联清 dialogs/messages/artifacts
 - `src/views/DialogView.vue:486-1140` — 在 view 里 inline CRUD + 事务
 - `src/composables/persistent-reactive.ts:5-29` — 把 `db.reactives` 当作通用 KV 用，`user-data` store 等都依赖它
@@ -239,6 +254,7 @@ UI 组件 ──→ Pinia store / composable ──→ db.<table>.add/put/update
 ### 1.4 同步逻辑对外接口（其他模块的入口）
 
 非显式 API，目前以四种形式暴露：
+
 1. **Pinia store 的属性**（liveQuery 驱动的响应式数组）—— 业务读路径几乎全走这条
 2. **`db.cloud.currentUser` Observable** —— `useObservable` 包装后给 UI 用（账户按钮、定价页、登录对话框）
 3. **命令式 `db.cloud.{login, logout, sync, userInteraction}`** —— 在页面里直接调
@@ -262,6 +278,7 @@ UI 组件 ──→ Pinia store / composable ──→ db.<table>.add/put/update
 **目标**：消除 `db.<table>.*` 与 `db.cloud.*` 的直接调用；为后续阶段建立替换点。
 
 **新增**
+
 - `src/data/repositories/{workspaces,dialogs,messages,assistants,artifacts,plugins,reactives,avatars,items,providers}.ts`
 - `src/data/types.ts` — `Repository<T,K>` / `Query<T>` / `SubscriptionHandle`
 - `src/data/auth.ts` — 包 `db.cloud.{currentUser, login, logout, sync, userInteraction}`，导出 `AuthSource`
@@ -269,6 +286,7 @@ UI 组件 ──→ Pinia store / composable ──→ db.<table>.add/put/update
 - `src/data/observe.ts` — `observe(querier)`，初始实现转发给 `useLiveQuery`
 
 **接口草稿**
+
 ```ts
 interface Repository<T, K = string> {
   get(id: K): Promise<T | undefined>
@@ -311,6 +329,7 @@ interface AuthSource {
 **做什么**：`docker-compose.yml`（Postgres 16 容器映射到 host:5433）；`src-backend/data/db.py`（SQLAlchemy 异步 engine + session）；`app.py` 加 `/api/v1/health`；`alembic init`。
 
 **通过判据**：`curl /api/v1/health` 返回 `{status:"ok", db:"ok"}`；`docker compose exec postgres psql ...` 能连。
+
 - api: `tests/api/test_health.py::test_health_returns_ok`
 
 #### Step 2 — `providers` 表 + 基础 CRUD（**先不带鉴权**）✅ commit `62318f6`
@@ -318,6 +337,7 @@ interface AuthSource {
 **做什么**：`models/provider.py`（含 `version` / `updated_at` / `deleted_at`）；首个 alembic migration（建表 + `global_change_seq` SEQUENCE）；`routers/providers.py` 提供 GET/PUT/DELETE /api/v1/providers[/:id] + `?since=`；`user_id` 暂以 `DEV_USER_ID` 环境变量占位。
 
 **通过判据**（纯 curl，零前端依赖）：6 场景全过 — PUT 新增 / list / get / PUT 更新 bumps version / `?since=N` 过滤 / soft-delete 后 list 仍能拿到 tombstone；Postgres 直查行存在。
+
 - api: `tests/api/test_providers.py::test_put_creates_and_list_returns_it`（PUT 新增 + list + Postgres 直查）
 - api: `tests/api/test_providers.py::test_get_returns_single_row`（GET）
 - api: `tests/api/test_providers.py::test_put_update_bumps_version`（PUT 更新 bumps version）
@@ -352,6 +372,7 @@ interface AuthSource {
 #### Step 7 — 端到端验证（Stage 1 收官）
 
 **4 个场景**：
+
 1. **清缓存恢复**：开 flag → 加 3 个 provider → 清 IndexedDB → 刷新 → 3 个回来
 2. **跨设备同步**：浏览器 A、B 都登 backend 账号 X → A 改 → B 刷新看到（实时由 Stage 2 接管，本阶段允许刷新）
 3. **flag 关闭回滚**：关 flag → 刷新 → UI 走缓存数据 → 行为回到 Stage 0
@@ -364,6 +385,7 @@ interface AuthSource {
 ### Stage 1.5 — 自家鉴权（多用户 Ready）
 
 > **⚠️ 部分内容已清理（2026-05-02 · Stage 2.5 落地完成）**：本段中以下与「双写窗口 / Dexie 账号关联」相关的设计在导入导出 only 路径下从未生效，已在 Stage 2.5 整体清理：
+>
 > - ~~`users.linked_dexie_email` 列 + UNIQUE 约束 + alembic migration~~（drop migration `c4f1e2d3a8b0` 已落地）
 > - ~~`POST /api/v1/auth/link-dexie` endpoint + `tests/api/test_auth.py::test_link_dexie_first_write_wins`~~
 > - ~~前端首次登录调 `link-dexie` 的逻辑~~（实际从未接入，从 plan 中抽除）
@@ -375,6 +397,7 @@ interface AuthSource {
 **目标**：上线一套自家管控的多用户鉴权，作为后续所有 `/api/v1/*` 端点的统一身份来源。Stage 5 不再需要做"切换鉴权"。
 
 **后端新增**
+
 - `src-backend/data/models/user.py` — `User(id, email UNIQUE, password_hash, status, created_at, last_login_at)`
 - `src-backend/data/models/refresh_token.py` — `RefreshToken(id, user_id FK, token_hash, expires_at, revoked_at NULL, created_at)`
 - `src-backend/data/auth.py` —
@@ -393,6 +416,7 @@ interface AuthSource {
 > 原计划含 `users.linked_dexie_email NULL UNIQUE` 列 + `POST /api/v1/auth/link-dexie` endpoint，用于"双写窗口期间把 dexie 账号 ↔ backend 账号配对"。导入导出 only 路径下整套机制无意义，已在 Stage 2.5 整体清理（drop 列 migration `c4f1e2d3a8b0`，endpoint 从未接入）。
 
 **前端新增**
+
 - `src/data/auth.ts` 新增 `BackendAuthSource` 实现 `AuthSource`：
   - `login()` 弹自家邮箱 + 密码表单（最小可用，复用 Quasar Dialog）
   - 内存 + `localStorage` 持久 access/refresh token；自动刷新
@@ -403,14 +427,17 @@ interface AuthSource {
 - `src/router/routes.ts`：`/account` 页在 `BACKEND_AUTH=true` 时绑定 `BackendAuthSource`，否则维持原逻辑
 
 **单一登录入口（2026-05-02 · Stage 2.5 整理后）**
+
 - new-deploy 镜像不挂 `dexie-cloud-addon`，AccountPage 只显示自家 JWT 登录入口
 - 不存在"原 Dexie 账号"区块、不存在双写窗口、不存在 dexie email ↔ backend account 配对机制
 - 老用户的迁移路径 = 旧版 ExportDataDialog 导出 → 新版 ImportDataDialog 导入（详见「现有用户数据迁移」段），不依赖账号关联
 
 **Migration**
+
 - `users` 表 + `refresh_tokens` 表的 alembic migration
 
 **验证（4 个独立场景）**
+
 1. 注册新账号 A、B → `auth/me` 各返回各的 `user_id`
 2. A 登录后 PUT `/api/v1/providers/p1` → 切到 B 登录后 GET 看不到 p1（账号隔离）
 3. access token 故意过期 → 客户端自动 refresh → 不需要重新输密码
@@ -430,6 +457,7 @@ interface AuthSource {
 **回滚**：env `BACKEND_AUTH=false` 立即回到 Stage 0 行为；后端的 `users` 表和 endpoints 留着，不影响。
 
 **风险**
+
 - **JWT_SECRET 泄露** = 全部用户冒充。**缓解**：env 文件不入 git；生产用密钥管理服务；定期轮换（轮换时所有 access token 失效，用户需重新登录）。
 - **无邮箱验证** = 注册阶段允许任意邮箱。**缓解**：MVP 阶段默认 `ALLOW_REGISTRATION=invite`，仅自己持有邀请码；公网开放时再补 SMTP + 验证邮件。
 
@@ -440,6 +468,7 @@ interface AuthSource {
 **目标**：让 server 在写发生后主动推给所有在线 Tab，Tab 收到后回填本地 IndexedDB → liveQuery 自动触发 → UI 自动刷新。业务代码（仍调 `repos.<table>.observeList()`）无感切换。Stage 1 的「Tab A 改 → Tab B 必须 F5」问题在这一阶段消除。
 
 **核心机制（业界实践对齐）**
+
 - **Pub/sub**：单进程内存 broker（`asyncio.Queue` per 订阅），多实例扩展时切 Redis pub/sub。参考 Centrifugo / NATS / Phoenix Channels MVP 起步同款。
 - **事件来源**：API 写路径手动 publish（不挂 LISTEN/NOTIFY 也不挂 WAL 复制槽）。简单可控、不依赖 DB 特性。
 - **多路复用**：单 WS / 多表订阅 / 客户端 refcount。参考 GraphQL Subscriptions、Supabase Realtime。
@@ -458,6 +487,7 @@ interface AuthSource {
 #### Step 1 — 后端：内存 pub/sub broker + WS 端点
 
 **做什么**
+
 - `src-backend/realtime.py`：
   - `Broker` 类 —— `subscribers: dict[user_id, set[Subscription]]`；`publish(user_id, event)` 推到所有订阅；`Subscription` 持有 `asyncio.Queue(maxsize=200)` + 表过滤集合
   - 进程级单例，按 `_enable_backend_data_api()` flag 守卫 lazy import（与 auth/providers 同款）
@@ -474,6 +504,7 @@ interface AuthSource {
 - `src-backend/app.py`：把 `realtime` router 加进 `_enable_backend_data_api()` 的挂载列表
 
 **通过判据**（纯 Python 测试脚本，零前端依赖）
+
 1. 两个 `websockets` 客户端用 user A 的 token 连上 `/api/v1/stream` 并 subscribe `providers` → curl PUT 一个 provider → 两个连接都收到事件
 2. user A 的 WS 连接对 user B 的 PUT 不应收到事件（账号隔离）
 3. 客户端发 `{type:'subscribe', table:'providers', since:0}` → 收到全部历史 + `replay-done` → 之后再 PUT → 收到 live 事件
@@ -490,6 +521,7 @@ interface AuthSource {
 #### Step 2 — 前端：`SyncSource` 接口 + `DexieSyncSource`（纯重构）
 
 **做什么**
+
 - `src/data/sync-source.ts`：
   ```ts
   interface ChangeEvent<T> { op: 'put' | 'delete'; id: string; row?: T; rev?: number }
@@ -502,12 +534,14 @@ interface AuthSource {
 - `src/data/repositories/dexie.ts` 的 `observeList` / `observeOne` 改为内部使用 `DexieSyncSource`（接口不变，业务无感）
 
 **通过判据**
+
 - `pnpm build` 通过（含 type check）
 - 手测：建工作区 / 建 dialog / 发消息 / 跨标签页 Dexie Cloud 同步 —— 行为与 Stage 1 字节级一致
 
 #### Step 3 — 前端：`RemoteSyncSource`（WS-only，不做降级）
 
 **做什么**
+
 - `src/data/realtime-ws.ts`：
   - `RealtimeConnection` 单例 —— 整个 app 一个 WS
   - 连接时构造子协议头 `bearer.<token>`（从 `authSource.currentToken()` 取）
@@ -519,11 +553,13 @@ interface AuthSource {
 - 暂不接 repository（仍是 console 测试模式）
 
 **通过判据**（Console 调，绕开 UI）
+
 - 场景 A：Console 调 `realtime.subscribe('providers', e => console.log(e))` → 第二 tab PUT → 看到 event
 - 场景 B：主动断网 5s 再连 → Console 看到自动重连日志，订阅恢复
 - 场景 C：让 token 过期（手动 setTimeout 改本地 token）→ 看到 close 4001 → refresh → 重连
 
 **当前状态（2026-05-02）**
+
 - 代码：commit `aa0f25b`（`src/data/realtime-ws.ts` + `src/data/index.ts` 导出）；副 commit `e73e52e`（AccountPage 退出登录级联）
 - 场景 A ✅ **通过**：Console 订阅后能收到 event（WS 握手、`bearer.<token>` 子协议鉴权、`since=<lastRev>` SQL replay、event 派发到 listener 全部 OK）。`'idle'` 边界 bug 已由「已知问题 #1」修复消除（见下方）。
 - 场景 B ✅ **由 Phase 6 自动化覆盖**：`tests/e2e/stage2/step3-realtime-recovery.spec.ts::scenarioB ws auto-reconnect after offline window`，realtime-ws profile 走 `window.aiawRealtime.subscribe` + `setOffline` 闭环验证 backend 写入在重连后由 SQL replay 追上。
@@ -531,22 +567,24 @@ interface AuthSource {
 - spec: `tests/e2e/stage2/step3-realtime-recovery.spec.ts`
 
 **已知问题**
+
 1. ~~**`RealtimeConn` 进入 `'idle'` 后无自动恢复**~~ ✅ **已修复**
+
    - 原现象：`ensureConnected()` 检查 token，token 暂时为 null（如 reconnect 路径里 refresh 还在飞 / HMR 重置单例）→ 状态置 `'idle'` 直接 return，再无定时器 / 监听器把它推回连接尝试。只有新的 `subscribe()` 调用能触发 `ensureConnected()`。
    - 影响：场景 B 重连测试不可靠；场景 C token 过期路径理论上由 `tryRefresh().then(scheduleReconnect)` 兜底，但若 refresh 失败会一样卡死。
    - 修复：`realtime-ws.ts` 加 `wakeIfIdle()` + 模块级 `watch(authSource.user)`，null→user 跳变时主动叫醒。覆盖冷启动 subscribe 早于登录、4001 + refresh 失败后重登两条主路径。详见「修订记录 2026-05-02 · 已知问题 #1 修复」。
-
 2. ~~**（Step 4 前置疑点）UI 不刷新疑似 dexie-cloud-addon middleware 吞读写**~~ ✅ **已修复**
+
    - 原现象：仅登 backend 账号（未登 Dexie）时，Console PUT provider → server 200 OK → WS event 派发到 listener 正常 → 但 UI 列表无新条目；`db.providers.toArray()` 直查 Promise 挂 pending。
    - 根因：dexie-cloud-addon 把所有非 `$` 表默认标 `markedForSync = true`，三个 dbcore middleware（`idGeneration` / `implicitPropSetter` / `mutationTracking`）对这些表的 readwrite 路径并入 `$<table>_mutations` 事务并写 `owner`/`realmId`，依赖 `trans.currentUser` 上下文，与 backend-only 用户冲突。
    - 修复：方案 (b) 的精细化版本——`src/utils/db.ts` 给 `db.cloud.configure(...)` 加 `unsyncedTables`（按 `BackendDataTables ∩ SERVER_CAPABLE_TABLES` 计算）。flag 开时 `providers` 退化为纯 Dexie 表，三个 middleware 全部短路；其它仍走 Dexie Cloud 的表不受影响。详见「修订记录 2026-05-02 · 已知问题 #2 修复」。
-
 3. **（旁支跟踪，非本 Step 范围）`persistent-reactive` 脏状态竞态**
+
    - 现象：先登 backend、再登 Dexie 场景下，第一次输入正确验证码后 UI 无反应、刷新才生效；且加载的数据缺失默认 provider / 默认模型 / 系统助手等设置（`persistent-reactive` KV 存的字段），第二次重试又能恢复。
    - 历史：commit `4258fa8` 修过 clean-state 路径，dirty-state 在 5s 超时边界仍有问题。
    - 决策：跟踪中、不阻塞 Stage 2；Stage 3 迁 `reactives` 表时一起重新审视。
-
 4. **（旁支跟踪）Dexie Cloud 登录 preflight 400**
+
    - 现象：本机环境某些时刻点"登录 Dexie 账号" → `dexie-cloud-addon.js:5780` 报 `TypeError: Load failed`，Network 看到 SaaS 端 `/login` preflight 400。
    - 怀疑：dev server 端口或本机环境的 CORS 触发 SaaS 侧策略，或 Dexie SaaS 临时问题。
    - 决策：Stage 2.5 已摘 `dexie-cloud-addon`，问题应已自然消失；如再现需重新评估。
@@ -554,6 +592,7 @@ interface AuthSource {
 #### Step 4 — 把 `providers.server.ts` 接到 `RemoteSyncSource`
 
 **做什么**
+
 - `providers.server.ts` 的 `observeList` / `observeOne` 改为：
   - 内部仍返回 `DexieSyncSource` 的 ref（这样 UI 读路径不变，liveQuery 仍驱动 Vue ref）
   - 同时启动一个 `RemoteSyncSource` 订阅，事件到来时把 row 写入 `db.providers` 缓存（put / delete）→ liveQuery 触发 → UI 自动更新
@@ -561,11 +600,11 @@ interface AuthSource {
 - 首次订阅时带 `since=<本地 db.providers 里最大 version>`，server 回放追上
 
 **通过判据**
+
 - Tab A、Tab B 都开 `BACKEND_DATA_API_URL` + `BACKEND_AUTH` + `BACKEND_DATA_TABLES=providers` + `REALTIME_TRANSPORT=ws`
 - A 创建 / 修改 / 删除 provider → B 在 500ms 内 UI 更新（不刷新页面）
 - B 离线 30s 期间 A 改 3 次 → B 网络恢复 → 重连 → 3 次变更追上 → UI 一致
 - `REALTIME_TRANSPORT` 改空 / poll → 退化到 Stage 1 行为，A 改后 B 必须刷新
-
 - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case1 ws double-tab`（实时联动）
 - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case2 ws reconnect catch-up`（30s 离线追平）
 - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case3 providers-rest no-realtime`（无 WS 退化）
@@ -574,6 +613,7 @@ interface AuthSource {
 #### Step 5 — 降级路径（SSE + poll）
 
 **做什么**
+
 - `REALTIME_TRANSPORT` 取值：`ws`（默认）/ `sse` / `poll` / `auto`
 - 后端：`GET /api/v1/stream/sse?since=<rev>&tables=providers`
   - 标准 `text/event-stream`；`id:` 字段用全局 rev；EventSource 自动用 `Last-Event-ID` 重连
@@ -586,6 +626,7 @@ interface AuthSource {
   - 当前实际生效的 transport 通过 `window.aiawRealtime.transport`（取值 `'ws' | 'sse' | 'poll'`）暴露，复用 `src/boot/expose-debug.ts` 已有的 `EXPOSE_DB=true` 守卫与现有 `window.aiawRealtime.subscribe` 同一钩子点，供 e2e 验证 auto 真正降到了哪一档
 
 **脚手架增量**（与 plan 维护规则同步在 Step 5 落地批次内一并加进 `playwright.config.ts` / `tests/env/` / `tests/scripts/`）
+
 - 3 个新 profile + 端口 + env 文件：
   - `realtime-sse` → 9012 → `tests/env/.env.test.realtime-sse`（`REALTIME_TRANSPORT=sse`，其余 flag 同 `realtime-ws`）
   - `realtime-poll` → 9013 → `tests/env/.env.test.realtime-poll`（`REALTIME_TRANSPORT=poll`）
@@ -597,6 +638,7 @@ interface AuthSource {
 - `tests/README.md` §helper ↔ plan 词汇表追加 `blockSSE` 一行；§已知预期红段在 spec-first 提交时短暂登记 case1-4 的红信号，Step 5 代码落地后清空
 
 **通过判据**
+
 - `REALTIME_TRANSPORT=sse` → 双 tab 联动正常（延迟略高于 WS，可接受）
   - spec: `tests/e2e/stage2/step5-transport-degradation.spec.ts::case1 sse double-tab`
   - api: `tests/api/test_realtime_sse.py::test_sse_replay_then_live`
@@ -618,6 +660,7 @@ interface AuthSource {
 > Step 6 不引入新功能，只做 Stage 2 整体回归 + 非脚手架可覆盖的「软性」上线把关 + 翻 Stage 2 上线 flag。所有「协议 / 实时通道 / 降级」类判据已在 Step 1-5 的 spec / api 里沉淀，本 Step 仅 reuse 复跑、不重写。
 
 **回归判据（reuse 既有 spec / api，不重写）**
+
 1. **WS 双 tab 联动**
    - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case1 ws double-tab`
 2. **重连补漏 / token 过期 / server 4001**
@@ -637,11 +680,13 @@ interface AuthSource {
    - spec: `tests/e2e/stage2/step4-providers-realtime.spec.ts::case4 baseline byte-identical`
 
 **上线把关判据（脚手架不覆盖，本 Step 必须手测 + 把结果数字写进进度快照）**
+
 - **bundle 体积变化**：分别用 `pnpm test:build --profile=baseline` 与 `pnpm test:build --profile=realtime-ws`（均强制 cache miss，可改一字符 env 触发）→ diff 两份 `tests/.builds/<profile>/<key>/assets/*.js` 的总大小，差值在 ~+10 KB ± 5 KB 内（含 EventSource polyfill）即视为可接受；记入快照「bundle KB 数」字段
 - **后端无内存泄漏**：`pnpm test:backend:start` 起 9011 → 跑本 Step 新增的 `tests/scripts/soak.sh`（循环 PUT + 多 WS 订阅 1h，幂等可中断）→ 期间每 5 min 抓一次 `ps -o rss= -p <pid>`，结束时与启动 5 min 后基线相比涨幅 < 30 MB；记入快照「RSS 起止 MB 数」字段
 - **延迟 p95**：暂不进自动化（`helpers/sync.ts.expectRowSync` 当前只 poll 不出分布）；本 Step 用浏览器 DevTools 手测 100 次 PUT，目测 95% 在 500 ms 内即可；记入快照「p95 ms 数」字段。Stage 3+ 若需要硬性 SLA，再扩 helper 收集 percentile
 
 **Stage 2 出口判据**
+
 - 「回归判据」5 类全部 reuse 复跑全绿（含 Step 5 新增的 SSE / poll / auto case）：`pnpm test:api && pnpm test:e2e -g "stage2|stage1_5|smoke"` 一把全绿
 - 「上线把关判据」3 条手测结果（bundle KB / RSS MB / p95 ms 三个具体数）写进 plan 进度快照
 - 走「上线但不启用」策略：合并到 new-deploy 时 `REALTIME_TRANSPORT` 默认空 → 行为字节级等同 Stage 1 收尾；按需在 Northflank 控制台开 flag 灰度
@@ -649,6 +694,7 @@ interface AuthSource {
 **回滚**：`REALTIME_TRANSPORT=` 空（关闭实时通道，退回 Stage 1 行为）；如有更严重问题，从 `BACKEND_DATA_TABLES` 摘掉 providers 退回 Stage 0 行为。
 
 **风险**
+
 - **重连风暴**：100 个 tab 同时重连撞 server。**缓解**：客户端指数退避 + 抖动；server 端连接数硬限制（`MAX_WS_PER_USER=20`），超过直接 reject。**对应自动化**：暂无（hard limit 触发态在 e2e 模拟成本高），靠「上线把关判据」soak 阶段的多 WS 订阅压力 + Step 1 `test_ws_account_isolation` 反向证明 broker 不会跨 user_id 串
 - **漏事件**：server 重启 / 长时断网期间事件丢失。**缓解**：每个 event 带 `rev`，客户端记 `lastRev`，重连发 `since=<lastRev>` 让 server SQL 回放。**对应自动化**：`step4 case2 ws reconnect catch-up` + `step3 scenarioB ws auto-reconnect after offline window`
 - **慢客户端拖垮 server**：订阅队列堆积。**缓解**：`maxsize=200` + 满了 close 客户端，让它走重连补漏。**对应自动化**：暂无（200 条事件灌入实测成本高），靠「上线把关判据」1h soak 的 RSS 涨幅曲线反向兜
@@ -842,15 +888,16 @@ interface AuthSource {
 **5 张表 5 个批次**，依赖排序硬约束（每张表都有重大 schema 决策不可合并）：
 
 - **批次-4a · `workspaces`**（先做，建立级联事务的设计基线）
+
   - schema 决策：folder 自引用 FK + `parentId` NULL（root）vs 自引用 FK + `parentId` 必填指向虚拟 root；level 限制（避免无限嵌套）；`type` 字段约束（`'workspace' | 'folder'`）
   - 后端：`DELETE /api/v1/workspaces/:id?cascade=true` 在单个 PG 事务里清掉所有 dialogs / messages / items / artifacts / assistants（级联实现先用 `ON DELETE CASCADE`，再加 row-level user_id check）
   - 测试：`tests/api/test_workspaces.py` ~12 case（CRUD + 级联删除 + folder 树深度 + 跨 user 不能跨删 + cascade=false 走"非空时拒绝删"）；`tests/e2e/stage4/workspaces-cascade.spec.ts` ~4 case（UI 删工作区 → 子 dialogs / messages 实时消失 + server 行清空 + 第二 tab 同步看到删除）
-
 - **批次-4b · `dialogs`**（依赖 workspaces FK）
+
   - schema 决策：`workspaceId` FK + `ON DELETE CASCADE`；is_active / draft 字段
   - 测试：`tests/api/test_dialogs.py` ~8 case（CRUD + workspaceId FK 失效拒绝 + 级联删 messages / items / artifacts）；`tests/e2e/stage4/dialogs-realtime.spec.ts` ~4 case
-
 - **批次-4c · `items`**（FK→dialogs，**依赖硬前置 2 BlobStore**——items 是消息附件载体）
+
   - **schema 决策**（2026-05-03 修订；废弃旧"独立简单叶子表 + dialogId 可为 null"假设）：
     - `dialog_id` 提到顶层列、FK→`dialogs.id` ON DELETE CASCADE，**必填不可 null**（与代码 `StoredItem.dialogId:string` 一致）
     - `data:JSONB` opaque 列承载 `{id, dialogId, type:'text'|'file'|'quote', references:number, contentText?, contentBuffer?:AttachmentEnvelope, name?, mimeType?}`，其中 `contentBuffer` 字段在 wire 上是 `AttachmentEnvelope`（来自 `blob-client.ts`）：
@@ -863,13 +910,13 @@ interface AuthSource {
   - **测试**：`tests/api/test_items.py` ~10 case：基础 CRUD（put / get / list / delete + soft-delete tombstone + delete-then-put-revives + since 增量 + account isolation + unauth 401）+ FK 校验（`test_put_rejects_missing_dialog_id` / `test_put_rejects_unknown_dialog` / `test_put_rejects_cross_user_dialog`）+ ref 形态（`test_put_item_with_inline_attachment` / `test_put_item_with_ref_attachment_round_trips` / `test_inline_below_64kb` / `test_ref_at_or_above_64kb`）+ workspace cascade（`test_workspace_cascade_true_tombstones_items_via_dialog`）+ dialog cascade（`test_dialog_delete_cascades_items_via_pg_fk`，验证 PG 层 ON DELETE CASCADE 真触发）+ 跨 user 不能跨删
   - **测试**：`tests/e2e/stage4/items-realtime.spec.ts` ~5 case：① ws 双 tab 小 inline item put / update / delete realtime 同步（与 dialogs case1 同模板）；② ws 双 tab 100KB ref attachment：A 写入 → blob-client 走 ref → B realtime 收到 → `materializeAttachment` 还原 → contentBuffer bytes 字节级一致；③ workspace delete cascade：A 删 workspace → B 收到一组 dialogs + items tombstone events → IndexedDB 清空；④ providers-rest profile 无 realtime 刷新仍同步；⑤ baseline profile 走 dexie（4.9 删除）。**故障注入**（必须真跑红一次再绿）：跑 case2 时把 `items.server.ts` 的 `materializeAttachment` 注掉一次，验证 stdout 报"contentBuffer bytes mismatch / B got undefined while A had ArrayBuffer(102400)"；恢复后绿
   - **避坑**：见 2026-05-03 修订记录尾的避坑段（不要拷 avatarImages 模板 / 不要在 PG 拆 attachment 列 / `serializeAttachment` 是 async 走网络 / `materializeAttachment` 失败容忍 / cascade 共用 cascade_version）
-
 - **批次-4d · `artifacts`**（依赖 Stage 4 硬前置 2 对象存储 + 硬前置 1 cursor 分页 + 硬前置 3 scoped pull）
+
   - schema 决策：内容字段大小阈值 → ≥ 64KB 走对象存储 ref；`workspaceId` / `dialogId` 双 FK
   - lazy 路径：`artifacts.server.ts` 必须自带 scoped pull（`?workspaceId=X` / `?dialogId=Y`），不允许全表 pull 触发场景（除非用户主动调 `repos.artifacts.list()`，仍兼容）
   - 测试：`tests/api/test_artifacts.py` ~10 case（CRUD + 大行 ref 序列化 + 64KB 边界 + 同 sha256 去重 + level 0 inline 兜底 + cursor 分页 + workspaceId/dialogId scope 过滤）；`tests/e2e/stage4/artifacts-large.spec.ts` ~5 case（UI 创建 5MB artifact → ref 上对象存储 → 第二 tab 渲染 + 清缓存重拉，**走 inline envelope 流式同步，不走 notify-only**；新增 case：打开 workspace X → 仅 X 的 artifacts 进 IDB，其他 workspace 的不出现）
-
 - **批次-4e · `messages`**（最难，最后做，依赖 Stage 4 硬前置 1 cursor 分页 + 硬前置 2 对象存储 + 硬前置 3 scoped pull + 流式节流）
+
   - schema 决策：attachment 字段 `{type:'inline', data:base64}` vs `{type:'ref', url, sha256, size, content_type}`；message 顺序保证（rev / created_at / explicit `order` 字段）；`dialogId` FK；DialogView 的滚动加载靠 cursor + `?since` 双语义 ↔ "拉旧" vs "拉新"
   - lazy 路径：`messages.server.ts` 的 `?dialogId=` 是 **mandatory**（不带 422 reject，全表 messages 拉无意义且撑爆响应）；首屏靠 bootstrap response 里的 `messages_recent` 直接渲染，滚动加载用 `?dialogId=Y&since=N&limit=200` cursor 续拉
   - **流式节流策略（2026-05-03 修订）**：流式 token 入口（`composables/call-api.ts` / `utils/middlewares.ts` 的 streaming 分支）用 batch flush 包 `repos.messages.update()`，**200ms 时间窗 + 满 1KB 文本累积 + sentence boundary（。？！. ? ! 换行）三触发取最先**；非流式 PUT 立刻 flush；flush 时 PUT 当前累积的完整 message envelope（不是 delta）。流式结束时（`done` event）强制 flush 一次。具体钩点 4e 落地批次内确定（候选位置：`call-api.ts::streamingHandler` 的 onChunk 回调外包一层 batch wrapper），本修订只敲定策略
@@ -982,6 +1029,7 @@ ImportDataDialog
 #### Step 1 — ImportJob 模型 + 后端 worker 骨架 + Phase A 解析
 
 **做什么**：
+
 - `src-backend/data/models/import_job.py`：`ImportJob(id UUID, user_id FK, status enum['queued'|'uploading'|'assembling'|'parsing'|'phase_b'|'phase_c'|'phase_d'|'done'|'failed'|'cancelled'], multipart_upload_id, raw_object_key, total_bytes, processed_bytes, total_rows, processed_rows, total_blobs, processed_blobs, error_message, dead_letter JSONB, created_at, updated_at)`
 - alembic migration：建表 + partial unique index `(user_id) WHERE status IN ('queued','uploading','assembling','parsing','phase_b','phase_c','phase_d')` 保证每用户同时只 1 个 active job
 - `src-backend/data/import_worker.py`：asyncio worker 框架，按 status 状态机推进；FastAPI 进程启动时 `asyncio.create_task` 起 worker 主循环，启动时扫一次所有 status 非终态的 active job 续跑（崩溃恢复）
@@ -989,6 +1037,7 @@ ImportDataDialog
 - 全部由 `IMPORT_JOB_ENABLED` env flag 守卫的 lazy import（与现有 `BACKEND_DATA_API_ENABLED` 同款）
 
 **通过判据**：
+
 - api: `tests/api/test_import_job.py::test_phase_a_extracts_table_row_counts`（fixture small：10 providers + 5 dialogs，验证 total_rows 准确）
 - api: `tests/api/test_import_job.py::test_phase_a_streaming_memory_under_200mb`（fixture huge：200MB JSON，pytest 跑前后 RSS 差 < 200MB，slow mark）
 - api: `tests/api/test_import_job.py::test_phase_a_invalid_json_marks_failed`（损坏 JSON → status='failed' + error_message 非空）
@@ -998,6 +1047,7 @@ ImportDataDialog
 #### Step 2 — S3 multipart 上传 5 个 endpoint
 
 **做什么**：
+
 - `src-backend/data/routers/imports.py`:
   - `POST /api/v1/import/jobs` → 创建 ImportJob (status=uploading) + 调 `BlobStore.create_multipart_upload(imports/<user>/<job_id>.json)` → 返回 `{job_id, multipart_upload_id}`
   - `POST /api/v1/import/jobs/{id}/parts/{n}` → 校验 job ownership + status=uploading → 返回 pre-signed PUT URL (TTL 1h)
@@ -1008,6 +1058,7 @@ ImportDataDialog
 - `BlobStore` 接口扩展（Stage 4 硬前置规划过）补 4 个 multipart 方法：`create_multipart_upload` / `generate_part_url` / `complete_multipart_upload` / `abort_multipart_upload`，3 种实现（local-fs / minio / s3）按 env `BLOB_STORE_KIND` 选
 
 **通过判据**：
+
 - api: `tests/api/test_imports_router.py::test_create_job_returns_job_id_and_multipart_upload_id`
 - api: `tests/api/test_imports_router.py::test_part_url_is_presigned_with_short_ttl`（断言响应 URL 包含签名参数 + Expires 在 ±5min 范围内）
 - api: `tests/api/test_imports_router.py::test_complete_with_all_parts_triggers_worker`
@@ -1021,6 +1072,7 @@ ImportDataDialog
 #### Step 3 — Phase B 结构表写入
 
 **做什么**：
+
 - `import_worker.py` 增 phase_b：从 Phase A 输出的 NDJSON 读小表（按依赖顺序：providers / assistants / plugins / reactives / avatarImages / workspaces / dialogs metadata），按表 `INSERT ... ON CONFLICT (id) DO UPDATE WHERE existing.updated_at < incoming.updated_at`（LWW）
 - 复用现有各 router 的 SQLModel + bulk insert helpers（避免业务逻辑分裂）
 - 每行写入时附 `imported_from_job_id=<job_id>` + `imported_at=now()` 两列（所有 server-routed 表 alembic 加这两列；Stage 1-4 已落地的表按需 backfill NULL）
@@ -1028,6 +1080,7 @@ ImportDataDialog
 - 状态转 phase_c
 
 **通过判据**：
+
 - api: `tests/api/test_import_phase_b.py::test_writes_workspaces_with_original_uuid`（fixture 含 3 workspaces，导入后 PG 直查 UUID 一致）
 - api: `tests/api/test_import_phase_b.py::test_writes_all_structural_tables_in_dependency_order`
 - api: `tests/api/test_import_phase_b.py::test_lww_skips_older_incoming_when_existing_newer`（先 PUT 一个 newer workspace，再导入 older → 跳过）
@@ -1038,12 +1091,14 @@ ImportDataDialog
 #### Step 4 — Phase C messages 文字写入
 
 **做什么**：
+
 - `import_worker.py` 增 phase_c：流式遍历 `messages.ndjson`，每 500 行一批 `INSERT ... ON CONFLICT DO UPDATE`；attachment 字段按原 base64 inline 存进 PG 的临时区域（messages 行加 `_pending_blob_extraction BOOLEAN DEFAULT FALSE` 列，导入时含 attachment 的行标 true）
 - 进度按行报：每 500 行 `broker.publish` 进度事件（节流，避免 WS 风暴）
 - FK 约束：messages 必须 dialog 已写入。Phase B 已写 dialogs metadata，正常情况无孤儿；FK 失败的 row 进 `import_jobs.dead_letter` JSONB 字段，Phase D 跑完后重试一次（一般是依赖顺序错配的小概率边界）
 - 状态转 phase_d
 
 **通过判据**：
+
 - api: `tests/api/test_import_phase_c.py::test_writes_message_text_in_batches_of_500`（fixture 1500 messages，验证 PG 行数 1500 + 进度事件 ≥ 3 次）
 - api: `tests/api/test_import_phase_c.py::test_marks_pending_blob_extraction_for_messages_with_attachment`
 - api: `tests/api/test_import_phase_c.py::test_orphan_message_without_dialog_lands_in_dead_letter`
@@ -1054,6 +1109,7 @@ ImportDataDialog
 #### Step 5 — Phase D attachments → 对象存储
 
 **做什么**：
+
 - `import_worker.py` 增 phase_d：扫 `messages WHERE _pending_blob_extraction=TRUE AND user_id=?`，逐条提取 attachment base64 字段
 - 对每个 attachment：解码 base64 → 算字节大小 → 按 `BLOB_INLINE_MAX_BYTES=65536` (64KB) 阈值判断
   - `< 64KB` → 保持 inline 在 PG row 字段（与硬前置 2 客户端 `serializeAttachment` 阈值规则一致：messages 表小附件 inline，避免无谓 blob store 一次往返）
@@ -1064,6 +1120,7 @@ ImportDataDialog
 - 全部完成清 `_pending_blob_extraction` 标志 → 状态转 done → 清 `/tmp/import-<job_id>/` + 对象存储里的 raw upload (TTL 7 天 lifecycle rule 兜底)
 
 **通过判据**：
+
 - api: `tests/api/test_import_phase_d.py::test_attachment_under_64kb_stays_inline_in_pg`
 - api: `tests/api/test_import_phase_d.py::test_attachment_over_64kb_uploaded_to_blob_store_and_row_rewritten`（验证 PG row 字段是 `{type:'ref',...}`，BlobStore 里 `<sha256>` 文件存在）
 - api: `tests/api/test_import_phase_d.py::test_same_sha256_reuses_existing_blob_no_double_upload`
@@ -1074,6 +1131,7 @@ ImportDataDialog
 #### Step 6 — WS 进度推送 + 状态持久化（已在 Step 1-5 内分散实现，本 Step 做集成验证）
 
 **做什么**：
+
 - `import_jobs` 注册为 server-routed table（添加到 `SERVER_CAPABLE_TABLES`，但只读不允许 client 直接 PUT；写路径只有 worker）
 - `_to_event` 与 `_to_row` 沿用现有 envelope 契约（`{id, version, updated_at, deleted, data: <ImportJobStatus>}`）
 - 客户端 `realtime.subscribe('import_jobs', cb)` 即可拿状态变更
@@ -1081,6 +1139,7 @@ ImportDataDialog
 - ImportJob row 的 PUT 仅由 worker 内部完成；任何 `PUT /api/v1/import_jobs/<id>` 来自客户端的写请求返回 405 Method Not Allowed
 
 **通过判据**：
+
 - api: `tests/api/test_import_realtime.py::test_phase_change_publishes_ws_event`
 - api: `tests/api/test_import_realtime.py::test_ws_event_envelope_matches_routed_table_contract`（断言 `e.row.data` 形如 `{status, phase, processed_rows, total_rows, ...}`）
 - api: `tests/api/test_import_realtime.py::test_user_b_does_not_receive_user_a_import_progress`
@@ -1090,6 +1149,7 @@ ImportDataDialog
 #### Step 7 — 前端 ImportDataDialog 重写 + 上传切片 helper
 
 **做什么**：
+
 - `src/data/import-client.ts` 新增（client 侧的 multipart 实现，零依赖，~150 行）：
   - `createImportJob(file): Promise<{jobId, multipartUploadId}>`
   - `uploadParts(file, jobId, opts): Promise<Array<{partNumber, etag}>>` —— 5MB `Blob.slice()` 切片，4 路 `Promise.all` 并发，单 part 失败重试 3 次（指数退避）；上传 cursor（已成功 part numbers）持久化到 `localStorage:import.<jobId>.parts`，断网恢复后查 `GET /api/v1/import/jobs/<id>` 验证 server 端记录，续传剩余 parts
@@ -1104,6 +1164,7 @@ ImportDataDialog
 - 应用启动时：`useObservable(authSource.user)` 触发后调一次 `GET /api/v1/import/jobs?status=active`，有 active job 则自动挂 subscribe + 显示卡片（多设备一致性）
 
 **通过判据**：
+
 - spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_upload_then_close_tab_then_reopen_sees_progress`（profile import-job + fixture small：上传完后 `page.close()` → 重开 → AccountPage 显示卡片 + phase 推进）
 - spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_upload_resumes_after_simulated_network_drop`（用 `helpers/net.ts.setOffline` 中断 → 恢复后续传 + cursor 校验，slow mark）
 - spec: `tests/e2e/stage4_5/step7-import-flow.spec.ts::test_cancel_button_aborts_job_and_clears_state`
@@ -1114,6 +1175,7 @@ ImportDataDialog
 #### Step 8 — `GET /api/v1/bootstrap` endpoint + 首屏路由 guard
 
 **做什么**：
+
 - 后端 `src-backend/data/routers/bootstrap.py`：`GET /api/v1/bootstrap`
   - 一次返回所有小表全量 + messages 表的"最近 N 个 dialog 的最新 50 条"摘要
   - 响应体：`{schema_version, workspaces:[...], dialogs:[...], providers:[...], assistants:[...], plugins:[...], reactives:[...], avatarImages:[...], messages_recent:[...]}`
@@ -1125,6 +1187,7 @@ ImportDataDialog
 - 已有 active import job 时：`bootstrap` 仍返回当前 server 端可见的部分数据（Phase B 完成的 workspaces 等），与 import 进度不冲突
 
 **通过判据**：
+
 - api: `tests/api/test_bootstrap.py::test_returns_all_small_tables_in_one_response`
 - api: `tests/api/test_bootstrap.py::test_messages_recent_limited_to_50_per_dialog`
 - api: `tests/api/test_bootstrap.py::test_response_size_under_1mb_for_typical_user`（fixture 100 dialogs × 50 messages = 5000，验证响应体 < 1MB）
@@ -1319,17 +1382,17 @@ ImportDataDialog
 
 详见上文 Stage 4.5 段。核心思路：浏览器只负责文件分块直传对象存储，其余阶段由后端 worker 跑，用户上传完即可关 tab。下面是 200MB 用户的真实体感时序：
 
-| 阶段 | 谁在跑 | 用户视角 | 200MB 用户耗时估 | 关键节点 |
-|---|---|---|---|---|
-| a. 文件选择 | 浏览器 | 选 `aiaw_user_db.json` | <1s | — |
-| b. 上传（5MB 切片 → 对象存储） | 浏览器 | 进度条 "87/270 MB" | 3–10min | 浏览器必须在线 |
-| c. 排队 | backend | "上传完成，已开始处理。**您可以关闭页面**" | <1s | 🟢 **此刻可关 tab** |
-| d. (可选) 用户关闭浏览器 | — | — | — | — |
-| e. Phase A 解析（流式 ijson） | backend worker | 状态卡片 "解析中" | 30s–2min | — |
-| f. Phase B 写结构表 | backend worker | "写入 workspaces..." | 5–30s | — |
-| g. Phase C 写 messages 文字 | backend worker | "对话历史 3,421 / 12,580" | 1–5min | 🟢 **此后任意设备登录可看到全部 workspaces / dialogs / message 文字** |
-| h. Phase D 处理附件 | backend worker | "附件 47 / 312" | 5–30min | 🟢 不阻塞使用 |
-| i. 完成 | backend | "迁移完成"通知 | — | — |
+| 阶段                            | 谁在跑         | 用户视角                                         | 200MB 用户耗时估 | 关键节点                                                                   |
+| ------------------------------- | -------------- | ------------------------------------------------ | ---------------- | -------------------------------------------------------------------------- |
+| a. 文件选择                     | 浏览器         | 选 `aiaw_user_db.json`                         | <1s              | —                                                                         |
+| b. 上传（5MB 切片 → 对象存储） | 浏览器         | 进度条 "87/270 MB"                               | 3–10min         | 浏览器必须在线                                                             |
+| c. 排队                         | backend        | "上传完成，已开始处理。**您可以关闭页面**" | <1s              | 🟢**此刻可关 tab**                                                   |
+| d. (可选) 用户关闭浏览器        | —             | —                                               | —               | —                                                                         |
+| e. Phase A 解析（流式 ijson）   | backend worker | 状态卡片 "解析中"                                | 30s–2min        | —                                                                         |
+| f. Phase B 写结构表             | backend worker | "写入 workspaces..."                             | 5–30s           | —                                                                         |
+| g. Phase C 写 messages 文字     | backend worker | "对话历史 3,421 / 12,580"                        | 1–5min          | 🟢**此后任意设备登录可看到全部 workspaces / dialogs / message 文字** |
+| h. Phase D 处理附件             | backend worker | "附件 47 / 312"                                  | 5–30min         | 🟢 不阻塞使用                                                              |
+| i. 完成                         | backend        | "迁移完成"通知                                   | —               | —                                                                         |
 
 **「卡住」时间从 30-60 分钟降到 3-10 分钟**——只有上传阶段需要浏览器在线；最慢的附件处理完全在 server 跑，跟用户的设备性能 / 是否在线无关。
 
@@ -1349,6 +1412,7 @@ ImportDataDialog
 ### 跨版本导入/导出兼容（**硬要求：与旧版格式完全互通 · 唯一迁移路径**）
 
 旧版用 `dexie-export-import` 库：
+
 - `ExportDataDialog.vue:65` — `exportDB(db, options)` 产出 `aiaw_user_db.json`
 - `ImportDataDialog.vue:84` — `importInto(db, file, opts)` 反向
 
@@ -1457,16 +1521,16 @@ ImportDataDialog
 
 ### 阶段化人工测试清单
 
-| 阶段 | 必须人工测什么 | 时间预算 |
-|---|---|---|
-| Stage 3 批次-3a / 3b 落地 | 不需要。脚手架 + 自审 即可。可选：5-10 min 在 dev 上点一次相关表的主路径冒烟 | 0–10 min |
-| Stage 4 硬前置 1+2 落地 | 不需要。脚手架 + soak.sh 即可 | 0 |
-| Stage 4 主体 批次-4a/b/c/d/e 落地 | 每张表落地后 5-10 min 冒烟级：注册新账号 → UI 创建 / 修改 / 删除该表数据 → 第二 tab 实时同步 → 清 IndexedDB 刷新数据回灌。**不必真用真实数据** | 5-10 min × 5 = 25-50 min |
-| Stage 4 主体全部完成 | 一次性主路径自测 30 min：注册账号 → 创建工作区 + folder 树 → 创建对话 → 发消息（含 5MB attachment）→ 创建 artifact → 配 provider / assistant / 装 plugin → 第二 tab 全链路同步 → 清缓存重登数据回灌 | 30 min |
-| **Stage 4.5 落地（🟢 分水岭）** | **必须**做真实数据端到端：① 在 my-deploy 上 ExportDataDialog 导出**你自己全部真实数据** → ② 在 new-deploy 上注册新账号 → ③ ImportDataDialog 导入 → ④ 逐项核对所有数据（工作区树 / 对话 / 消息 / attachment / provider / assistant / plugin / avatar）→ ⑤ 清浏览器缓存重登确认数据从 server 拉回 → ⑥ 第二台设备登录确认能看到全部数据 → ⑦ Phase A-D 各阶段进度 UI 表现 / 关 tab 后再开看到状态恢复 | 1-2 h |
-| Stage 4.9 落地 | 落地前后跑同一份脚手架对比 + 30 min 主路径自测确认无回归 | 30 min |
-| **Stage 5 落地** | **第二轮端到端 + 跨平台真机**：① 卸载重装 PWA / 不同浏览器登录 → ② Tauri 桌面（至少 macOS）真机 → ③ Capacitor Android 真机 → ④ 长时间使用一周观察「用着用着发现少数据」→ ⑤ 邀请 1-2 个老用户跑同样的 export → import 流程，收集主观反馈 | 几小时 + 一周观察 + 1-2 用户邀测 |
-| Stage 5 后 | 公开邀请、发"迁移日"通知。my-deploy 实例继续保留至 active 用户迁移率 ≥ 80% 后宣告 6 周下线窗 | — |
+| 阶段                                  | 必须人工测什么                                                                                                                                                                                                                                                                                                                                                                                                             | 时间预算                         |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| Stage 3 批次-3a / 3b 落地             | 不需要。脚手架 + 自审 即可。可选：5-10 min 在 dev 上点一次相关表的主路径冒烟                                                                                                                                                                                                                                                                                                                                               | 0–10 min                        |
+| Stage 4 硬前置 1+2 落地               | 不需要。脚手架 + soak.sh 即可                                                                                                                                                                                                                                                                                                                                                                                              | 0                                |
+| Stage 4 主体 批次-4a/b/c/d/e 落地     | 每张表落地后 5-10 min 冒烟级：注册新账号 → UI 创建 / 修改 / 删除该表数据 → 第二 tab 实时同步 → 清 IndexedDB 刷新数据回灌。**不必真用真实数据**                                                                                                                                                                                                                                                                    | 5-10 min × 5 = 25-50 min        |
+| Stage 4 主体全部完成                  | 一次性主路径自测 30 min：注册账号 → 创建工作区 + folder 树 → 创建对话 → 发消息（含 5MB attachment）→ 创建 artifact → 配 provider / assistant / 装 plugin → 第二 tab 全链路同步 → 清缓存重登数据回灌                                                                                                                                                                                                                 | 30 min                           |
+| **Stage 4.5 落地（🟢 分水岭）** | **必须**做真实数据端到端：① 在 my-deploy 上 ExportDataDialog 导出**你自己全部真实数据** → ② 在 new-deploy 上注册新账号 → ③ ImportDataDialog 导入 → ④ 逐项核对所有数据（工作区树 / 对话 / 消息 / attachment / provider / assistant / plugin / avatar）→ ⑤ 清浏览器缓存重登确认数据从 server 拉回 → ⑥ 第二台设备登录确认能看到全部数据 → ⑦ Phase A-D 各阶段进度 UI 表现 / 关 tab 后再开看到状态恢复 | 1-2 h                            |
+| Stage 4.9 落地                        | 落地前后跑同一份脚手架对比 + 30 min 主路径自测确认无回归                                                                                                                                                                                                                                                                                                                                                                   | 30 min                           |
+| **Stage 5 落地**                | **第二轮端到端 + 跨平台真机**：① 卸载重装 PWA / 不同浏览器登录 → ② Tauri 桌面（至少 macOS）真机 → ③ Capacitor Android 真机 → ④ 长时间使用一周观察「用着用着发现少数据」→ ⑤ 邀请 1-2 个老用户跑同样的 export → import 流程，收集主观反馈                                                                                                                                                                    | 几小时 + 一周观察 + 1-2 用户邀测 |
+| Stage 5 后                            | 公开邀请、发"迁移日"通知。my-deploy 实例继续保留至 active 用户迁移率 ≥ 80% 后宣告 6 周下线窗                                                                                                                                                                                                                                                                                                                              | —                               |
 
 ### 守则
 
@@ -1515,16 +1579,16 @@ ImportDataDialog
 
 ## 端到端验证策略
 
-| 阶段 | 验证手段 | 通过判据 |
-|---|---|---|
-| 0 | `pnpm build` + 手测核心闭环 | 行为与现状完全一致 |
-| 1 | staging + 单表（providers）灰度 | 清缓存后服务端数据回灌；flag 关掉立即回到旧逻辑 |
-| 1.5 | 注册 A/B 两账号 + token 过期 + logout 吊销 | 账号数据隔离；token 自动 refresh；logout 后 refresh 返回 401 |
-| 2 | 双 tab 实时联动 | < 500ms 收到事件；断网降级到 poll 仍最终一致 |
-| 3 | 逐表分批 + 导出/导入往返 | 每张表独立可灰度可回滚 |
-| 4 | 级联删除 + 大量消息加载 | 服务端单事务级联，DialogView 滚动加载性能不退化 |
-| 5 | 全新设备首次登录 + 卸载重装 + **旧版导出 → 新版导入往返字节一致**（含对象存储桥接路径） | 服务端为唯一真源；包内无 `dexie-cloud-addon`；ref blob 透明还原 |
-| 全程 | **旧版导出 → 新版导入 → 旧版导入** 数据闭环 | `aiaw_user_db.json` 字节级互通，无字段丢失；新版 export JSON grep 无 `"type":"ref"` |
-| 全程 | 多设备开机首次登录 | 第二台直接走「server → 本地缓存」回灌（无 push 机制，无标记表） |
+| 阶段 | 验证手段                                                                                      | 通过判据                                                                                |
+| ---- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| 0    | `pnpm build` + 手测核心闭环                                                                 | 行为与现状完全一致                                                                      |
+| 1    | staging + 单表（providers）灰度                                                               | 清缓存后服务端数据回灌；flag 关掉立即回到旧逻辑                                         |
+| 1.5  | 注册 A/B 两账号 + token 过期 + logout 吊销                                                    | 账号数据隔离；token 自动 refresh；logout 后 refresh 返回 401                            |
+| 2    | 双 tab 实时联动                                                                               | < 500ms 收到事件；断网降级到 poll 仍最终一致                                            |
+| 3    | 逐表分批 + 导出/导入往返                                                                      | 每张表独立可灰度可回滚                                                                  |
+| 4    | 级联删除 + 大量消息加载                                                                       | 服务端单事务级联，DialogView 滚动加载性能不退化                                         |
+| 5    | 全新设备首次登录 + 卸载重装 +**旧版导出 → 新版导入往返字节一致**（含对象存储桥接路径） | 服务端为唯一真源；包内无 `dexie-cloud-addon`；ref blob 透明还原                       |
+| 全程 | **旧版导出 → 新版导入 → 旧版导入** 数据闭环                                           | `aiaw_user_db.json` 字节级互通，无字段丢失；新版 export JSON grep 无 `"type":"ref"` |
+| 全程 | 多设备开机首次登录                                                                            | 第二台直接走「server → 本地缓存」回灌（无 push 机制，无标记表）                        |
 
 每阶段均能合并到 master、独立部署、按 flag 灰度，验证失败时仅通过环境变量回退即可，无需代码 revert。

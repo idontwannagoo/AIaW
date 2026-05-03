@@ -490,3 +490,140 @@ async def test_cross_user_cannot_delete(
     r = await client_a.get('/api/v1/items/i-shared')
     assert r.status_code == 200
     assert r.json()['deleted'] is False
+
+
+# ---- Stage 4 / 硬前置 3 — scope-aware list (`?dialogId=`) ------------------
+#
+# Mirrors the dialogs `?workspaceId=` retrofit. The scope filter is the
+# load-bearing path for the lazy frontend pull (items can be tens of
+# thousands per active user; opening a single dialog must not pull the
+# whole user's items table).
+
+
+async def test_list_with_dialog_id_filters_to_scope(
+    client_a: httpx.AsyncClient,
+) -> None:
+    """Two dialogs (under one workspace) with 5 items each. `?dialogId=d1`
+    must return exactly the 5 items whose dialog_id matches. The other
+    dialog's items must not leak."""
+    ws_id = await _seed_workspace(client_a)
+    d1 = await _seed_dialog(client_a, ws_id, 'd1')
+    d2 = await _seed_dialog(client_a, ws_id, 'd2')
+    for i in range(5):
+        await client_a.put(
+            f'/api/v1/items/d1-i{i}',
+            json=_item_body(d1, id=f'd1-i{i}', contentText=f't{i}'),
+        )
+        await client_a.put(
+            f'/api/v1/items/d2-i{i}',
+            json=_item_body(d2, id=f'd2-i{i}', contentText=f't{i}'),
+        )
+
+    r = await client_a.get('/api/v1/items?dialogId=d1')
+    assert r.status_code == 200, r.text
+    rows = r.json()
+    ids = sorted(row['id'] for row in rows)
+    assert ids == sorted(f'd1-i{i}' for i in range(5)), (
+        f'expected only d1 items, got {ids!r}'
+    )
+    for row in rows:
+        assert row['data']['dialogId'] == 'd1', (
+            f'leaked row from another dialog: {row!r}'
+        )
+
+
+async def test_dialog_id_combined_with_since_and_limit(
+    client_a: httpx.AsyncClient,
+) -> None:
+    """Same cursor envelope semantics as dialogs `?workspaceId=` —
+    `limit=` switches the response to `{rows, next_cursor}` and the
+    scope filter applies before LIMIT."""
+    ws_id = await _seed_workspace(client_a)
+    d_paged = await _seed_dialog(client_a, ws_id, 'd-paged')
+    d_noise = await _seed_dialog(client_a, ws_id, 'd-noise')
+    for i in range(6):
+        await client_a.put(
+            f'/api/v1/items/p{i}', json=_item_body(d_paged, id=f'p{i}'),
+        )
+        await client_a.put(
+            f'/api/v1/items/n{i}', json=_item_body(d_noise, id=f'n{i}'),
+        )
+
+    r = await client_a.get(
+        '/api/v1/items?dialogId=d-paged&since=0&limit=4'
+    )
+    assert r.status_code == 200, r.text
+    page1 = r.json()
+    assert isinstance(page1, dict), (
+        f'limit= must yield CursorPage envelope, got {type(page1).__name__}: {page1!r}'
+    )
+    rows1 = page1['rows']
+    assert len(rows1) == 4
+    for row in rows1:
+        assert row['data']['dialogId'] == 'd-paged', (
+            f'leaked row from d-noise: {row!r}'
+        )
+    cursor = page1['next_cursor']
+    assert cursor is not None and cursor > 0, (
+        f'page is full, expected next_cursor, got {cursor!r}'
+    )
+
+    r2 = await client_a.get(
+        f'/api/v1/items?dialogId=d-paged&since={cursor}&limit=4'
+    )
+    page2 = r2.json()
+    rows2 = page2['rows']
+    assert len(rows2) == 2, (
+        f'expected last 2 d-paged items, got {[r["id"] for r in rows2]!r}'
+    )
+    assert page2['next_cursor'] is None
+    all_ids = {r['id'] for r in rows1} | {r['id'] for r in rows2}
+    assert all_ids == {f'p{i}' for i in range(6)}, all_ids
+
+
+async def test_dialog_id_account_isolation(
+    client_a: httpx.AsyncClient, client_b: httpx.AsyncClient,
+) -> None:
+    """User B queries User A's dialogId. user_id predicate already
+    isolates accounts → empty set, status 200, no 403/404 ownership
+    leak."""
+    ws_a = await _seed_workspace(client_a, 'ws-a')
+    dlg_a = await _seed_dialog(client_a, ws_a, 'd-a-private')
+    for i in range(3):
+        await client_a.put(
+            f'/api/v1/items/a-i{i}',
+            json=_item_body(dlg_a, id=f'a-i{i}'),
+        )
+
+    r = await client_b.get(f'/api/v1/items?dialogId={dlg_a}')
+    assert r.status_code == 200, (
+        f'cross-user scopeId must filter to [], not error; got {r.status_code}: {r.text}'
+    )
+    rows = r.json()
+    assert rows == [], (
+        f'B leaked A rows via dialogId scope: {rows!r}'
+    )
+
+    r_a = await client_a.get(f'/api/v1/items?dialogId={dlg_a}')
+    assert len(r_a.json()) == 3
+
+
+async def test_no_dialog_id_param_returns_full_user_table(
+    client_a: httpx.AsyncClient,
+) -> None:
+    """Backwards compatibility — no `?dialogId=` → bare list of all the
+    user's items across all dialogs."""
+    ws_id = await _seed_workspace(client_a)
+    d1 = await _seed_dialog(client_a, ws_id, 'd1')
+    d2 = await _seed_dialog(client_a, ws_id, 'd2')
+    await client_a.put('/api/v1/items/i1', json=_item_body(d1, id='i1'))
+    await client_a.put('/api/v1/items/i2', json=_item_body(d2, id='i2'))
+
+    r = await client_a.get('/api/v1/items')
+    assert r.status_code == 200
+    rows = r.json()
+    assert isinstance(rows, list), (
+        f'no `limit=` → bare list; got {type(rows).__name__}'
+    )
+    ids = sorted(row['id'] for row in rows)
+    assert ids == ['i1', 'i2'], ids
