@@ -133,21 +133,26 @@ test.describe('stage4_pre syncRef anti-flicker', () => {
     const result = await page.evaluate(async () => {
       const make = (window as AnyWindow).__syncRefHarness__
       const h = make('', { debounceMs: 0, suppressSourceWhileEditingMs: 0 })
-      // Two rapid edits should both fire set() immediately.
+      // Vue post-flushing watch coalesces synchronous edits within a tick;
+      // space edits across timer ticks so each fires set() independently.
       h.value = 'A'
-      await new Promise(resolve => setTimeout(resolve, 5))
+      await new Promise(resolve => setTimeout(resolve, 30))
+      const callsAfterFirst = h.setCallCount()
       h.value = 'AB'
-      await new Promise(resolve => setTimeout(resolve, 5))
-      const callsAfterEdits = h.setCallCount()
+      await new Promise(resolve => setTimeout(resolve, 30))
+      const callsAfterSecond = h.setCallCount()
       // Source push should apply immediately, no suppression.
       h.pushSource('remote')
-      await new Promise(resolve => setTimeout(resolve, 10))
+      await new Promise(resolve => setTimeout(resolve, 30))
       const valAfter = h.value
+      const lastSet = h.setCalls[h.setCalls.length - 1]
       h.cleanup()
-      return { callsAfterEdits, valAfter }
+      return { callsAfterFirst, callsAfterSecond, valAfter, lastSet }
     })
 
-    expect(result.callsAfterEdits).toBe(2)
+    expect(result.callsAfterFirst).toBe(1)
+    expect(result.callsAfterSecond).toBe(2)
+    expect(result.lastSet).toBe('AB')
     expect(result.valAfter).toBe('remote')
   })
 
