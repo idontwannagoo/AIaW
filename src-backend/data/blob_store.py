@@ -1,4 +1,4 @@
-"""BlobStore abstraction — Stage 4 硬前置 2.
+"""BlobStore abstraction — Stage 4 硬前置 2 + Stage 4.5 Step 2 multipart.
 
 Two implementations land in this batch:
 
@@ -13,9 +13,19 @@ Two implementations land in this batch:
   when Stage 4.5 needs it for ImportJob multipart uploads — for now it's
   enough to land the interface and prove LocalFS goes through it cleanly.
 
-Multipart upload (S3-style 5-endpoint protocol) is *not* in this batch;
-Stage 4.5 ImportJob will extend this interface with create_multipart_upload /
-generate_part_url / complete_multipart_upload / abort_multipart_upload.
+Stage 4.5 Step 2: 4 multipart methods extended onto the abstract base —
+`create_multipart_upload` / `generate_part_url` / `complete_multipart_upload`
+/ `abort_multipart_upload`. LocalFs simulates by:
+  - upload_id = random uuid; per-part bytes land at
+    `<root>/_multipart/<upload_id>/part_<n>` via a presigned-routed
+    `PUT /api/v1/_internal/multipart/<upload_id>/part/<n>` endpoint
+    (HMAC sig with same JWT_SECRET as blob presign).
+  - complete concatenates parts in order, computes sha256, moves to
+    `<sha[:2]>/<sha[2:]>` (the same canonical layout single-shot put uses),
+    cleans up `_multipart/<upload_id>/`, returns final storage key.
+  - abort just rm -rf the multipart dir.
+S3BlobStore proxies to boto3 multipart API (skeleton; not exercised by
+default LocalFs test profile).
 
 Module-level state (LOCALFS_ROOT, BLOB_STORE_KIND, presign secret cache) is
 read from env at first use, not at import time, so importing this module in
@@ -73,6 +83,30 @@ def verify_blob_signature(sha256: str, exp: int, sig: str) -> bool:
     return hmac.compare_digest(expected, sig)
 
 
+# ---- multipart presign signing ---------------------------------------------
+#
+# Stage 4.5 Step 2: LocalFs simulates S3 multipart by routing per-part PUTs
+# back to a FastAPI internal endpoint. We sign `<upload_id>|<part_number>|exp`
+# so the endpoint can verify the URL hasn't been forged or extended past TTL.
+# The signature scheme is parallel to sign_blob_url — same HMAC key, separate
+# message namespace so a leaked blob URL can't be reused to PUT a part (and
+# vice versa).
+
+
+def sign_multipart_part_url(upload_id: str, part_number: int, exp: int) -> str:
+    msg = f'mp|{upload_id}|{part_number}|{exp}'.encode('utf-8')
+    return hmac.new(
+        _presign_secret().encode('utf-8'), msg, hashlib.sha256
+    ).hexdigest()
+
+
+def verify_multipart_part_signature(
+    upload_id: str, part_number: int, exp: int, sig: str
+) -> bool:
+    expected = sign_multipart_part_url(upload_id, part_number, exp)
+    return hmac.compare_digest(expected, sig)
+
+
 # ---- abstract interface -----------------------------------------------------
 
 
@@ -126,6 +160,62 @@ class BlobStore(ABC):
 
         For LocalFS the URL points back at our /api/v1/blobs/{sha256} endpoint
         with HMAC sig + exp. For S3 it'll be a real S3 presigned URL.
+        """
+
+    # ---- Stage 4.5 Step 2 multipart upload protocol ------------------------
+    #
+    # The 4 methods below mirror S3's multipart upload API. Stage 4.5 ImportJob
+    # uploads a 200MB+ raw export by splitting client-side into ≤ 8MB parts and
+    # PUT'ing each to a presigned URL. `complete_multipart_upload` assembles
+    # them server-side and returns the final canonical storage_key.
+    #
+    # part_number is 1-indexed (S3 convention). `parts` passed to complete must
+    # be a list of `{part_number, etag}` dicts in part_number order, contiguous
+    # 1..N — the router enforces this contract before calling complete.
+
+    @abstractmethod
+    async def create_multipart_upload(self, key: str) -> str:
+        """Begin a multipart upload at `key` (e.g. `imports/<user>/<job>.json`).
+        Returns an opaque `multipart_upload_id` the caller stores on the
+        ImportJob row and threads through generate_part_url / complete / abort.
+        Idempotency: not guaranteed — callers should only call once per logical
+        upload; create-then-abort is the documented retry path.
+        """
+
+    @abstractmethod
+    async def generate_part_url(
+        self,
+        multipart_upload_id: str,
+        part_number: int,
+        *,
+        ttl_seconds: int,
+        base_url: str,
+    ) -> str:
+        """Return a presigned PUT URL the client uploads `part_number`'s bytes
+        to. TTL bounds replay window. For LocalFs this routes back to our
+        internal endpoint; for S3 it's a real S3 presigned URL bound to the
+        upload_id + part_number.
+        """
+
+    @abstractmethod
+    async def complete_multipart_upload(
+        self,
+        multipart_upload_id: str,
+        parts: list[dict],
+        key: str,
+    ) -> str:
+        """Assemble previously-uploaded parts and finalize. `parts` is the
+        client-claimed `[{part_number, etag}, ...]` list (router validates
+        contiguous + 1-indexed before passing in). Returns the final
+        storage_key (canonical content-addressed location for LocalFs; the
+        original `key` for S3 since S3 keys are caller-chosen).
+        """
+
+    @abstractmethod
+    async def abort_multipart_upload(self, multipart_upload_id: str) -> None:
+        """Discard any uploaded parts and the upload session itself. Idempotent
+        — calling on an already-aborted / non-existent upload_id is a no-op so
+        the DELETE /api/v1/import/jobs/{id} endpoint can be safely retried.
         """
 
 
@@ -256,6 +346,155 @@ class LocalFsBlobStore(BlobStore):
         # cross-origin without further plumbing.
         return f'{base_url.rstrip("/")}/api/v1/blobs/{sha256}/data?{qs}'
 
+    # ---- multipart simulation ---------------------------------------------
+    #
+    # Layout: `<root>/_multipart/<upload_id>/part_<n>` for staged parts +
+    # `<root>/_multipart/<upload_id>/.meta.json` for the original `key` so
+    # complete can know where to put the assembled blob if a caller wants the
+    # original key (LocalFs ignores it and uses sha256-addressed canonical key,
+    # but we record it for parity with S3/debugging).
+
+    def _multipart_dir(self, upload_id: str) -> Path:
+        # Strip any leading underscores / slashes — we control the value
+        # (uuid4 hex), so this is defense-in-depth rather than untrusted input.
+        if not upload_id or '/' in upload_id or '..' in upload_id:
+            raise ValueError(f'invalid multipart upload_id: {upload_id!r}')
+        return self.root / '_multipart' / upload_id
+
+    def _part_path(self, upload_id: str, part_number: int) -> Path:
+        if part_number < 1:
+            raise ValueError(f'part_number must be >= 1, got {part_number}')
+        return self._multipart_dir(upload_id) / f'part_{part_number}'
+
+    async def create_multipart_upload(self, key: str) -> str:
+        upload_id = _secrets.token_hex(16)
+        dirp = self._multipart_dir(upload_id)
+
+        def _mk() -> None:
+            dirp.mkdir(parents=True, exist_ok=True)
+            # Stash original requested key so callers/debug can correlate.
+            (dirp / '.meta.json').write_text(
+                f'{{"key": {key!r}}}', encoding='utf-8'
+            )
+
+        await asyncio.to_thread(_mk)
+        return upload_id
+
+    async def generate_part_url(
+        self,
+        multipart_upload_id: str,
+        part_number: int,
+        *,
+        ttl_seconds: int,
+        base_url: str,
+    ) -> str:
+        import time
+        exp = int(time.time()) + ttl_seconds
+        sig = sign_multipart_part_url(multipart_upload_id, part_number, exp)
+        qs = urlencode({'exp': exp, 'sig': sig})
+        return (
+            f'{base_url.rstrip("/")}/api/v1/_internal/multipart/'
+            f'{multipart_upload_id}/part/{part_number}?{qs}'
+        )
+
+    async def write_part(
+        self, multipart_upload_id: str, part_number: int, data: bytes
+    ) -> str:
+        """Internal helper invoked by the routed PUT endpoint after the HMAC
+        signature has been verified. Writes part bytes atomically and returns
+        the etag (sha256 of the part bytes — same trust boundary as S3, where
+        etag is also a content hash for non-multipart parts).
+        """
+        path = self._part_path(multipart_upload_id, part_number)
+
+        def _write() -> str:
+            if not path.parent.exists():
+                raise FileNotFoundError(
+                    f'multipart upload {multipart_upload_id} does not exist'
+                )
+            tmp = path.parent / f'.tmp-part-{_secrets.token_hex(8)}'
+            try:
+                tmp.write_bytes(data)
+                tmp.replace(path)
+            finally:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except FileNotFoundError:
+                        pass
+            return hashlib.sha256(data).hexdigest()
+
+        return await asyncio.to_thread(_write)
+
+    async def complete_multipart_upload(
+        self,
+        multipart_upload_id: str,
+        parts: list[dict],
+        key: str,
+    ) -> str:
+        del key  # LocalFs uses sha256-addressed canonical key (parity with put)
+        dirp = self._multipart_dir(multipart_upload_id)
+
+        def _assemble() -> str:
+            if not dirp.exists():
+                raise FileNotFoundError(
+                    f'multipart upload {multipart_upload_id} does not exist'
+                )
+            # Validate every claimed part actually exists on disk before we
+            # start assembling. A missing part means the client claimed an
+            # etag for bytes we never received — abort with a clear error so
+            # the router can return 400 instead of producing a corrupt blob.
+            ordered = sorted(parts, key=lambda p: int(p['part_number']))
+            sources: list[Path] = []
+            for p in ordered:
+                pp = self._part_path(
+                    multipart_upload_id, int(p['part_number'])
+                )
+                if not pp.exists():
+                    raise FileNotFoundError(
+                        f'part {p["part_number"]} not uploaded'
+                    )
+                sources.append(pp)
+
+            # Stream parts through sha256 + a tmp file so we know the canonical
+            # destination before moving. Avoids loading all parts in RAM (a
+            # 200MB import = ~25 parts × 8MB).
+            h = hashlib.sha256()
+            staging = dirp / '.assembled'
+            with open(staging, 'wb') as out:
+                for src in sources:
+                    with open(src, 'rb') as f:
+                        while True:
+                            chunk = f.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            h.update(chunk)
+                            out.write(chunk)
+            sha256 = h.hexdigest()
+            final = _path_for(sha256, self.root)
+            final.parent.mkdir(parents=True, exist_ok=True)
+            # Trust-the-hash dedup: if the canonical path already holds bytes,
+            # we don't overwrite — same sha256 means same bytes.
+            if final.exists():
+                staging.unlink()
+            else:
+                staging.replace(final)
+            # Cleanup the multipart staging dir so abort/complete leave no trace.
+            import shutil
+            shutil.rmtree(dirp, ignore_errors=True)
+            return sha256
+
+        return await asyncio.to_thread(_assemble)
+
+    async def abort_multipart_upload(self, multipart_upload_id: str) -> None:
+        dirp = self._multipart_dir(multipart_upload_id)
+
+        def _rm() -> None:
+            import shutil
+            shutil.rmtree(dirp, ignore_errors=True)
+
+        await asyncio.to_thread(_rm)
+
 
 # ---- S3 implementation (skeleton) -------------------------------------------
 
@@ -353,6 +592,76 @@ class S3BlobStore(BlobStore):
             Params={'Bucket': self.bucket, 'Key': self._key(sha256)},
             ExpiresIn=ttl_seconds,
         )
+
+    # ---- Stage 4.5 Step 2 multipart (skeleton; not exercised in default
+    # LocalFs test profile, but the abstract base requires implementations) ---
+
+    async def create_multipart_upload(self, key: str) -> str:
+        def _create() -> str:
+            resp = self._client.create_multipart_upload(
+                Bucket=self.bucket,
+                Key=key,
+            )
+            return resp['UploadId']
+
+        return await asyncio.to_thread(_create)
+
+    async def generate_part_url(
+        self,
+        multipart_upload_id: str,
+        part_number: int,
+        *,
+        ttl_seconds: int,
+        base_url: str,
+    ) -> str:
+        del base_url  # S3 returns its own host
+        # Note: S3 presigned URL for upload_part requires us to know the Key
+        # (object name). Caller must thread this through; we stash via meta?
+        # For Stage 4.5 we accept that callers pass the Key separately when
+        # the S3 backend is selected. The concrete plumbing path is:
+        # imports router knows job.raw_object_key and would call a richer
+        # variant. LocalFs is the default & fully wired path — this skeleton
+        # is documented-incomplete on purpose.
+        raise NotImplementedError(
+            'S3BlobStore.generate_part_url requires Key plumbing; '
+            'LocalFs is the default Stage 4.5 backend'
+        )
+
+    async def complete_multipart_upload(
+        self,
+        multipart_upload_id: str,
+        parts: list[dict],
+        key: str,
+    ) -> str:
+        def _complete() -> str:
+            self._client.complete_multipart_upload(
+                Bucket=self.bucket,
+                Key=key,
+                UploadId=multipart_upload_id,
+                MultipartUpload={
+                    'Parts': [
+                        {
+                            'PartNumber': int(p['part_number']),
+                            'ETag': p['etag'],
+                        }
+                        for p in sorted(parts, key=lambda p: int(p['part_number']))
+                    ],
+                },
+            )
+            return key
+
+        return await asyncio.to_thread(_complete)
+
+    async def abort_multipart_upload(self, multipart_upload_id: str) -> None:
+        def _abort() -> None:
+            # Without the original Key we can't issue AbortMultipartUpload on
+            # S3 — same plumbing gap as generate_part_url. Stage 4.5 default
+            # path is LocalFs; S3 wiring lands when prod target is picked.
+            raise NotImplementedError(
+                'S3BlobStore.abort_multipart_upload requires Key plumbing'
+            )
+
+        await asyncio.to_thread(_abort)
 
 
 # ---- factory ----------------------------------------------------------------

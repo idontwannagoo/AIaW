@@ -120,18 +120,22 @@ def _enable_backend_data_api(app: FastAPI) -> None:
         'messages + health + stream + sse mounted)'
     )
 
-    # Stage 4.5 / Step 1 — wire up ImportJob worker behind a separate flag.
+    # Stage 4.5 / Step 1+2 — wire up ImportJob worker behind a separate flag.
     # Lazy import keeps `ijson` dep + worker module out of the import path of
     # backend deploys that don't enable imports. The worker is *constructed*
     # here but *started* by the FastAPI lifespan hook (needs a running loop).
+    # Step 2 also mounts the imports router (5 public endpoints + LocalFs
+    # _internal multipart PUT shim).
     import_flag = os.environ.get('IMPORT_JOB_ENABLED', '').strip().lower()
     if import_flag == 'true':
         global _import_worker
         from data.import_worker import get_worker
+        from data.routers import imports as imports_router
         _import_worker = get_worker()
+        app.include_router(imports_router.router)
         logger.info(
             'import worker registered (will start in lifespan); '
-            'IMPORT_JOB_ENABLED=true'
+            'imports router mounted; IMPORT_JOB_ENABLED=true'
         )
     else:
         logger.info(
