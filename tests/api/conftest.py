@@ -44,6 +44,20 @@ PG_DSN = os.environ.get(
     'postgresql://aiaw:aiaw_test@localhost:5434/aiaw_test',
 )
 
+# Stage 4.5 Step 5 — some tests (e.g. test_import_phase_d) drive
+# `run_phase_d` directly in-process to mock LocalFsBlobStore.put. Those need
+# `data.db.SessionLocal` to point at the test PG (5434), not the dev DB
+# (5433 — the default in `data/db.py` when DATABASE_URL is unset). Set the
+# env BEFORE conftest imports anything, so tests that `import data.db` (or
+# anything that transitively pulls it in) get the test DB engine. Same for
+# JWT_SECRET (blob_store / auth lazy-load it; without it those modules
+# raise on first call).
+os.environ.setdefault(
+    'DATABASE_URL',
+    'postgresql+asyncpg://aiaw:aiaw_test@localhost:5434/aiaw_test',
+)
+os.environ.setdefault('JWT_SECRET', 'test-only-secret-do-not-use-in-prod')
+
 
 # ---- session bootstrap ------------------------------------------------------
 

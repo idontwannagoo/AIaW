@@ -33,6 +33,7 @@ IMPORT_JOB_ENABLED are true (see app.py).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1313,13 +1314,685 @@ async def run_phase_c(job_id: str) -> dict[str, Any]:
     }
 
 
-# ---- phase D stub (Step 5 fills this in) -----------------------------------
+# ---- phase D (attachments → object store) ---------------------------------
 
 
-async def run_phase_d(job_id: str) -> None:
-    raise NotImplementedError(
-        f'phase D not implemented (Step 5); job {job_id} cannot advance'
-    )
+# Plan line 1219-1224: 64KB inline 阈值（与 frontend `BLOB_INLINE_MAX_BYTES` /
+# backend blob_store.BLOB_INLINE_MAX_BYTES 对齐）。同 Phase C 注释，硬编码而不
+# 是从 blob_store 读 module constant —— 避免 worker 启动期 import blob_store
+# 触发 JWT_SECRET 检查。Phase D 真要 put blob 时再 lazy-import blob_store，
+# 那时拿到的 module-level 常量必然与本地这个一致（CI 跑全套测试会捕捉漂移）。
+_PHASE_D_INLINE_MAX_BYTES = 64 * 1024
+
+# Plan line 1222: 4 路并发上限。把 attachment 处理并发到 4 个 task —— 与
+# blob_store 的 thread pool / asyncpg pool 大小匹配，再高 PG 连接 pool 容易
+# 抢空。
+_PHASE_D_CONCURRENCY = 4
+
+# Plan line 1222: 重试 3 次指数退避。1s / 2s / 4s 总计 7s + put 自身耗时；
+# attachment 上传慢节点也能撑过短暂 5xx。第 4 次失败 → dead_letter，phase
+# 继续。
+_PHASE_D_MAX_RETRIES = 3
+_PHASE_D_RETRY_BACKOFFS_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+# Plan line 1224: 进度节流，每 10 个 attachment 完成 publish 一次。比 Phase C
+# 的 500 行更细粒度（attachment 处理是 IO-bound 慢，单 message 可能分钟级），
+# 用户体感是「跑动了」最重要。
+_PHASE_D_PROGRESS_INTERVAL = 10
+
+
+def _maybe_decode_inline_envelope(value: Any) -> Optional[tuple[bytes, str, int]]:
+    """Recognize an `{type:'inline', data:<base64>, ...}` envelope and return
+    `(decoded_bytes, content_type, declared_size)`. Returns None if `value`
+    isn't a recognizable inline attachment.
+
+    Matches the loose envelope shape `serializeAttachment` writes (see
+    `src/data/blob-client.ts::InlineBlob`):
+
+        { type:'inline', data:<base64>, content_type:<str>, size:<int> }
+
+    Tolerant of legacy variants:
+      - `data` key sometimes carried as `base64` in older client builds.
+      - Missing `size` → fall back to len(decoded_bytes).
+      - Missing `content_type` → fall back to 'application/octet-stream'.
+
+    Returns None (envelope unrecognized) on:
+      - non-dict
+      - `type` != 'inline'
+      - missing data/base64
+      - base64 decode error (logged + skipped — the value stays as-is and
+        Phase D leaves the row alone, will retry on next worker pass; if
+        consistently malformed it'll burn through retries → dead_letter).
+    """
+    if not isinstance(value, dict):
+        return None
+    if value.get('type') != 'inline':
+        return None
+    raw_b64 = value.get('data') or value.get('base64')
+    if not isinstance(raw_b64, str) or not raw_b64:
+        return None
+    try:
+        import base64
+        decoded = base64.b64decode(raw_b64, validate=False)
+    except Exception:
+        return None
+    ct = value.get('content_type') or 'application/octet-stream'
+    if not isinstance(ct, str) or not ct:
+        ct = 'application/octet-stream'
+    declared_size = value.get('size')
+    if not isinstance(declared_size, int) or declared_size < 0:
+        declared_size = len(decoded)
+    return decoded, ct, declared_size
+
+
+def _walk_attachments(
+    container: Any, *, _path: tuple = (), _depth: int = 0
+) -> list[tuple[tuple, dict[str, Any]]]:
+    """Walk a row tree and yield every inline-attachment envelope along with
+    a *path* the caller can use to mutate the original container in place.
+
+    Each yielded entry is `(path, envelope_dict)`:
+      - `path` is a tuple of dict-keys / list-indices to reach the envelope
+        from the root container. Caller uses `_set_at_path(root, path, ref)`
+        to swap the inline envelope for a ref envelope.
+      - `envelope_dict` is the dict reference itself (for content / size
+        re-extraction without re-walking).
+
+    Why a list of paths rather than mutate-during-walk:
+      - Mutating a dict you're iterating over is a footgun; some envelopes
+        live in a list and reassigning the slot mid-walk skips the next
+        item. Two-pass (collect → process → write) is simpler.
+      - Paths are also useful for dead_letter entries: we record the
+        attachment location on failure so a future inspect-and-retry tool
+        knows exactly which field needs human attention.
+
+    Depth cap matches `_row_has_attachment_envelope` in Phase C — defense
+    against pathological self-referential JSON.
+    """
+    if _depth > 16:
+        return []
+    found: list[tuple[tuple, dict[str, Any]]] = []
+    if isinstance(container, dict):
+        # Check if THIS dict is itself an inline envelope.
+        if container.get('type') == 'inline' and (
+            'data' in container or 'base64' in container
+        ):
+            found.append((_path, container))
+            # Don't recurse into the envelope's own fields — `data` is a
+            # base64 string, not a nested envelope.
+            return found
+        for k, v in container.items():
+            found.extend(
+                _walk_attachments(v, _path=_path + (k,), _depth=_depth + 1)
+            )
+    elif isinstance(container, list):
+        for i, v in enumerate(container):
+            found.extend(
+                _walk_attachments(v, _path=_path + (i,), _depth=_depth + 1)
+            )
+    return found
+
+
+def _set_at_path(root: Any, path: tuple, new_value: Any) -> None:
+    """Replace the value at `path` in `root` with `new_value`. Path is a
+    tuple of dict-keys / list-indices as produced by `_walk_attachments`.
+
+    No-op if path is empty (would replace the root, which the caller never
+    wants — we always rewrite *into* the row, not the row itself).
+    """
+    if not path:
+        return
+    cursor: Any = root
+    for step in path[:-1]:
+        cursor = cursor[step]
+    cursor[path[-1]] = new_value
+
+
+async def _phase_d_upload_one(
+    *,
+    semaphore: asyncio.Semaphore,
+    blob_store: 'BlobStore',
+    user_id: str,
+    decoded: bytes,
+    content_type: str,
+) -> dict[str, Any]:
+    """Upload `decoded` to BlobStore (sha256-keyed dedup) + ensure a per-user
+    blob_ref row exists. Returns the ref envelope dict ready to slot back
+    into the row.
+
+    Wraps put/ref work in the semaphore so we cap to 4 concurrent uploads.
+    Retries (3 attempts, exp backoff 1/2/4s) live in the caller — keeping
+    this function single-attempt makes the retry loop trivial to reason
+    about.
+
+    The blob_refs INSERT is `ON CONFLICT DO NOTHING` so re-runs after a
+    crash + same (user, sha256) don't error. Same idempotency model as
+    `routers/blobs.py::upload_blob`.
+    """
+    sha256 = hashlib.sha256(decoded).hexdigest()
+    size = len(decoded)
+    async with semaphore:
+        # 1. Put bytes (idempotent on sha256).
+        await blob_store.put(sha256, decoded, content_type)
+
+        # 2. Ensure blob row exists. Mirror routers/blobs.py — INSERT with
+        # ON CONFLICT DO NOTHING so a concurrent uploader doesn't 500 us.
+        async with SessionLocal() as session:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            from .models.blob import Blob, BlobRef
+
+            blob_stmt = pg_insert(Blob).values(
+                sha256=sha256,
+                size=size,
+                content_type=content_type,
+                storage_key=sha256,  # LocalFs uses sha256 as storage_key
+            ).on_conflict_do_nothing(index_elements=[Blob.sha256])
+            await session.execute(blob_stmt)
+
+            # 3. Per-user ref. ON CONFLICT bumps last_seen_at — same shape
+            # as the live PUT path so a re-import of the same attachment
+            # behaves identically to a fresh upload.
+            ref_stmt = pg_insert(BlobRef).values(
+                user_id=user_id,
+                sha256=sha256,
+            ).on_conflict_do_update(
+                index_elements=[BlobRef.user_id, BlobRef.sha256],
+                set_={'last_seen_at': text('now()')},
+            )
+            await session.execute(ref_stmt)
+            await session.commit()
+
+        # 4. Build the ref envelope. URL is presigned per-process; the row's
+        # signed URL will expire after BLOB_PRESIGN_TTL_SECONDS. The
+        # frontend treats sha256 as the canonical id and re-presigns via
+        # GET /api/v1/blobs/<sha>/presign on demand (or just refetches the
+        # row to get a fresh envelope). For Phase D we put a *valid for the
+        # next hour* URL into the row so an immediate read after import
+        # works without an extra round-trip.
+        from .blob_store import BLOB_PRESIGN_TTL_SECONDS
+        # No request context inside the worker → can't compute X-Forwarded
+        # absolute base. Use the configured backend external URL so the
+        # URL points at the same host the frontend will hit. Fallback to
+        # relative if no env is set (frontend fetch will resolve relative
+        # to its origin, which works in same-origin deployments).
+        backend_base = os.environ.get('BACKEND_DATA_API_URL', '').rstrip('/')
+        if not backend_base:
+            backend_base = ''  # presign_get_url tolerates empty → relative URL
+        url = blob_store.presign_get_url(
+            sha256, ttl_seconds=BLOB_PRESIGN_TTL_SECONDS, base_url=backend_base
+        )
+
+    return {
+        'type': 'ref',
+        'url': url,
+        'sha256': sha256,
+        'size': size,
+        'content_type': content_type,
+    }
+
+
+async def _phase_d_process_row(
+    *,
+    semaphore: asyncio.Semaphore,
+    blob_store: 'BlobStore',
+    job_id: str,
+    user_id: str,
+    row_id: str,
+    row_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Process every inline attachment in one message row.
+
+    Walk → for each inline envelope:
+      - If decoded size < 64KB → leave as-is (inline stays in PG row).
+      - If decoded size ≥ 64KB → upload + replace with ref envelope. Retry
+        up to 3 times with exp backoff on transient errors. Final failure
+        → dead_letter entry, but envelope stays inline (incorrect-but-
+        tolerable: row remains queryable, future re-run can retry).
+
+    Then UPDATE the messages row in one transaction:
+      - data := mutated row_data (with refs swapped in)
+      - _pending_blob_extraction := FALSE
+      - version := nextval('global_change_seq')
+      - updated_at := now()
+
+    Same-tx invariant: row data rewrite + flag clear together so a worker
+    crash between the two can never leave a row marked TRUE but already
+    rewritten (would re-process refs → no-op since envelope is now ref →
+    flag eventually clears, but burns IO). Doing both in one UPDATE makes
+    the crash recovery story trivial.
+
+    Returns a per-row summary dict for the caller to aggregate: number of
+    attachments processed, failures, etc. Failures don't raise; the caller
+    decides not to abort the phase.
+    """
+    attachments = _walk_attachments(row_data)
+    n_processed = 0
+    n_uploaded = 0
+    n_inline_kept = 0
+    n_failed = 0
+    failures: list[dict[str, Any]] = []
+
+    for path, envelope in attachments:
+        decoded_meta = _maybe_decode_inline_envelope(envelope)
+        if decoded_meta is None:
+            # Already a ref / unrecognizable / decode failed — leave alone.
+            # If the value is a `{type:'ref',...}` envelope this is the
+            # crash-recovery happy path: we already rewrote it, no work to
+            # do.
+            continue
+
+        decoded, content_type, _declared_size = decoded_meta
+        actual_size = len(decoded)
+
+        if actual_size < _PHASE_D_INLINE_MAX_BYTES:
+            # Plan line 1220 — small attachments stay inline. Don't upload,
+            # don't rewrite. Counts as "processed" for the throttle so
+            # progress events still fire on small-attachment rows.
+            n_inline_kept += 1
+            n_processed += 1
+            continue
+
+        # Large attachment: try uploading with retries.
+        last_error: Optional[Exception] = None
+        ref_envelope: Optional[dict[str, Any]] = None
+        for attempt in range(_PHASE_D_MAX_RETRIES + 1):
+            try:
+                ref_envelope = await _phase_d_upload_one(
+                    semaphore=semaphore,
+                    blob_store=blob_store,
+                    user_id=user_id,
+                    decoded=decoded,
+                    content_type=content_type,
+                )
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < _PHASE_D_MAX_RETRIES:
+                    backoff = _PHASE_D_RETRY_BACKOFFS_SECONDS[attempt]
+                    logger.warning(
+                        'phase D / job %s / row %s / attachment %s: '
+                        'attempt %d/%d failed (%s), retrying in %.1fs',
+                        job_id, row_id, path, attempt + 1,
+                        _PHASE_D_MAX_RETRIES + 1, e, backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.warning(
+                        'phase D / job %s / row %s / attachment %s: '
+                        'all %d attempts failed (%s), dead-lettering',
+                        job_id, row_id, path,
+                        _PHASE_D_MAX_RETRIES + 1, e,
+                    )
+
+        if ref_envelope is not None:
+            _set_at_path(row_data, path, ref_envelope)
+            n_uploaded += 1
+            n_processed += 1
+        else:
+            # All retries failed — dead_letter and leave the inline envelope
+            # in place. The row stays semantically correct (frontend can
+            # decode inline base64) but bloats PG. A future inspect-and-
+            # retry tool reads dead_letter, picks rows where the attachment
+            # is still inline, and re-runs Phase D on demand.
+            n_failed += 1
+            failures.append({
+                'table': 'messages',
+                'row_id': row_id,
+                'attachment_path': list(path),
+                'error': (
+                    f'attachment upload failed after '
+                    f'{_PHASE_D_MAX_RETRIES + 1} attempts: {last_error}'
+                ),
+                'attempt': _PHASE_D_MAX_RETRIES + 1,
+                'ts': datetime.now(timezone.utc).isoformat(),
+            })
+
+    # UPDATE the row. Even if no attachments were rewritten (all stayed
+    # inline / all failed), we still clear `_pending_blob_extraction` so the
+    # row drops out of the partial-index scan on next pass — failures are
+    # captured in dead_letter, not by re-queueing the row indefinitely.
+    async with SessionLocal() as session:
+        from .models.message import Message
+
+        next_version = (await session.execute(
+            text("SELECT nextval('global_change_seq')")
+        )).scalar_one()
+        await session.execute(
+            update(Message)
+            .where(Message.id == row_id, Message.user_id == user_id)
+            .values(
+                data=row_data,
+                _pending_blob_extraction=False,
+                version=next_version,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        # Append all failures for this row as one JSONB array-concat (single
+        # UPDATE) — same `||` template as Phase C `_append_dead_letter` but
+        # batched per-row to keep commit cost low when a single row has many
+        # failed attachments.
+        if failures:
+            entries_array = json.dumps(failures, ensure_ascii=False, default=str)
+            await session.execute(
+                text(
+                    'UPDATE import_jobs '
+                    'SET dead_letter = dead_letter || CAST(:entries AS jsonb), '
+                    '    updated_at = now() '
+                    'WHERE id = :jid'
+                ),
+                {'entries': entries_array, 'jid': job_id},
+            )
+        await session.commit()
+
+    return {
+        'row_id': row_id,
+        'n_processed': n_processed,
+        'n_uploaded': n_uploaded,
+        'n_inline_kept': n_inline_kept,
+        'n_failed': n_failed,
+    }
+
+
+def _publish_phase_d_progress(
+    job: ImportJob, *, processed_blobs: int, attachment_index: int
+) -> dict[str, Any]:
+    """WS event body for Phase D progress publishes. Same envelope shape as
+    Phase B / C — frontend treats successive events as full snapshots, not
+    deltas. `phase_d_attachment_index` lets UI render a per-attachment
+    «processed N/M» without a separate count round-trip.
+    """
+    snap = job._envelope()
+    snap['data']['processed_blobs'] = processed_blobs
+    snap['data']['phase_d_attachment_index'] = attachment_index
+    return {
+        'type': 'event',
+        'table': 'import_jobs',
+        'op': 'put',
+        'id': job.id,
+        'rev': int(job.version) if job.version is not None else 0,
+        'row': snap,
+    }
+
+
+async def _phase_d_publish_progress(
+    job_id: str, user_id: str, *, processed_blobs: int, attachment_index: int
+) -> None:
+    """Refresh the job snapshot + publish one progress event. Best-effort —
+    a broker failure logs and continues so progress UX glitches never tank
+    the phase.
+    """
+    async with SessionLocal() as session:
+        # Bump processed_blobs on the row so the snapshot we publish carries
+        # the same counter. Single UPDATE per progress tick is cheap (every
+        # 10 attachments).
+        next_version = (await session.execute(
+            text("SELECT nextval('global_change_seq')")
+        )).scalar_one()
+        await session.execute(
+            update(ImportJob)
+            .where(ImportJob.id == job_id)
+            .values(
+                processed_blobs=processed_blobs,
+                version=next_version,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+        refreshed = (await session.execute(
+            select(ImportJob).where(ImportJob.id == job_id)
+        )).scalar_one()
+        session.expunge(refreshed)
+    try:
+        from realtime import broker as realtime_broker
+        await realtime_broker.publish(
+            user_id,
+            _publish_phase_d_progress(
+                refreshed,
+                processed_blobs=processed_blobs,
+                attachment_index=attachment_index,
+            ),
+        )
+    except Exception as e:  # pragma: no cover — broker failure shouldn't kill phase
+        logger.warning(
+            'phase D / job %s: failed to publish progress at index %d: %s',
+            job_id, attachment_index, e,
+        )
+
+
+async def _phase_d_cleanup(
+    job_id: str, raw_object_key: Optional[str], blob_store: 'BlobStore'
+) -> None:
+    """Plan line 1225: 全部完成 → 清 `/tmp/import-<job_id>/` + 对象存储里
+    的 raw upload (TTL 7 天 lifecycle rule 兜底).
+
+    tmp dir：unconditional rmtree, ignore_errors —— 残留 NDJSON 不影响后续
+    job（每个 job 一个独立目录）。
+
+    raw upload：trickier。LocalFs 把 multipart-completed bytes 存到 sha256
+    路径 (`<root>/<sha[:2]>/<sha[2:]>`)，与所有其他 blob 共享文件命名空间。
+    如果 raw upload 的 sha256 恰好匹配某个 user 的 attachment blob（极小
+    概率：用户上传了 backup file 然后 backup 内某个 attachment 的字节正好
+    与 backup file 自身相同——不会发生），盲删会把那个 blob 的字节也删了。
+    防御：先查 `blobs` 表，如果有 row 引用同 sha256 → skip 删，让 GC 处理；
+    否则安全删除。
+
+    本函数对所有失败 best-effort warn —— job 已 done，cleanup 失败不应回滚
+    状态。
+    """
+    tmp = temp_dir_for_job(job_id)
+    try:
+        if await asyncio.to_thread(tmp.exists):
+            await asyncio.to_thread(shutil.rmtree, tmp, ignore_errors=True)
+            logger.info('phase D / job %s: cleaned up tmp dir %s', job_id, tmp)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning(
+            'phase D / job %s: tmp cleanup failed (non-fatal): %s', job_id, e,
+        )
+
+    if not raw_object_key:
+        return
+
+    try:
+        # Check if any blobs row references the same key — for LocalFs
+        # `storage_key == sha256 == raw_object_key` (after multipart complete
+        # rewrites raw_object_key to the canonical sha256). If a row exists,
+        # it means the bytes are also serving as a user attachment blob and
+        # we MUST NOT delete them. Lifecycle GC will reap the orphan if the
+        # blob really is import-only.
+        async with SessionLocal() as session:
+            from .models.blob import Blob
+
+            result = await session.execute(
+                select(Blob).where(Blob.sha256 == raw_object_key)
+            )
+            shared_blob = result.scalar_one_or_none()
+
+        if shared_blob is not None:
+            logger.info(
+                'phase D / job %s: raw upload %s is shared with user blob, '
+                'skipping delete (lifecycle GC will handle)',
+                job_id, raw_object_key,
+            )
+            return
+
+        await blob_store.delete(raw_object_key)
+        logger.info(
+            'phase D / job %s: deleted raw upload %s', job_id, raw_object_key,
+        )
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning(
+            'phase D / job %s: raw upload cleanup failed (non-fatal, '
+            'lifecycle GC will catch): %s', job_id, e,
+        )
+
+
+async def run_phase_d(job_id: str) -> dict[str, Any]:
+    """Phase D — extract attachments from messages tagged
+    `_pending_blob_extraction=TRUE` for this job's user, decide inline vs
+    ref by 64KB threshold, upload large ones to BlobStore + rewrite the
+    row's attachment field to a `{type:'ref',...}` envelope.
+
+    Concurrency model:
+    - One `asyncio.Semaphore(4)` shared across all rows of this phase. The
+      semaphore wraps the BlobStore put + blob_refs INSERT for one
+      attachment, NOT the row processing as a whole — that means a row
+      with 5 attachments gets to start uploading attachment 1 even while
+      attachment 0 of the previous row is still in flight (saturating the
+      4-slot pool whenever there's work).
+    - Per-row processing is sequential within each row to keep the row
+      UPDATE atomic (one transaction per row).
+    - Rows are processed in batches of `concurrency*4` so the asyncio
+      gather() set never balloons with thousands of pending tasks for a
+      large fixture; we yield to the event loop between batches.
+
+    Crash recovery:
+    - The partial index `ix_messages_pending_blob_extraction` (Phase C
+      created) only covers TRUE rows. On restart we re-scan and re-process
+      whichever rows didn't get their flag cleared. Already-rewritten rows
+      have `{type:'ref',...}` envelopes which `_walk_attachments` skips
+      naturally (no inline `data` key → `_maybe_decode_inline_envelope`
+      returns None).
+    - `BlobStore.put(sha256, ...)` is idempotent (same sha → same bytes,
+      no-op write) so a half-uploaded attachment from the previous run
+      doesn't double-bill or corrupt.
+
+    Returns a summary dict the caller writes into the job row alongside
+    the status flip to `done`.
+    """
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(ImportJob).where(ImportJob.id == job_id)
+        )
+        job = result.scalar_one()
+        user_id = job.user_id
+        raw_object_key = job.raw_object_key
+        session.expunge(job)
+
+    from .blob_store import get_blob_store
+    blob_store = get_blob_store()
+
+    # Find all rows still flagged TRUE for this user. The partial index
+    # makes this scan cheap even with millions of cleared rows in the
+    # table.
+    async with SessionLocal() as session:
+        from .models.message import Message
+
+        # NB: use `== True` (compiles to `= TRUE`) rather than `.is_(True)`
+        # so the predicate matches the partial index's WHERE clause exactly
+        # (`postgresql_where=sa.text('_pending_blob_extraction = TRUE')` in
+        # migration c5e9f2a8d6b4). PG's planner won't always pick a partial
+        # index when the query uses `IS TRUE` even though it's logically
+        # equivalent.
+        result = await session.execute(
+            select(Message.id, Message.data).where(
+                Message.user_id == user_id,
+                Message._pending_blob_extraction == True,  # noqa: E712
+            )
+        )
+        rows: list[tuple[str, dict[str, Any]]] = [
+            (row_id, row_data) for row_id, row_data in result.all()
+        ]
+
+    if not rows:
+        logger.info(
+            'phase D / job %s: no pending rows, advancing to done', job_id,
+        )
+        # Even on empty work set we still run cleanup — tmp dir + raw upload
+        # could exist from earlier phases.
+        await _phase_d_cleanup(job_id, raw_object_key, blob_store)
+        return {
+            'rows_processed': 0,
+            'attachments_processed': 0,
+            'attachments_uploaded': 0,
+            'attachments_inline_kept': 0,
+            'attachments_failed': 0,
+        }
+
+    semaphore = asyncio.Semaphore(_PHASE_D_CONCURRENCY)
+
+    rows_processed = 0
+    attachments_processed = 0
+    attachments_uploaded = 0
+    attachments_inline_kept = 0
+    attachments_failed = 0
+
+    # Process rows in batches so the gather() set stays bounded. Batch size
+    # `_PHASE_D_CONCURRENCY * 4` strikes a balance: enough rows in flight
+    # to keep the 4-slot semaphore saturated, not so many that we stall
+    # garbage collection on the per-row dict copies. Each batch is one
+    # `asyncio.gather` await.
+    batch_size = _PHASE_D_CONCURRENCY * 4
+    last_published_processed = 0
+
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        results = await asyncio.gather(
+            *[
+                _phase_d_process_row(
+                    semaphore=semaphore,
+                    blob_store=blob_store,
+                    job_id=job_id,
+                    user_id=user_id,
+                    row_id=row_id,
+                    row_data=row_data,
+                )
+                for row_id, row_data in batch
+            ],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                # Per-row processing exceptions are rare — _phase_d_process_row
+                # swallows attachment-level failures into dead_letter. A raise
+                # here means the UPDATE itself failed, e.g. PG conn drop.
+                # Log + count as failed; don't abort the whole phase.
+                logger.exception(
+                    'phase D / job %s: row processing raised: %s', job_id, r,
+                )
+                attachments_failed += 1
+                continue
+            rows_processed += 1
+            attachments_processed += r['n_processed']
+            attachments_uploaded += r['n_uploaded']
+            attachments_inline_kept += r['n_inline_kept']
+            attachments_failed += r['n_failed']
+
+        # Throttled progress: publish only when we've crossed a multiple of
+        # the interval since the last publish. Prevents one batch with 100
+        # attachments from spamming 100 events.
+        if (
+            attachments_processed - last_published_processed
+            >= _PHASE_D_PROGRESS_INTERVAL
+        ):
+            await _phase_d_publish_progress(
+                job_id, user_id,
+                processed_blobs=attachments_processed,
+                attachment_index=attachments_processed,
+            )
+            last_published_processed = attachments_processed
+
+    # Final progress event so a watcher always sees the last value (even if
+    # the last batch didn't cross the throttle threshold).
+    if attachments_processed != last_published_processed or rows_processed > 0:
+        await _phase_d_publish_progress(
+            job_id, user_id,
+            processed_blobs=attachments_processed,
+            attachment_index=attachments_processed,
+        )
+
+    # Cleanup tmp + raw upload. Best-effort — failure here doesn't unwind
+    # the phase (rows are already correctly rewritten in PG).
+    await _phase_d_cleanup(job_id, raw_object_key, blob_store)
+
+    return {
+        'rows_processed': rows_processed,
+        'attachments_processed': attachments_processed,
+        'attachments_uploaded': attachments_uploaded,
+        'attachments_inline_kept': attachments_inline_kept,
+        'attachments_failed': attachments_failed,
+    }
 
 
 # ---- worker --------------------------------------------------------------
@@ -1462,15 +2135,7 @@ class ImportWorker:
             return
 
         if status == 'phase_d':
-            # Step 5 plugs the real handler. Until then we leave the row
-            # alone — don't crash the worker loop and don't mark failed
-            # (the job legitimately reached phase_d, just can't proceed
-            # without the Step 5 implementation). UI will show «phase_d»
-            # status indefinitely; that's acceptable until Step 5 lands.
-            logger.warning(
-                'import job %s in phase_d: Step 5 handler not implemented '
-                'yet, job parked', job_id,
-            )
+            await self._do_phase_d(job_id)
             return
 
         # uploading / assembling are owned by HTTP endpoints (Step 2). The
@@ -1616,6 +2281,89 @@ class ImportWorker:
             summary.get('orphan_count', 0),
             summary.get('pending_blob_count', 0),
             summary.get('batches', 0),
+        )
+
+    async def _do_phase_d(self, job_id: str) -> None:
+        """Run Phase D (extract attachments → BlobStore for ≥ 64KB / leave
+        inline for < 64KB), then advance to done.
+
+        Idempotency: partial-index scan only finds rows still flagged TRUE;
+        already-rewritten rows (from a previous crashed run) have ref
+        envelopes that `_walk_attachments` skips naturally. `BlobStore.put`
+        is idempotent on sha256 so a half-uploaded attachment from the
+        previous run doesn't double-bill.
+        """
+        try:
+            summary = await run_phase_d(job_id)
+        except ImportFormatError as e:
+            logger.warning('import job %s: phase D failed: %s', job_id, e)
+            await self._mark_failed(job_id, f'phase D: {e}')
+            return
+        except Exception as e:
+            logger.exception(
+                'import job %s: unexpected phase D error: %s', job_id, e
+            )
+            await self._mark_failed(job_id, f'phase D unexpected: {e}')
+            return
+
+        # Advance status → done with a fresh version so the WS event for
+        # the transition is distinct from the per-N-attachment progress
+        # events that fired during run_phase_d.
+        async with SessionLocal() as session:
+            next_version = (await session.execute(
+                text("SELECT nextval('global_change_seq')")
+            )).scalar_one()
+            await session.execute(
+                update(ImportJob)
+                .where(ImportJob.id == job_id)
+                .values(
+                    status='done',
+                    updated_at=datetime.now(timezone.utc),
+                    version=next_version,
+                )
+            )
+            await session.commit()
+
+        # Best-effort final WS publish so the frontend immediately sees the
+        # 'done' status without waiting for the next poll. Reuses the
+        # generic envelope shape — frontend's realtime handler decodes it
+        # via the same code path used for status changes.
+        try:
+            from realtime import broker as realtime_broker
+            async with SessionLocal() as session:
+                refreshed = (await session.execute(
+                    select(ImportJob).where(ImportJob.id == job_id)
+                )).scalar_one()
+                session.expunge(refreshed)
+            await realtime_broker.publish(
+                refreshed.user_id,
+                {
+                    'type': 'event',
+                    'table': 'import_jobs',
+                    'op': 'put',
+                    'id': refreshed.id,
+                    'rev': (
+                        int(refreshed.version)
+                        if refreshed.version is not None else 0
+                    ),
+                    'row': refreshed._envelope(),
+                },
+            )
+        except Exception as e:  # pragma: no cover — broker failure shouldn't undo done
+            logger.warning(
+                'phase D / job %s: failed to publish done event: %s',
+                job_id, e,
+            )
+
+        logger.info(
+            'import job %s: phase D done '
+            '(rows=%d attachments=%d uploaded=%d inline_kept=%d failed=%d)',
+            job_id,
+            summary.get('rows_processed', 0),
+            summary.get('attachments_processed', 0),
+            summary.get('attachments_uploaded', 0),
+            summary.get('attachments_inline_kept', 0),
+            summary.get('attachments_failed', 0),
         )
 
     async def _update_status(self, job_id: str, new_status: str) -> None:

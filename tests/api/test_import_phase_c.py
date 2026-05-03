@@ -521,9 +521,12 @@ async def test_progress_event_emitted_per_batch(
 async def test_phase_c_done_triggers_phase_d(
     user_a, pg_conn: psycopg.Connection,
 ) -> None:
-    """worker after run_phase_c success advances status='phase_d'. Phase D is
-    a stub (worker `_advance_one('phase_d')` log warn no-op) → job parks at
-    phase_d. We only assert the transition, NOT 'done'."""
+    """worker after run_phase_c success advances status='phase_d'.
+
+    Stage 4.5 / Step 5 落地后 Phase D 不再是 stub —— job will continue to
+    progress through phase_d → done (with 0 attachments to extract since this
+    fixture has no inline blob envelopes ≥ 64KB). We assert the chain
+    `phase_c → phase_d → done` is reached without intermediate failure."""
     ws_id = f'ws-trig-{uuid.uuid4().hex[:6]}'
     dlg_id = f'dlg-trig-{uuid.uuid4().hex[:6]}'
     _insert_workspace(pg_conn, user_id=user_a['id'], ws_id=ws_id)
@@ -539,22 +542,14 @@ async def test_phase_c_done_triggers_phase_d(
         raw_object_key='dummy-raw-key',
     )
 
+    # Step 5 implemented: messages have no inline attachment envelopes →
+    # phase D scan returns 0 rows (no _pending_blob_extraction TRUE rows) →
+    # status flips done immediately. Verify we reach done not failed.
     final = wait_for_job_status(
-        pg_conn, job_id, target_in=('phase_d', 'failed'),
+        pg_conn, job_id, target_in=('done', 'failed'),
     )
-    assert final['status'] == 'phase_d', final
+    assert final['status'] == 'done', final
     assert final['error_message'] is None, final
-    # Re-poll a couple of seconds later to confirm it stays at phase_d (Step 5
-    # not implemented → no further advance).
-    time.sleep(1.5)
-    with pg_conn.cursor() as cur:
-        cur.execute(
-            'SELECT status FROM import_jobs WHERE id=%s', (job_id,),
-        )
-        still = cur.fetchone()[0]
-    assert still == 'phase_d', (
-        f'job left phase_d unexpectedly (Step 5 stub should park it): {still}'
-    )
 
 
 # ---- 6. LWW message text skip when existing newer --------------------------
