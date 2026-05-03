@@ -38,6 +38,7 @@ from realtime import Subscription, broker
 
 from ..auth import _decode_access
 from ..db import SessionLocal
+from ..models.artifact import Artifact
 from ..models.assistant import Assistant
 from ..models.avatar_image import AvatarImage
 from ..models.dialog import Dialog
@@ -63,6 +64,7 @@ TABLE_MODELS = {
     'workspaces': Workspace,
     'dialogs': Dialog,
     'items': Item,
+    'artifacts': Artifact,
 }
 
 # SSE keepalives are comments; clients (including event-source-polyfill)
@@ -214,6 +216,24 @@ def _serialize_item(it: Item) -> dict[str, Any]:
     }
 
 
+def _serialize_artifact(a: Artifact) -> dict[str, Any]:
+    deleted = a.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'artifacts',
+        'op': 'delete' if deleted else 'put',
+        'id': a.id,
+        'rev': a.version,
+        'row': None if deleted else {
+            'id': a.id,
+            'version': a.version,
+            'updated_at': a.updated_at.isoformat(),
+            'deleted': False,
+            'data': a.data,
+        },
+    }
+
+
 SERIALIZERS = {
     'providers': _serialize_provider,
     'reactives': _serialize_reactive,
@@ -223,6 +243,7 @@ SERIALIZERS = {
     'workspaces': _serialize_workspace,
     'dialogs': _serialize_dialog,
     'items': _serialize_item,
+    'artifacts': _serialize_artifact,
 }
 
 

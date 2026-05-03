@@ -305,3 +305,38 @@ export async function deleteItem(
 ): Promise<ItemRow> {
   return backendClient(token).del(`/api/v1/items/${id}`)
 }
+
+// Stage 4 / 批次-4d — artifacts endpoint (id-PK; data carries the full
+// Artifact row, workspace_id is server-side promoted to its own column +
+// FK to workspaces. `data.versions`, when JSON-serialized to <64KB,
+// rides inline; over the threshold it spills to
+// `data.versionsBlob: AttachmentEnvelope` ref — see artifacts.server.ts).
+export interface ArtifactRow {
+  id: string
+  version: number
+  updated_at: string
+  deleted: boolean
+  data: Record<string, unknown> | null
+}
+
+export async function putArtifact(
+  token: string,
+  id: string,
+  data: Record<string, unknown>
+): Promise<ArtifactRow> {
+  return backendClient(token).put(`/api/v1/artifacts/${id}`, data)
+}
+
+export async function listArtifacts(
+  token: string,
+  since = 0
+): Promise<ArtifactRow[]> {
+  return backendClient(token).get(`/api/v1/artifacts?since=${since}`)
+}
+
+export async function deleteArtifact(
+  token: string,
+  id: string
+): Promise<ArtifactRow> {
+  return backendClient(token).del(`/api/v1/artifacts/${id}`)
+}

@@ -570,6 +570,7 @@ export type {
   Message,
   Assistant,
   Artifact,
+  ArtifactVersion,
   StoredReactive,
   StoredItem,
   StoredItemId,

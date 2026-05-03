@@ -64,6 +64,7 @@ def _enable_backend_data_api(app: FastAPI) -> None:
 
     # Imported lazily so module-level side effects (engine creation, JWT_SECRET
     # check inside data/auth.py) only happen when the feature is on.
+    from data.routers import artifacts as artifacts_router
     from data.routers import assistants as assistants_router
     from data.routers import auth as auth_router
     from data.routers import avatar_images as avatar_images_router
@@ -89,12 +90,14 @@ def _enable_backend_data_api(app: FastAPI) -> None:
     app.include_router(workspaces_router.router)
     app.include_router(dialogs_router.router)
     app.include_router(items_router.router)
+    app.include_router(artifacts_router.router)
     app.include_router(stream_router.router)
     app.include_router(sse_router.router)
     logger.info(
         'backend data API enabled '
         '(auth + providers + reactives + assistants + avatar_images + '
-        'installed_plugins + blobs + workspaces + dialogs + items + health + stream + sse mounted)'
+        'installed_plugins + blobs + workspaces + dialogs + items + artifacts + '
+        'health + stream + sse mounted)'
     )
 
 

@@ -1,4 +1,4 @@
-"""Stage 4 / 批次-4a/4b/4c — workspaces REST CRUD.
+"""Stage 4 / 批次-4a/4b/4c/4d — workspaces REST CRUD.
 
 id-PK envelope, byte-for-byte equivalent to assistants. `data` carries the
 full Workspace | Folder row (the discriminator `type` field lives inside
@@ -6,17 +6,21 @@ full Workspace | Folder row (the discriminator `type` field lives inside
 
 `DELETE /api/v1/workspaces/{id}` accepts `?cascade=true|false`. As
 server-routed child tables come online (dialogs at 4b, items at 4c,
-artifacts / messages at 4d–4e), each one gets folded into the cascade
+artifacts at 4d, messages at 4e), each one gets folded into the cascade
 branch below so the entire subtree tombstones in a single request. The
 frontend's stores/workspaces.ts still performs the same per-table sweep
 over Dexie tables that haven't migrated yet — the two are complementary,
 not duplicate, since each table lives in exactly one persistence layer.
 
-Cascade chain at 4c: workspace → dialogs → items. items are tombstoned
-based on the dialog ids that this workspace owned; all cascaded rows
-(dialogs + items) share a single `cascade_version` so clients treat them
-as one tombstone batch (per-row LWW idempotency makes intra-batch
-ordering immaterial).
+Cascade chain at 4d: workspace → dialogs → items + artifacts.
+- items are tombstoned based on the dialog ids that this workspace owned
+  (two-hop: workspace -> dialogs -> items via dialog_id).
+- artifacts hang directly off workspace_id (no dialog hop — the frontend
+  `Artifact` type carries only `workspaceId`, no `dialogId`); they are
+  tombstoned by the same `WHERE workspace_id = :ws` predicate.
+- All cascaded rows (dialogs + items + artifacts) share a single
+  `cascade_version` so clients treat them as one tombstone batch (per-row
+  LWW idempotency makes intra-batch ordering immaterial).
 """
 from typing import Any, Optional
 
@@ -30,6 +34,7 @@ from realtime import broker
 
 from ..auth import current_user
 from ..db import get_session
+from ..models.artifact import Artifact
 from ..models.dialog import Dialog
 from ..models.item import Item
 from ..models.user import User
@@ -114,6 +119,24 @@ def _item_event(it: Item) -> dict[str, Any]:
     }
 
 
+def _artifact_event(a: Artifact) -> dict[str, Any]:
+    deleted = a.deleted_at is not None
+    return {
+        'type': 'event',
+        'table': 'artifacts',
+        'op': 'delete' if deleted else 'put',
+        'id': a.id,
+        'rev': a.version,
+        'row': None if deleted else {
+            'id': a.id,
+            'version': a.version,
+            'updated_at': a.updated_at.isoformat(),
+            'deleted': False,
+            'data': a.data,
+        },
+    }
+
+
 @router.get('', response_model=list[WorkspaceRow])
 async def list_workspaces(
     since: int = 0,
@@ -193,6 +216,7 @@ async def delete_workspace(
     # frontend; that path stays for as long as those tables live in Dexie.
     cascaded_dialogs: list[Dialog] = []
     cascaded_items: list[Item] = []
+    cascaded_artifacts: list[Artifact] = []
     if cascade:
         cascade_version = (await session.execute(
             text("SELECT nextval('global_change_seq')")
@@ -230,6 +254,22 @@ async def delete_workspace(
             cascaded_items = list(
                 (await session.execute(item_stmt)).scalars().all()
             )
+        # 4d — artifacts hang directly off workspace_id (no dialog hop —
+        # the frontend `Artifact` type carries only `workspaceId`). Same
+        # cascade_version so the cross-table batch is atomic on the wire.
+        artifact_stmt = (
+            update(Artifact)
+            .where(
+                Artifact.workspace_id == workspace_id,
+                Artifact.user_id == user_id,
+                Artifact.deleted_at.is_(None),
+            )
+            .values(version=cascade_version, deleted_at=text('now()'))
+            .returning(Artifact)
+        )
+        cascaded_artifacts = list(
+            (await session.execute(artifact_stmt)).scalars().all()
+        )
         # All cascaded child rows share the same `version` — clients treat
         # them as one tombstone batch, and per-row LWW idempotency makes
         # ordering inside the batch immaterial.
@@ -251,5 +291,7 @@ async def delete_workspace(
         await broker.publish(user_id, _dialog_event(d))
     for it in cascaded_items:
         await broker.publish(user_id, _item_event(it))
+    for a in cascaded_artifacts:
+        await broker.publish(user_id, _artifact_event(a))
     await broker.publish(user_id, _to_event(row))
     return _to_row(row)
