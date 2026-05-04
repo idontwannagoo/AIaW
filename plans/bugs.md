@@ -137,3 +137,36 @@
 - **已知遗留**:
   - Bug 1 已知遗留（DOM enabled 反应式延迟）独立未消除，留待后续 reactivity-glue 调研
   - bug5 spec 跑过程中观察到一次 `[page-error] TypeError: Cannot read properties of null (reading 'specificationVersion')` —— 从 ai SDK provider 解析路径出（minified `h1 → jb → Ce`），不影响 mock hit + assistant message 收敛，spec 不 fail，记录待观察（疑与 streamFlush 收尾 / 同 tab 第二次 send 的某个 stale provider ref 有关）
+  - **Bug 6（性能延伸）**: Round 2 拆 runTx 后，server-routed 表写入退化为「裸 await 串行 HTTP」—— 单次 `appendMessage` = 2 串行 PUT（~400ms），单次 `stream()` 在 streamText 起跑前要打 4 串行 PUT（~800ms）。用户感知发送 / 编辑按钮有 0.5-1s 延迟。已立 Bug 6 跟进。
+
+---
+
+## Bug 6：对话页发送 / 编辑分支按钮延迟 0.5-1s（串行 PUT × 3-4 次）
+
+- **状态**: ❌ 未修复
+- **现象**：在对话页输入消息后点「发送」或点消息项的「编辑」（创建分支编辑）按钮，UI 响应有半秒到一秒的明显延迟。打开 Network 面板观察到点击瞬间发出 3-4 个串行 PUT，每个 ~200ms。
+- **触发场景**：每次点击 send / edit / 创建分支 / saveItems。每次 send 起码 4 次串行 PUT（2× messages.add + 2× dialogs.update，分散在两次 `appendMessage` 调用里）；edit 是 2× appendMessage PUT + N 次 saveItems items.bulkPut。
+- **影响**：核心交互响应速度差，长会话累积越用越觉得「卡」。非阻塞功能正确性，纯 UX 问题。
+- **关联**: Bug 5 Round 2 修复（commit `5769ec6`，拆 runTx → sequential await）的性能负债。原 runTx 仍是 4 次 PUT，但 Dexie 同步路径靠 IDB tx 把多个 cache.put 合并成一个 microtask；现在每次 PUT 串行 await HTTP，cache.put 也只能在 HTTP 返回后才执行（`putOne` 形态：`http.put → cache.put(decoded)`），UI liveQuery 一直要等到所有 PUT 完成才开始 emit 新行 → 用户感知延迟 = 全部 PUT RTT 之和。
+
+### 修复方案（已与用户对齐：方案 1+3）
+
+- **方案 1**：`DialogView.vue::appendMessage` 内 2 次 PUT 并行（dialog cache 读是同步的，msgTree 计算是纯函数；server 侧 dialogs/messages 之间无外键，先后顺序无所谓）。`Promise.all([repos.messages.add, repos.dialogs.update])` 把 2 次 RTT 折叠成 1 次。
+- **方案 3**：所有 server-routed `<table>.server.ts` 的 `putOne` 改成「local-first cache write」—— 先 `db.<table>.put(value)` 让 liveQuery 立刻 emit，然后再 await HTTP，HTTP 返回后用 server canonical version 重新 put 一次（覆盖 server 侧规整的字段如 updated_at）。caller 仍然 await 整个 putOne，但 UI 在 HTTP 等待期已经看到新行（liveQuery emit 在 HTTP 返回前）。
+- **不做的方案 2**：`stream()` 把 2× appendMessage 进一步合成 1 次 Promise.all。原因：第 2 次 appendMessage 用第 1 次的 id 作 parent，dialog.msgTree 合并需要拍平到一次 dialog write，逻辑改动较深，方案 1+3 已足够消除用户主要痛点。
+- **不做的方案 4**：后端聚合 endpoint。需要 plan + spec + 后端 router 改动，工程量大，留作未来优化。
+
+### 修复记录
+- **日期**: 2026-05-04
+- **核心改动**:
+  - `src/data/repositories/<10 tables>.server.ts::putOne`：每张表 putOne 改成「local-first」——`db.<table>.put(value)` 先于 `http.put`，HTTP 返回再 cache.put(decoded) 做 server canonical 覆盖。10 张全部改：messages / dialogs / items / artifacts / workspaces / assistants / providers / installed-plugins / avatar-images / reactives。一致性优先，未来加新表沿用同模板。
+  - `src/views/DialogView.vue::appendMessage`：dialog cache.get + msgTree 计算前移到 HTTP 之前；2 次 server-routed PUT 用 `Promise.all([repos.messages.add, repos.dialogs.update])` 并行触发，单次 appendMessage 的 RTT 从 ~400ms 降到 ~200ms。
+- **判据映射**:
+  - 点 send 后 IDB messages 表新增的 2 行（assistant placeholder + 新 inputing user）必须在 HTTP_DELAY=1500ms 以内的 300ms 窗口内出现 → spec: `tests/e2e/bugs/bug6-dialog-write-optimistic.spec.ts::bug6 [providers-rest|realtime-ws] click send → IDB shows new branches before HTTP completes`
+  - 现有 bug5 spec 在 providers-rest + realtime-ws 双 profile 5/5 仍稳定绿（mock LLM hit ≥1 + assistant message 收敛 status='default' + 无 PrematureCommitError）→ regression check
+- **故障注入红测**: 把 `messages.server.ts::putOne` 内 `await db.messages.put(value)` 去掉（恢复 HTTP-first） → `rm -rf tests/.builds/providers-rest tests/.builds/realtime-ws` → bug6 spec 双 profile 红（IDB messages count 在 300ms 内 < 3）→ 恢复 → 绿
+- **预估收益**:
+  - 单次 send 点击 → streamText 起跑前的 RTT：从 4 串行 PUT (~800ms) → 2 串行 appendMessage × 1 并行 PUT (~400ms)
+  - 单次 send 点击 → UI 看到分支：从 ~800ms（必须等所有 HTTP 完成）→ ~50ms（local cache 已 put）
+  - 单次 edit 点击 → UI 看到新分支：从 ~400ms → ~50ms（appendMessage 部分）
+- **已知遗留**: items.bulkPut 在 saveItems 仍是串行 N 次 PUT（受 `(user_id, sha256) blob_refs` 唯一约束需要串行）；edit 带 N 个 attachment 的场景仍有 N×200ms 延迟，但 N 一般 ≤ 3，且这部分在 saveItems 而不在视觉上需要 0ms 响应的 appendMessage 路径里，先不动。

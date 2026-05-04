@@ -156,6 +156,8 @@ export const serverDialogsRepository: Repository<Dialog, string> = (() => {
 
   async function putOne(value: Dialog): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    await db.dialogs.put(value)
     const row = await http.put<DialogRow>(`/api/v1/dialogs/${value.id}`, value)
     if (row.data) await db.dialogs.put(row.data)
     if (row.version > lastVersion) lastVersion = row.version

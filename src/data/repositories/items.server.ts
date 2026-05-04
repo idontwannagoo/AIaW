@@ -250,6 +250,8 @@ export const serverItemsRepository: Repository<StoredItem, string> = (() => {
 
   async function putOne(value: StoredItem): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    await db.items.put(value)
     const wire = await encodeForWire(value)
     const row = await http.put<ItemRow>(`/api/v1/items/${value.id}`, wire)
     if (row.data) {

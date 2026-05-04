@@ -96,6 +96,8 @@ export const serverWorkspacesRepository: Repository<WorkspaceOrFolder, string> =
 
   async function putOne(value: WorkspaceOrFolder): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    await db.workspaces.put(value)
     const row = await http.put<WorkspaceRow>(`/api/v1/workspaces/${value.id}`, value)
     if (row.data) await db.workspaces.put(row.data)
     if (row.version > lastVersion) lastVersion = row.version

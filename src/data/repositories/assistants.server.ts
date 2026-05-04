@@ -91,6 +91,8 @@ export const serverAssistantsRepository: Repository<Assistant, string> = (() => 
 
   async function putOne(value: Assistant): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    await db.assistants.put(value)
     const row = await http.put<AssistantRow>(`/api/v1/assistants/${value.id}`, value)
     if (row.data) await db.assistants.put(row.data)
     if (row.version > lastVersion) lastVersion = row.version

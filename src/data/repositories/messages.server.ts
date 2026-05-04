@@ -274,6 +274,13 @@ export const serverMessagesRepository: Repository<Message, string> = (() => {
 
   async function putOne(value: Message): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write so dexie liveQuery emits
+    // before the HTTP round-trip. Caller still awaits the full PUT, but
+    // Vue's reactivity processes the cache emit during the HTTP wait, so
+    // the UI reflects the new row within ~50ms instead of ~200ms. Server
+    // response (decoded below) overwrites any server-normalized fields
+    // (e.g. updated_at) once it lands.
+    await db.messages.put(value)
     const wire = await encodeForWire(value)
     const row = await http.put<MessageRow>(`/api/v1/messages/${value.id}`, wire)
     if (row.data) {

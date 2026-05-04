@@ -669,12 +669,16 @@ async function appendMessage(target, info: Partial<Message>, insert = false, sel
   // documented in stores/workspaces.ts:54-61: server-side LWW + version
   // monotonicity keep eventual consistency; worst case after a mid-flight
   // failure is an orphan message with no msgTree pointer.
-  await repos.messages.add({
-    id,
-    dialogId: dialog.value.id,
-    workspaceId: dialog.value.workspaceId,
-    ...info
-  } as Message)
+  //
+  // Bug 6 perf fix — parallelize the two server-routed PUTs.
+  // `repos.dialogs.get(props.id)` is a cache read (sync-ms). msgTree
+  // mutation is a pure function. The two HTTP PUTs (messages.add +
+  // dialogs.update) are independent on the wire — server has no foreign
+  // key between dialogs.msgTree and the messages table. Promise.all
+  // collapses 2× sequential RTT (~400ms) to 1× parallel RTT (~200ms).
+  // Combined with `<table>.server.ts::putOne`'s local-first cache write,
+  // dexie liveQuery emits the new row + msgTree within ~50ms, well
+  // before the HTTP responses land.
   const d = await repos.dialogs.get(props.id)
   const children = d.msgTree[target]
   const changes = insert ? {
@@ -694,7 +698,15 @@ async function appendMessage(target, info: Partial<Message>, insert = false, sel
     dialogChanges.msgBranchState = branchState
     dialogChanges.msgRoute = getChain(msgTree, '$root', branchState)[1]
   }
-  await repos.dialogs.update(props.id, dialogChanges)
+  await Promise.all([
+    repos.messages.add({
+      id,
+      dialogId: dialog.value.id,
+      workspaceId: dialog.value.workspaceId,
+      ...info
+    } as Message),
+    repos.dialogs.update(props.id, dialogChanges)
+  ])
   return id
 }
 function expandMessageTree(root): string[] {

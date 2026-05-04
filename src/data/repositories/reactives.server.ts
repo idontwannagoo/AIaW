@@ -105,6 +105,11 @@ export const serverReactivesRepository: Repository<StoredReactive, string> = (()
 
   async function putOne(value: StoredReactive): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    // The local cache shape is `{key, value}` (envelope unwrapped); we
+    // mirror what the server response will produce so liveQuery emits the
+    // intended state during the HTTP wait.
+    await db.reactives.put({ key: value.key, value: value.value })
     // Server stores only the `value` blob; envelope wraps `{key, value, ...}`.
     const row = await http.put<ReactiveRow>(
       `/api/v1/reactives/${encodeKey(value.key)}`,

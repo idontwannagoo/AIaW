@@ -143,6 +143,8 @@ export const serverAvatarImagesRepository: Repository<AvatarImage, string> = (()
 
   async function putOne(value: AvatarImage): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    await db.avatarImages.put(value)
     const row = await http.put<AvatarImageRow>(
       `/api/v1/avatar-images/${value.id}`,
       encodeForWire(value)

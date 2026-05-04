@@ -285,6 +285,8 @@ export const serverArtifactsRepository: Repository<Artifact, string> = (() => {
 
   async function putOne(value: Artifact): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    await db.artifacts.put(value)
     const wire = await encodeForWire(value)
     const row = await http.put<ArtifactRow>(`/api/v1/artifacts/${value.id}`, wire)
     if (row.data) {

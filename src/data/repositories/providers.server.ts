@@ -106,6 +106,8 @@ export const serverProvidersRepository: Repository<CustomProvider, string> = (()
   )
 
   async function putOne(value: CustomProvider): Promise<string> {
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    await db.providers.put(value)
     const row = await http.put<ProviderRow>(`/api/v1/providers/${value.id}`, value)
     if (row.data) await db.providers.put(row.data)
     if (row.version > lastVersion) lastVersion = row.version

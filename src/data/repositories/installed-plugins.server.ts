@@ -112,6 +112,8 @@ export const serverInstalledPluginsRepository: Repository<InstalledPlugin, strin
 
   async function putOne(value: InstalledPlugin): Promise<string> {
     ensureRealtimeSubscription()
+    // Bug 6 perf fix — local-first cache write; see messages.server.ts.
+    await db.installedPluginsV2.put(value)
     const row = await http.put<InstalledPluginRow>(
       `/api/v1/installed-plugins/${encodeKey(value.key)}`,
       value
